@@ -1,0 +1,1915 @@
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, Metadata};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rayon::prelude::*;
+use regex::RegexSet;
+
+use crate::model::{EntryKind, Node, Snapshot};
+
+#[derive(Default, Clone, Debug)]
+pub struct ScanOptions {
+    pub exclude: Vec<String>,
+    pub one_file_system: bool,
+    pub threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ScanPhase {
+    #[default]
+    Idle,
+    Discovering,
+    Finalizing,
+    Complete,
+}
+
+#[derive(Default, Debug)]
+pub struct ScanControl {
+    pub cancelled: AtomicBool,
+    pub paused: AtomicBool,
+    pub visited: AtomicU64,
+    pub bytes: AtomicU64,
+    pub allocated_bytes: AtomicU64,
+    pub unknown_allocations: AtomicU64,
+    pub phase: AtomicU8,
+    waiting: AtomicU64,
+}
+
+impl ScanControl {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.resume();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn phase(&self) -> ScanPhase {
+        match self.phase.load(Ordering::Acquire) {
+            1 => ScanPhase::Discovering,
+            2 => ScanPhase::Finalizing,
+            3 => ScanPhase::Complete,
+            _ => ScanPhase::Idle,
+        }
+    }
+
+    pub fn checkpoint(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        if self.is_paused() {
+            self.waiting.fetch_add(1, Ordering::AcqRel);
+            while self.is_paused() && !self.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+        }
+        !self.is_cancelled()
+    }
+}
+
+pub(crate) fn thread_pool(threads: usize) -> Result<rayon::ThreadPool, String> {
+    let threads = if threads == 0 {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(16)
+    } else {
+        threads.clamp(1, 64)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+struct ScanState {
+    snapshot: Snapshot,
+    identities: HashMap<String, usize>,
+    directories: HashSet<String>,
+}
+
+struct Traversal<'control> {
+    state: Mutex<ScanState>,
+    excluded: &'control RegexSet,
+    options: &'control ScanOptions,
+    control: &'control ScanControl,
+}
+
+pub fn scan(
+    roots: &[PathBuf],
+    options: &ScanOptions,
+    control: &ScanControl,
+) -> Result<Snapshot, String> {
+    scan_with_directories(roots, options, control, HashSet::new())
+}
+
+fn scan_with_directories(
+    roots: &[PathBuf],
+    options: &ScanOptions,
+    control: &ScanControl,
+    mut directories: HashSet<String>,
+) -> Result<Snapshot, String> {
+    if options.one_file_system && !cfg!(unix) {
+        return Err(
+            "Restricting scans to filesystem boundaries is unsupported on this platform".to_owned(),
+        );
+    }
+    let excluded = RegexSet::new(&options.exclude)
+        .map_err(|error| format!("Invalid exclusion expression: {error}"))?;
+    let pool = thread_pool(options.threads)?;
+    let started = Instant::now();
+    control
+        .phase
+        .store(ScanPhase::Discovering as u8, Ordering::Release);
+    let mut snapshot = Snapshot {
+        version: 1,
+        roots: Vec::new(),
+        nodes: Vec::new(),
+        errors: Vec::new(),
+        started: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        elapsed_ms: 0,
+        cancelled: false,
+    };
+    control.visited.store(0, Ordering::Relaxed);
+    control.bytes.store(0, Ordering::Relaxed);
+    control.allocated_bytes.store(0, Ordering::Relaxed);
+    control.unknown_allocations.store(0, Ordering::Relaxed);
+    let current = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut candidates = Vec::new();
+    for root in roots {
+        if !control.checkpoint() {
+            break;
+        }
+        let absolute: PathBuf = current.join(root).components().collect();
+        let normalized = match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent).map(|parent| parent.join(name)),
+            _ => fs::canonicalize(&absolute),
+        };
+        let path = match normalized {
+            Ok(path) => path,
+            Err(error) => {
+                snapshot.errors.push(format!("{}: {error}", root.display()));
+                continue;
+            }
+        };
+        if excluded.is_match(&path.to_string_lossy()) {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let canonical = if is_link(&metadata) {
+                    Ok(path.clone())
+                } else {
+                    fs::canonicalize(&path)
+                };
+                match canonical {
+                    Ok(canonical) => candidates.push((canonical, metadata)),
+                    Err(error) => snapshot.errors.push(format!("{}: {error}", path.display())),
+                }
+            }
+            Err(error) => snapshot.errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    candidates.sort_by(|(left, _), (right, _)| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut accepted: Vec<(PathBuf, bool)> = Vec::new();
+    let mut identities = HashMap::new();
+    let mut pending = Vec::new();
+    for (path, metadata) in candidates {
+        if !control.checkpoint() {
+            break;
+        }
+        if accepted.iter().any(|(previous, directory)| {
+            path == *previous || (*directory && path.starts_with(previous))
+        }) {
+            continue;
+        }
+        let directory = metadata.is_dir() && !is_link(&metadata);
+        accepted.push((path.clone(), directory));
+        let device = metadata_device(&metadata);
+        let node = node_from_metadata(path, None, &metadata);
+        let Some(index) = insert_node(
+            &mut snapshot,
+            &mut identities,
+            &mut directories,
+            node,
+            control,
+        ) else {
+            continue;
+        };
+        snapshot.roots.push(index);
+        if directory {
+            pending.push((index, device));
+        }
+    }
+    if snapshot.roots.is_empty() && !control.cancelled.load(Ordering::Relaxed) {
+        control
+            .phase
+            .store(ScanPhase::Complete as u8, Ordering::Release);
+        return Err(if snapshot.errors.is_empty() {
+            "No paths to scan after exclusions".to_owned()
+        } else {
+            snapshot.errors.join("\n")
+        });
+    }
+    let traversal = Traversal {
+        state: Mutex::new(ScanState {
+            snapshot,
+            identities,
+            directories,
+        }),
+        excluded: &excluded,
+        options,
+        control,
+    };
+    pool.install(|| {
+        rayon::scope(|scope| {
+            for (index, device) in pending {
+                let traversal = &traversal;
+                scope.spawn(move |scope| traversal.directory(scope, index, device));
+            }
+        })
+    });
+    let mut snapshot = traversal
+        .state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot;
+    control
+        .phase
+        .store(ScanPhase::Finalizing as u8, Ordering::Release);
+    #[cfg(test)]
+    tests::gate(control, ScanPhase::Finalizing);
+    finalize(&mut snapshot, control);
+    snapshot.cancelled = control.is_cancelled();
+    snapshot.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    control
+        .phase
+        .store(ScanPhase::Complete as u8, Ordering::Release);
+    Ok(snapshot)
+}
+
+pub fn refresh_subtree(
+    snapshot: &Snapshot,
+    index: usize,
+    options: &ScanOptions,
+    control: &ScanControl,
+) -> Result<Snapshot, String> {
+    let started = Instant::now();
+    refresh_checkpoint(control)?;
+    let selected = snapshot.nodes.get(index).ok_or("Invalid subtree index")?;
+    if selected.kind != EntryKind::Directory {
+        return Err("Only directories can be refreshed as subtrees".to_owned());
+    }
+    snapshot.validate()?;
+    let metadata = fs::symlink_metadata(&selected.path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || is_link(&metadata)
+        || fs::canonicalize(&selected.path).ok().as_ref() != Some(&selected.path)
+    {
+        return Err("The selected directory changed or became a link; run a new scan".to_owned());
+    }
+    let mut mapping = vec![usize::MAX; snapshot.nodes.len()];
+    let mut retained = Vec::new();
+    let mut directories = HashSet::new();
+    let mut pending: Vec<_> = snapshot.roots.iter().rev().copied().collect();
+    while let Some(previous) = pending.pop() {
+        if retained.len() % 256 == 0 {
+            refresh_checkpoint(control)?;
+        }
+        if previous == index {
+            continue;
+        }
+        let node = &snapshot.nodes[previous];
+        if node.kind == EntryKind::Directory
+            && let Some(identity) = &node.file_id
+        {
+            directories.insert(identity.clone());
+        }
+        mapping[previous] = retained.len();
+        retained.push(previous);
+        pending.extend(node.children.iter().rev().copied());
+    }
+    let fresh = scan_with_directories(
+        std::slice::from_ref(&selected.path),
+        options,
+        control,
+        directories,
+    )?;
+    refresh_checkpoint(control)?;
+    let fresh_root = *fresh.roots.first().ok_or("The subtree scan has no root")?;
+    if fresh.cancelled || fresh.nodes[fresh_root].kind != EntryKind::Directory {
+        return Err("Subtree refresh was cancelled or the directory changed; previous results are preserved".to_owned());
+    }
+    if let Some(error) = &fresh.nodes[fresh_root].error {
+        return Err(format!("{error}; previous subtree results are preserved"));
+    }
+    if snapshot.roots.len() == 1 && snapshot.roots[0] == index {
+        return Ok(fresh);
+    }
+    control
+        .phase
+        .store(ScanPhase::Finalizing as u8, Ordering::Release);
+    let mut hints = allocation_hints(snapshot, control)?;
+    hints.extend(allocation_hints(&fresh, control)?);
+    let offset = retained.len();
+    let replacement_root = offset + fresh_root;
+    let parent = selected.parent.map(|parent| mapping[parent]);
+    let mut nodes = Vec::with_capacity(offset + fresh.nodes.len());
+    for previous in retained {
+        if nodes.len() % 256 == 0 {
+            refresh_checkpoint(control)?;
+        }
+        let mut node = snapshot.nodes[previous].clone();
+        node.parent = node.parent.map(|parent| mapping[parent]);
+        node.children = node
+            .children
+            .iter()
+            .filter_map(|&child| (mapping[child] != usize::MAX).then_some(mapping[child]))
+            .collect();
+        nodes.push(node);
+    }
+    for mut node in fresh.nodes {
+        if nodes.len() % 256 == 0 {
+            refresh_checkpoint(control)?;
+        }
+        node.parent = node.parent.map(|parent| offset + parent).or(parent);
+        for child in &mut node.children {
+            *child += offset;
+        }
+        nodes.push(node);
+    }
+    if let Some(parent) = parent {
+        nodes[parent].children.push(replacement_root);
+    }
+    let path_error = format!("{}:", selected.path.display());
+    let descendant_error = format!("{}{}", selected.path.display(), std::path::MAIN_SEPARATOR);
+    let mut merged = Snapshot {
+        version: snapshot.version,
+        roots: snapshot
+            .roots
+            .iter()
+            .map(|&root| {
+                if root == index {
+                    replacement_root
+                } else {
+                    mapping[root]
+                }
+            })
+            .collect(),
+        nodes,
+        errors: snapshot
+            .errors
+            .iter()
+            .filter(|error| {
+                !error.starts_with(&path_error) && !error.starts_with(&descendant_error)
+            })
+            .cloned()
+            .chain(fresh.errors)
+            .collect(),
+        started: snapshot.started,
+        elapsed_ms: 0,
+        cancelled: snapshot.cancelled,
+    };
+    for index in 0..merged.nodes.len() {
+        if index % 256 == 0 {
+            refresh_checkpoint(control)?;
+        }
+        let node = &merged.nodes[index];
+        if node.kind != EntryKind::File {
+            continue;
+        }
+        if let Some(identity) = &node.file_id {
+            let Some((_, owner)) = hints.get_mut(identity) else {
+                continue;
+            };
+            if owner.is_none_or(|previous| node.path < merged.nodes[previous].path) {
+                *owner = Some(index);
+            }
+            merged.nodes[index].allocated_size = Some(0);
+        }
+    }
+    for (_, (allocated, owner)) in hints {
+        if let Some(owner) = owner {
+            merged.nodes[owner].allocated_size = allocated;
+        }
+    }
+    finalize(&mut merged, control);
+    refresh_checkpoint(control)?;
+    merged.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    control
+        .phase
+        .store(ScanPhase::Complete as u8, Ordering::Release);
+    Ok(merged)
+}
+
+fn refresh_checkpoint(control: &ScanControl) -> Result<(), String> {
+    if control.checkpoint() {
+        Ok(())
+    } else {
+        control
+            .phase
+            .store(ScanPhase::Complete as u8, Ordering::Release);
+        Err("Subtree refresh cancelled; previous results are preserved".to_owned())
+    }
+}
+
+type AllocationHints = HashMap<String, (Option<u64>, Option<usize>)>;
+
+fn allocation_hints(snapshot: &Snapshot, control: &ScanControl) -> Result<AllocationHints, String> {
+    let mut hints: AllocationHints = HashMap::new();
+    for (index, node) in snapshot.nodes.iter().enumerate() {
+        if index % 256 == 0 {
+            refresh_checkpoint(control)?;
+        }
+        if node.kind == EntryKind::File
+            && let Some(identity) = &node.file_id
+        {
+            hints
+                .entry(identity.clone())
+                .and_modify(|(allocated, _)| {
+                    *allocated = allocated
+                        .zip(node.allocated_size)
+                        .map(|(left, right)| left.max(right));
+                })
+                .or_insert((node.allocated_size, None));
+        }
+    }
+    Ok(hints)
+}
+
+impl Traversal<'_> {
+    fn directory<'scope>(
+        &'scope self,
+        scope: &rayon::Scope<'scope>,
+        index: usize,
+        device: Option<u64>,
+    ) {
+        const BATCH: usize = 256;
+        if !self.control.checkpoint() {
+            return;
+        }
+        let (path, identity) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.snapshot.nodes[index].path.clone(),
+                state.snapshot.nodes[index].file_id.clone(),
+            )
+        };
+        let metadata = fs::symlink_metadata(&path);
+        if !metadata.as_ref().is_ok_and(|metadata| {
+            metadata.is_dir() && !is_link(metadata) && path_identity(&path, metadata) == identity
+        }) {
+            let message = metadata.err().map_or_else(
+                || format!("{}: directory changed during scan", path.display()),
+                |error| format!("{}: {error}", path.display()),
+            );
+            self.record_error(index, message);
+            return;
+        }
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.record_error(index, format!("{}: {error}", path.display()));
+                return;
+            }
+        };
+        let mut paths = Vec::with_capacity(BATCH);
+        for result in entries {
+            if !self.control.checkpoint() {
+                break;
+            }
+            match result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if !self.excluded.is_match(&path.to_string_lossy()) {
+                        paths.push(path);
+                    }
+                }
+                Err(error) => self.record_error(index, format!("{}: {error}", path.display())),
+            }
+            if paths.len() == BATCH {
+                self.batch(
+                    scope,
+                    index,
+                    device,
+                    std::mem::replace(&mut paths, Vec::with_capacity(BATCH)),
+                );
+            }
+        }
+        if !paths.is_empty() {
+            self.batch(scope, index, device, paths);
+        }
+    }
+
+    fn batch<'scope>(
+        &'scope self,
+        scope: &rayon::Scope<'scope>,
+        parent: usize,
+        device: Option<u64>,
+        paths: Vec<PathBuf>,
+    ) {
+        let nodes: Vec<_> = paths
+            .into_par_iter()
+            .filter_map(|path| {
+                if !self.control.checkpoint() {
+                    return None;
+                }
+                let metadata = fs::symlink_metadata(&path);
+                #[cfg(test)]
+                tests::gate(self.control, ScanPhase::Discovering);
+                if !self.control.checkpoint() {
+                    return None;
+                }
+                match metadata {
+                    Ok(metadata) => {
+                        if self.options.one_file_system && metadata_device(&metadata) != device {
+                            None
+                        } else {
+                            Some(node_from_metadata(path, Some(parent), &metadata))
+                        }
+                    }
+                    Err(error) => {
+                        let error = Some(format!("{}: {error}", path.display()));
+                        Some(Node {
+                            path,
+                            parent: Some(parent),
+                            children: Vec::new(),
+                            kind: EntryKind::Other,
+                            logical_size: 0,
+                            allocated_size: None,
+                            files: 0,
+                            directories: 0,
+                            modified: None,
+                            readonly: false,
+                            permissions: None,
+                            owner: None,
+                            file_id: None,
+                            error,
+                        })
+                    }
+                }
+            })
+            .collect();
+        self.control.checkpoint();
+        let mut directories = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ScanState {
+                snapshot,
+                identities,
+                directories: visited_directories,
+            } = &mut *state;
+            for node in nodes {
+                let directory = node.kind == EntryKind::Directory;
+                let Some(index) = insert_node(
+                    snapshot,
+                    identities,
+                    visited_directories,
+                    node,
+                    self.control,
+                ) else {
+                    continue;
+                };
+                snapshot.nodes[parent].children.push(index);
+                if directory {
+                    directories.push(index);
+                }
+            }
+        }
+        for index in directories {
+            scope.spawn(move |scope| self.directory(scope, index, device));
+        }
+    }
+
+    fn record_error(&self, index: usize, message: String) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.snapshot.nodes[index].error = Some(message.clone());
+        state.snapshot.errors.push(message);
+    }
+}
+
+fn insert_node(
+    snapshot: &mut Snapshot,
+    identities: &mut HashMap<String, usize>,
+    directories: &mut HashSet<String>,
+    mut node: Node,
+    control: &ScanControl,
+) -> Option<usize> {
+    if node.kind == EntryKind::Directory
+        && let Some(identity) = &node.file_id
+        && !directories.insert(identity.clone())
+    {
+        return None;
+    }
+    let index = snapshot.nodes.len();
+    if node.kind == EntryKind::File
+        && let Some(identity) = &node.file_id
+    {
+        if let Some(&previous) = identities.get(identity) {
+            if node.path < snapshot.nodes[previous].path {
+                if let Some(allocated) = snapshot.nodes[previous].allocated_size {
+                    control
+                        .allocated_bytes
+                        .fetch_sub(allocated, Ordering::Relaxed);
+                }
+                snapshot.nodes[previous].allocated_size =
+                    snapshot.nodes[previous].allocated_size.map(|_| 0);
+                identities.insert(identity.clone(), index);
+            } else {
+                node.allocated_size = node.allocated_size.map(|_| 0);
+            }
+        } else {
+            identities.insert(identity.clone(), index);
+        }
+    }
+    if let Some(error) = &node.error {
+        snapshot.errors.push(error.clone());
+    }
+    update_progress(control, &node);
+    snapshot.nodes.push(node);
+    Some(index)
+}
+
+fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
+    for index in (0..snapshot.nodes.len()).rev() {
+        if index % 256 == 0 {
+            control.checkpoint();
+        }
+        if snapshot.nodes[index].kind != EntryKind::Directory {
+            continue;
+        }
+        let mut logical = 0_u64;
+        let mut allocated = empty_allocation();
+        let mut files = 0_u64;
+        let mut directories = 0_u64;
+        for chunk in snapshot.nodes[index].children.chunks(256) {
+            control.checkpoint();
+            for &child in chunk {
+                let node = &snapshot.nodes[child];
+                logical = logical.saturating_add(node.logical_size);
+                allocated = allocated
+                    .zip(node.allocated_size)
+                    .map(|(total, size)| total.saturating_add(size));
+                files = files.saturating_add(node.files);
+                directories = directories
+                    .saturating_add(node.directories)
+                    .saturating_add(u64::from(node.kind == EntryKind::Directory));
+            }
+        }
+        let mut children = std::mem::take(&mut snapshot.nodes[index].children);
+        if !control.is_cancelled() {
+            sort_children(&mut children, &snapshot.nodes, control);
+        }
+        let node = &mut snapshot.nodes[index];
+        node.children = children;
+        node.logical_size = logical;
+        node.allocated_size = allocated;
+        node.files = files;
+        node.directories = directories;
+    }
+}
+
+fn sort_children(children: &mut [usize], nodes: &[Node], control: &ScanControl) {
+    const RUN: usize = 1024;
+    let compare = |left: &usize, right: &usize| {
+        nodes[*right]
+            .logical_size
+            .cmp(&nodes[*left].logical_size)
+            .then_with(|| nodes[*left].path.cmp(&nodes[*right].path))
+    };
+    for run in children.chunks_mut(RUN) {
+        if !control.checkpoint() {
+            return;
+        }
+        run.sort_unstable_by(compare);
+    }
+    if children.len() <= RUN {
+        return;
+    }
+    let mut scratch = vec![0; children.len()];
+    let mut width = RUN;
+    while width < children.len() {
+        for (run_index, run) in children.chunks(width * 2).enumerate() {
+            if !control.checkpoint() {
+                return;
+            }
+            let middle = width.min(run.len());
+            let (mut left, mut right, mut output) = (0, middle, run_index * width * 2);
+            while left < middle && right < run.len() {
+                if output % 256 == 0 && !control.checkpoint() {
+                    return;
+                }
+                if compare(&run[left], &run[right]).is_le() {
+                    scratch[output] = run[left];
+                    left += 1;
+                } else {
+                    scratch[output] = run[right];
+                    right += 1;
+                }
+                output += 1;
+            }
+            let remaining = if left < middle {
+                &run[left..middle]
+            } else {
+                &run[right..]
+            };
+            scratch[output..output + remaining.len()].copy_from_slice(remaining);
+        }
+        children.copy_from_slice(&scratch);
+        width *= 2;
+    }
+}
+
+fn update_progress(control: &ScanControl, node: &Node) {
+    control.visited.fetch_add(1, Ordering::Relaxed);
+    let _ = control
+        .bytes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            Some(total.saturating_add(node.logical_size))
+        });
+    if let Some(allocated) = node.allocated_size {
+        let _ =
+            control
+                .allocated_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    Some(total.saturating_add(allocated))
+                });
+    } else {
+        control.unknown_allocations.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata) -> Node {
+    let kind = if is_link(metadata) {
+        EntryKind::Symlink
+    } else if metadata.is_dir() {
+        EntryKind::Directory
+    } else if metadata.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    };
+    let (file_id, mut allocated_size) = if matches!(kind, EntryKind::File | EntryKind::Directory) {
+        entry_storage(&path, metadata)
+    } else {
+        (metadata_identity(metadata), empty_allocation())
+    };
+    if kind != EntryKind::File {
+        allocated_size = empty_allocation();
+    }
+    let (permissions, owner) = platform_permissions(metadata);
+    Node {
+        path,
+        parent,
+        children: Vec::new(),
+        kind,
+        logical_size: if kind == EntryKind::File {
+            metadata.len()
+        } else {
+            0
+        },
+        allocated_size,
+        files: u64::from(kind == EntryKind::File),
+        directories: 0,
+        modified: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        readonly: metadata.permissions().readonly(),
+        permissions,
+        owner,
+        file_id,
+        error: None,
+    }
+}
+
+pub(crate) fn metadata_identity(metadata: &Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub(crate) fn path_identity(path: &Path, metadata: &Metadata) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let (file, opened) = open_metadata_file(path).ok()?;
+        if opened.is_dir() != metadata.is_dir()
+            || opened.len() != metadata.len()
+            || opened.modified().ok() != metadata.modified().ok()
+        {
+            return None;
+        }
+        file_identity(&file, &opened)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        metadata_identity(metadata)
+    }
+}
+
+pub(crate) fn file_identity(file: &fs::File, metadata: &Metadata) -> Option<String> {
+    #[cfg(windows)]
+    {
+        if is_link(metadata) {
+            return None;
+        }
+        let information = winapi_util::file::information(file).ok()?;
+        if information.file_attributes() & 0x400 != 0 || information.file_index() == 0 {
+            return None;
+        }
+        Some(format!(
+            "win:{}:{}",
+            information.volume_serial_number(),
+            information.file_index()
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        metadata_identity(metadata)
+    }
+}
+
+fn entry_storage(path: &Path, metadata: &Metadata) -> (Option<String>, Option<u64>) {
+    #[cfg(windows)]
+    {
+        let Ok((file, opened)) = open_metadata_file(path) else {
+            return (None, None);
+        };
+        if opened.is_dir() != metadata.is_dir()
+            || opened.len() != metadata.len()
+            || opened.modified().ok() != metadata.modified().ok()
+        {
+            return (None, None);
+        }
+        let identity = file_identity(&file, &opened);
+        let allocated = if opened.is_file() {
+            identity
+                .as_ref()
+                .and_then(|_| fs2::FileExt::allocated_size(&file).ok())
+        } else {
+            Some(0)
+        };
+        (identity, allocated)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        (metadata_identity(metadata), allocated_bytes(metadata))
+    }
+}
+
+#[cfg(windows)]
+fn open_metadata_file(path: &Path) -> std::io::Result<(fs::File, Metadata)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_OPEN_NO_RECALL: u32 = 0x0010_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+        )
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if is_link(&metadata) {
+        return Err(std::io::Error::other("Reparse points are not followed"));
+    }
+    Ok((file, metadata))
+}
+
+fn metadata_device(metadata: &Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn platform_permissions(metadata: &Metadata) -> (Option<u32>, Option<u32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (Some(metadata.mode()), Some(metadata.uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (None, None)
+    }
+}
+
+#[cfg(not(windows))]
+fn allocated_bytes(metadata: &Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.blocks().saturating_mul(512))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn empty_allocation() -> Option<u64> {
+    if cfg!(any(unix, windows)) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn is_link(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Gate {
+        arrived: Barrier,
+        release: Barrier,
+    }
+
+    type GateMap = HashMap<usize, (ScanPhase, Arc<Gate>)>;
+
+    fn gates() -> &'static Mutex<GateMap> {
+        static GATES: OnceLock<Mutex<GateMap>> = OnceLock::new();
+        GATES.get_or_init(Mutex::default)
+    }
+
+    fn register_gate(control: &ScanControl, phase: ScanPhase) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            arrived: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        gates().lock().unwrap().insert(
+            control as *const ScanControl as usize,
+            (phase, Arc::clone(&gate)),
+        );
+        gate
+    }
+
+    pub(super) fn gate(control: &ScanControl, phase: ScanPhase) {
+        let gate = {
+            let mut gates = gates().lock().unwrap();
+            let key = control as *const ScanControl as usize;
+            if gates
+                .get(&key)
+                .is_some_and(|(expected, _)| *expected == phase)
+            {
+                gates.remove(&key).map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.arrived.wait();
+            gate.release.wait();
+        }
+    }
+
+    fn wait_for_paused_worker(control: &ScanControl) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.waiting.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not acknowledge pause"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn running_scan_pauses_and_resumes_during_discovery_and_finalization() {
+        for phase in [ScanPhase::Discovering, ScanPhase::Finalizing] {
+            let temporary = tempfile::tempdir().unwrap();
+            for index in 0..8 {
+                fs::write(temporary.path().join(format!("file-{index}")), [7; 10]).unwrap();
+            }
+            let control = ScanControl::default();
+            let gate = register_gate(&control, phase);
+            std::thread::scope(|scope| {
+                let (sender, receiver) = mpsc::channel();
+                let path = temporary.path().to_owned();
+                let control_ref = &control;
+                scope.spawn(move || {
+                    let result = scan(
+                        &[path],
+                        &ScanOptions {
+                            threads: 1,
+                            ..ScanOptions::default()
+                        },
+                        control_ref,
+                    );
+                    sender.send(result).unwrap();
+                });
+                gate.arrived.wait();
+                control.pause();
+                gate.release.wait();
+                wait_for_paused_worker(&control);
+                assert_eq!(control.phase(), phase);
+                assert!(receiver.try_recv().is_err());
+                control.resume();
+                let snapshot = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(snapshot.file_count(), 8);
+                assert!(snapshot.validate().is_ok());
+                assert_eq!(control.phase(), ScanPhase::Complete);
+            });
+        }
+    }
+
+    #[test]
+    fn running_scan_cancels_while_paused_and_returns_valid_partial_results() {
+        for phase in [ScanPhase::Discovering, ScanPhase::Finalizing] {
+            let temporary = tempfile::tempdir().unwrap();
+            for index in 0..8 {
+                fs::write(temporary.path().join(format!("file-{index}")), [7; 10]).unwrap();
+            }
+            let control = ScanControl::default();
+            let gate = register_gate(&control, phase);
+            std::thread::scope(|scope| {
+                let (sender, receiver) = mpsc::channel();
+                let path = temporary.path().to_owned();
+                let control_ref = &control;
+                scope.spawn(move || {
+                    sender
+                        .send(scan(
+                            &[path],
+                            &ScanOptions {
+                                threads: 1,
+                                ..ScanOptions::default()
+                            },
+                            control_ref,
+                        ))
+                        .unwrap();
+                });
+                gate.arrived.wait();
+                control.pause();
+                gate.release.wait();
+                wait_for_paused_worker(&control);
+                control.cancel();
+                let snapshot = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert!(snapshot.cancelled);
+                assert!(snapshot.validate().is_ok());
+                if phase == ScanPhase::Discovering {
+                    assert!(snapshot.file_count() < 8);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn one_and_many_threads_produce_equivalent_totals_and_hardlink_allocation() {
+        let temporary = tempfile::tempdir().unwrap();
+        for directory in 0..4 {
+            let path = temporary.path().join(format!("directory-{directory}"));
+            fs::create_dir(&path).unwrap();
+            for index in 0..40 {
+                fs::write(path.join(format!("file-{index}")), vec![7; index + 1]).unwrap();
+            }
+        }
+        fs::hard_link(
+            temporary.path().join("directory-0/file-1"),
+            temporary.path().join("directory-1/alias"),
+        )
+        .unwrap();
+        let run = |threads| {
+            scan(
+                &[temporary.path().to_owned()],
+                &ScanOptions {
+                    threads,
+                    ..ScanOptions::default()
+                },
+                &ScanControl::default(),
+            )
+            .unwrap()
+        };
+        let single = run(1);
+        let parallel = run(4);
+        assert_eq!(
+            (
+                single.total_size(false),
+                single.total_size(true),
+                single.file_count(),
+                single.directory_count()
+            ),
+            (
+                parallel.total_size(false),
+                parallel.total_size(true),
+                parallel.file_count(),
+                parallel.directory_count()
+            )
+        );
+        let paths = |snapshot: &Snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.path.clone(),
+                        node.logical_size,
+                        node.allocated_size,
+                        node.files,
+                        node.directories,
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(paths(&single), paths(&parallel));
+        assert!(single.validate().is_ok());
+        assert!(parallel.validate().is_ok());
+    }
+
+    #[test]
+    fn cancellable_sort_merges_wide_directories_without_losing_entries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("template");
+        fs::write(&path, b"template").unwrap();
+        let template = scan(
+            &[path],
+            &ScanOptions {
+                threads: 1,
+                ..ScanOptions::default()
+            },
+            &ScanControl::default(),
+        )
+        .unwrap()
+        .nodes
+        .remove(0);
+        let nodes: Vec<_> = (0..4097)
+            .map(|index| {
+                let mut node = template.clone();
+                node.path = temporary.path().join(format!("file-{index:04}"));
+                node.logical_size = ((4096 - index) % 97) as u64;
+                node
+            })
+            .collect();
+        let mut children: Vec<_> = (0..nodes.len()).rev().collect();
+        sort_children(&mut children, &nodes, &ScanControl::default());
+        assert_eq!(
+            children
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4097
+        );
+        assert!(children.windows(2).all(|pair| {
+            let left = &nodes[pair[0]];
+            let right = &nodes[pair[1]];
+            left.logical_size > right.logical_size
+                || (left.logical_size == right.logical_size && left.path <= right.path)
+        }));
+    }
+
+    #[test]
+    fn subtree_refresh_preserves_other_roots_and_reassigns_hardlink_allocation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("a-selected");
+        let retained = temporary.path().join("z-retained");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&retained).unwrap();
+        fs::write(selected.join("original"), [7; 8192]).unwrap();
+        fs::hard_link(selected.join("original"), retained.join("alias")).unwrap();
+        fs::write(other.path().join("unrelated"), [4; 7]).unwrap();
+        let roots = vec![temporary.path().to_owned(), other.path().to_owned()];
+        let options = ScanOptions {
+            threads: 2,
+            ..ScanOptions::default()
+        };
+        let original = scan(&roots, &options, &ScanControl::default()).unwrap();
+        let selected = fs::canonicalize(selected).unwrap();
+        let index = original
+            .nodes
+            .iter()
+            .position(|node| node.path == selected)
+            .unwrap();
+        fs::remove_file(selected.join("original")).unwrap();
+        fs::write(selected.join("new"), [2; 5]).unwrap();
+        let refreshed =
+            refresh_subtree(&original, index, &options, &ScanControl::default()).unwrap();
+        let complete = scan(&roots, &options, &ScanControl::default()).unwrap();
+        let values = |snapshot: &Snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.path.clone(),
+                        node.logical_size,
+                        node.allocated_size,
+                        node.files,
+                        node.directories,
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(values(&refreshed), values(&complete));
+        assert_eq!(refreshed.roots.len(), 2);
+        assert!(refreshed.validate().is_ok());
+        assert_eq!(original.file_count(), 3);
+    }
+
+    #[test]
+    fn subtree_refresh_accepts_directory_roots_and_rejects_invalid_indices_and_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("data"), [2; 5]).unwrap();
+        let options = ScanOptions {
+            threads: 1,
+            ..ScanOptions::default()
+        };
+        let original = scan(
+            &[temporary.path().to_owned()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert!(refresh_subtree(&original, usize::MAX, &options, &ScanControl::default()).is_err());
+        let file = original
+            .nodes
+            .iter()
+            .position(|node| node.kind == EntryKind::File)
+            .unwrap();
+        assert!(refresh_subtree(&original, file, &options, &ScanControl::default()).is_err());
+        fs::write(temporary.path().join("new"), [2; 6]).unwrap();
+        let refreshed = refresh_subtree(
+            &original,
+            original.roots[0],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (refreshed.total_size(false), refreshed.file_count()),
+            (11, 2)
+        );
+        assert!(refreshed.validate().is_ok());
+    }
+
+    #[test]
+    fn cancelling_subtree_refresh_keeps_the_original_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("data"), [2; 5]).unwrap();
+        let options = ScanOptions {
+            threads: 1,
+            ..ScanOptions::default()
+        };
+        let original = scan(
+            &[temporary.path().to_owned()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let control = ScanControl::default();
+        let gate = register_gate(&control, ScanPhase::Discovering);
+        std::thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            let original_ref = &original;
+            let control_ref = &control;
+            scope.spawn(move || {
+                sender
+                    .send(refresh_subtree(
+                        original_ref,
+                        original_ref.roots[0],
+                        &options,
+                        control_ref,
+                    ))
+                    .unwrap();
+            });
+            gate.arrived.wait();
+            control.cancel();
+            gate.release.wait();
+            assert!(
+                receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+        });
+        assert_eq!((original.total_size(false), original.file_count()), (5, 1));
+        assert!(original.validate().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subtree_refresh_refuses_a_directory_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let options = ScanOptions {
+            threads: 1,
+            ..ScanOptions::default()
+        };
+        let original = scan(
+            &[temporary.path().to_owned()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let index = original
+            .nodes
+            .iter()
+            .position(|node| node.name() == "selected")
+            .unwrap();
+        fs::remove_dir(&selected).unwrap();
+        symlink(temporary.path(), selected).unwrap();
+        assert!(refresh_subtree(&original, index, &options, &ScanControl::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subtree_refresh_keeps_previous_results_when_the_selected_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("data"), [2; 5]).unwrap();
+        let options = ScanOptions {
+            threads: 1,
+            ..ScanOptions::default()
+        };
+        let original = scan(
+            &[temporary.path().to_owned()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let index = original
+            .nodes
+            .iter()
+            .position(|node| node.name() == "selected")
+            .unwrap();
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o0)).unwrap();
+        let inaccessible = fs::read_dir(&selected).is_err();
+        let refreshed = refresh_subtree(&original, index, &options, &ScanControl::default());
+        fs::set_permissions(selected, fs::Permissions::from_mode(0o700)).unwrap();
+        if inaccessible {
+            assert!(refreshed.is_err());
+        }
+        assert_eq!(original.file_count(), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_identity_matches_paths_and_hardlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let alias = temporary.path().join("alias");
+        fs::write(&original, b"contents").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        let file = fs::File::open(&original).unwrap();
+        let metadata = file.metadata().unwrap();
+        let original_id = path_identity(&original, &metadata).expect("identity is available");
+        assert_eq!(file_identity(&file, &metadata), Some(original_id.clone()));
+        assert_eq!(
+            path_identity(&alias, &fs::symlink_metadata(&alias).unwrap()),
+            Some(original_id)
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn scan_uses_windows_allocation_and_deduplicates_hardlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        fs::write(&original, [7; 8192]).unwrap();
+        fs::hard_link(&original, temporary.path().join("alias")).unwrap();
+        let file = fs::File::open(&original).unwrap();
+        let allocated = fs2::FileExt::allocated_size(&file).unwrap();
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.nodes[snapshot.roots[0]].allocated_size,
+            Some(allocated)
+        );
+        assert_eq!(snapshot.total_size(false), 16384);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn scan_reports_unsupported_filesystem_boundaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = ScanOptions {
+            one_file_system: true,
+            ..ScanOptions::default()
+        };
+        assert!(
+            scan(
+                &[temporary.path().to_owned()],
+                &options,
+                &ScanControl::default()
+            )
+            .unwrap_err()
+            .contains("filesystem boundaries")
+        );
+    }
+
+    #[test]
+    fn scan_aggregates_files_and_deduplicates_overlapping_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("nested");
+        fs::create_dir(&child).unwrap();
+        fs::write(temporary.path().join("large.bin"), [0; 9]).unwrap();
+        fs::write(child.join("small.bin"), [0; 3]).unwrap();
+        let snapshot = scan(
+            &[
+                child,
+                temporary.path().to_owned(),
+                temporary.path().to_owned(),
+            ],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                snapshot.total_size(false),
+                snapshot.file_count(),
+                snapshot.directory_count(),
+                snapshot.roots.len()
+            ),
+            (12, 2, 2, 1)
+        );
+        let root = &snapshot.nodes[snapshot.roots[0]];
+        assert_eq!(snapshot.nodes[root.children[0]].logical_size, 9);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn repeated_directory_identity_is_pruned_before_insertion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let metadata = fs::symlink_metadata(temporary.path()).unwrap();
+        let mut snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        snapshot.nodes.clear();
+        snapshot.roots.clear();
+        let mut identities = HashMap::new();
+        let mut directories = HashSet::new();
+        let control = ScanControl::default();
+        for name in ["original", "alias"] {
+            let mut node = node_from_metadata(temporary.path().to_owned(), None, &metadata);
+            node.path = temporary.path().join(name);
+            insert_node(
+                &mut snapshot,
+                &mut identities,
+                &mut directories,
+                node,
+                &control,
+            );
+        }
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(control.visited.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_counts_macos_firmlink_roots_once() {
+        let temporary = tempfile::tempdir_in("/private/tmp").unwrap();
+        fs::write(temporary.path().join("data"), [1; 11]).unwrap();
+        let original = fs::canonicalize(temporary.path()).unwrap();
+        let alias = Path::new("/System/Volumes/Data").join(original.strip_prefix("/").unwrap());
+        let original_metadata = fs::symlink_metadata(&original).unwrap();
+        let alias_metadata = fs::symlink_metadata(&alias).unwrap();
+        assert!(!is_link(&original_metadata));
+        assert!(!is_link(&alias_metadata));
+        assert_eq!(
+            metadata_identity(&original_metadata),
+            metadata_identity(&alias_metadata)
+        );
+        let snapshot = scan(
+            &[original, alias],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                snapshot.total_size(false),
+                snapshot.file_count(),
+                snapshot.directory_count(),
+                snapshot.roots.len()
+            ),
+            (11, 1, 1, 1)
+        );
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn subtree_refresh_does_not_reintroduce_a_retained_directory_alias() {
+        let temporary = tempfile::tempdir_in("/private/tmp").unwrap();
+        let original_path = fs::canonicalize(temporary.path()).unwrap();
+        let nested = original_path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("data"), [1; 11]).unwrap();
+        let alias = Path::new("/System/Volumes/Data").join(nested.strip_prefix("/").unwrap());
+        let original = scan(
+            &[original_path.clone(), alias],
+            &ScanOptions {
+                exclude: vec![format!("^{}$", regex::escape(&nested.to_string_lossy()))],
+                ..ScanOptions::default()
+            },
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let selected = original
+            .nodes
+            .iter()
+            .position(|node| node.path == original_path)
+            .unwrap();
+        let refreshed = refresh_subtree(
+            &original,
+            selected,
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                refreshed.total_size(false),
+                refreshed.file_count(),
+                refreshed.directory_count()
+            ),
+            (11, 1, 2)
+        );
+        assert!(refreshed.validate().is_ok());
+    }
+
+    #[test]
+    fn scan_excludes_matching_subtrees_and_rejects_invalid_regex() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("ignored")).unwrap();
+        fs::write(temporary.path().join("ignored/data"), [0; 10]).unwrap();
+        fs::write(temporary.path().join("keep"), [0; 2]).unwrap();
+        let options = ScanOptions {
+            exclude: vec!["[/\\\\]ignored$".to_owned()],
+            ..ScanOptions::default()
+        };
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.total_size(false), 2);
+        let options = ScanOptions {
+            exclude: vec!["[".to_owned()],
+            ..ScanOptions::default()
+        };
+        assert!(
+            scan(
+                &[temporary.path().to_owned()],
+                &options,
+                &ScanControl::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scan_preserves_missing_root_errors_and_rejects_no_viable_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("absent");
+        let snapshot = scan(
+            &[missing.clone(), temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert!(!snapshot.errors.is_empty());
+        assert!(scan(&[missing], &ScanOptions::default(), &ScanControl::default()).is_err());
+    }
+
+    #[test]
+    fn scan_returns_a_valid_cancelled_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let control = ScanControl::default();
+        control.cancelled.store(true, Ordering::Relaxed);
+        control.paused.store(true, Ordering::Relaxed);
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &control,
+        )
+        .unwrap();
+        assert!(snapshot.cancelled);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn checkpoint_waits_until_resumed() {
+        let control = ScanControl::default();
+        control.paused.store(true, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                control.paused.store(false, Ordering::Relaxed);
+            });
+            let started = std::time::Instant::now();
+            assert!(control.checkpoint());
+            assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+        });
+    }
+
+    #[test]
+    fn scan_supports_file_roots_and_updates_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        fs::write(&path, [7; 5]).unwrap();
+        let control = ScanControl::default();
+        let snapshot = scan(&[path], &ScanOptions::default(), &control).unwrap();
+        assert_eq!(
+            (
+                snapshot.total_size(false),
+                snapshot.file_count(),
+                snapshot.directory_count()
+            ),
+            (5, 1, 0)
+        );
+        assert_eq!(
+            (
+                control.visited.load(Ordering::Relaxed),
+                control.bytes.load(Ordering::Relaxed)
+            ),
+            (1, 5)
+        );
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn allocation_progress_replaces_the_previous_hardlink_owner_charge() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("data");
+        fs::write(&path, [1; 8]).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let mut snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        snapshot.nodes.clear();
+        snapshot.roots.clear();
+        let mut identities = HashMap::new();
+        let mut directories = HashSet::new();
+        let control = ScanControl::default();
+        for (name, allocated) in [("z-original", 4096), ("a-alias", 8192)] {
+            let mut node = node_from_metadata(path.clone(), None, &metadata);
+            node.path = temporary.path().join(name);
+            node.allocated_size = Some(allocated);
+            let index = insert_node(
+                &mut snapshot,
+                &mut identities,
+                &mut directories,
+                node,
+                &control,
+            )
+            .unwrap();
+            snapshot.roots.push(index);
+        }
+        assert_eq!(control.allocated_bytes.load(Ordering::Relaxed), 8192);
+        assert_eq!(control.bytes.load(Ordering::Relaxed), 16);
+        assert_eq!(snapshot.total_size(true), 8192);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn allocation_progress_tracks_unknown_metadata_and_resets_for_a_new_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("data");
+        fs::write(&path, [1; 8]).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let control = ScanControl::default();
+        let mut node = node_from_metadata(path.clone(), None, &metadata);
+        node.allocated_size = None;
+        update_progress(&control, &node);
+        assert_eq!(control.unknown_allocations.load(Ordering::Relaxed), 1);
+        assert_eq!(control.allocated_bytes.load(Ordering::Relaxed), 0);
+        control.allocated_bytes.store(123, Ordering::Relaxed);
+        let snapshot = scan(&[path], &ScanOptions::default(), &control).unwrap();
+        assert_eq!(control.unknown_allocations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            Some(control.allocated_bytes.load(Ordering::Relaxed)),
+            snapshot.nodes[snapshot.roots[0]].allocated_size
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_keeps_sparse_logical_bytes_separate_from_allocation_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("sparse");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        let control = ScanControl::default();
+        let snapshot = scan(&[path], &ScanOptions::default(), &control).unwrap();
+        assert_eq!(snapshot.total_size(false), 1024 * 1024);
+        assert!(snapshot.total_size(true) < snapshot.total_size(false));
+        assert_eq!(control.bytes.load(Ordering::Relaxed), 1024 * 1024);
+        assert_eq!(
+            control.allocated_bytes.load(Ordering::Relaxed),
+            snapshot.total_size(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_records_permission_denied_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked = temporary.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("secret"), [8; 10]).unwrap();
+        let canonical = fs::canonicalize(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+        let access_denied = fs::read_dir(&blocked).is_err();
+        let result = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        );
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        let snapshot = result.unwrap();
+        if access_denied {
+            assert!(!snapshot.errors.is_empty());
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| node.path == canonical && node.error.is_some())
+            );
+        }
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_symlink_cycles_or_root_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("data"), [0; 5]).unwrap();
+        let link = temporary.path().join("loop");
+        symlink(temporary.path(), &link).unwrap();
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!((snapshot.nodes.len(), snapshot.total_size(false)), (3, 5));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| node.kind == EntryKind::Symlink && node.children.is_empty())
+        );
+        let snapshot = scan(
+            &[link.join(".")],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!((snapshot.nodes.len(), snapshot.total_size(false)), (1, 0));
+        assert_eq!(snapshot.nodes[0].kind, EntryKind::Symlink);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_count_external_file_or_directory_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+        fs::write(targets.path().join("data"), [1; 8192]).unwrap();
+        symlink(targets.path(), temporary.path().join("directory-link")).unwrap();
+        symlink(
+            targets.path().join("data"),
+            temporary.path().join("file-link"),
+        )
+        .unwrap();
+        let control = ScanControl::default();
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                snapshot.total_size(false),
+                snapshot.total_size(true),
+                snapshot.file_count()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(snapshot.nodes.len(), 3);
+        assert_eq!(control.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(control.allocated_bytes.load(Ordering::Relaxed), 0);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_counts_hardlink_logical_bytes_twice_and_allocation_once() {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        fs::write(&original, [1; 8192]).unwrap();
+        fs::hard_link(&original, temporary.path().join("alias")).unwrap();
+        let blocks = fs::metadata(original).unwrap().blocks() * 512;
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.total_size(false), 16384);
+        assert_eq!(
+            snapshot.nodes[snapshot.roots[0]].allocated_size,
+            Some(blocks)
+        );
+        assert!(snapshot.validate().is_ok());
+    }
+}

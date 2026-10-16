@@ -1,0 +1,48 @@
+[package]
+name = "unidirstat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A modern cross-platform disk usage analyzer"
+license = "GPL-3.0-or-later"
+exclude = ["docs/private/**", ".agents/**", ".codex/**", "skills-lock.json"]
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd", "dep:notify", "dep:sysinfo", "dep:trash", "dep:renamore"]
+screenshot = ["gui", "eframe/__screenshot"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+sha2 = "0.10"
+regex = "1"
+rayon = "1.11"
+sys-locale = "0.3"
+tempfile = "3"
+eframe = { version = "0.33", optional = true, default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11", "persistence"] }
+rfd = { version = "0.17", optional = true }
+notify = { version = "8.2", optional = true }
+sysinfo = { version = "0.37", optional = true, default-features = false, features = ["disk"] }
+trash = { version = "5", optional = true }
+renamore = { version = "0.3.2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
+winapi-util = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+redundant_clone = "warn"
+large_enum_variant = "warn"
+needless_collect = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true
