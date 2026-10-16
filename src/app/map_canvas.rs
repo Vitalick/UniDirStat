@@ -1,0 +1,317 @@
+use super::workspace::{info_button, paint_label};
+use super::*;
+
+fn base_rect(rect: unidirstat::layout::Rect, data: &MapData, size: Vec2) -> egui::Rect {
+    let ratio = size / Vec2::new(data.width.max(1) as f32, data.height.max(1) as f32);
+    egui::Rect::from_min_size(
+        egui::Pos2::ZERO + Vec2::new(rect.x, rect.y) * ratio,
+        Vec2::new(rect.width, rect.height) * ratio,
+    )
+}
+
+fn selected_region(selection: &Selection, snapshot: &Snapshot, mut index: usize) -> bool {
+    loop {
+        if selection.contains(index) {
+            return true;
+        }
+        let Some(parent) = snapshot.nodes[index].parent else {
+            return false;
+        };
+        index = parent;
+    }
+}
+
+fn map_resolution(view: MapView, size: Vec2, detail: u32) -> (u32, u32) {
+    let vertical_detail = if view == MapView::Flame { 1 } else { detail };
+    (
+        (size.x * detail as f32).round().max(1.0) as u32,
+        (size.y * vertical_detail as f32).round().max(1.0) as u32,
+    )
+}
+
+impl UniDirStatApp {
+    pub(super) fn map_canvas(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>, height: f32) {
+        let frame = card(ui).inner_margin(12);
+        frame.show(ui, |ui| {
+            let bottom = ui.cursor().top() + (height - 24.0).max(1.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(tr("Storage map"));
+                info_button(ui, tr("Wheel zooms at the pointer; drag to pan. Double-click a folder to focus it. Cmd/Ctrl toggles selection. Use Up or Reset to return."));
+                egui::ComboBox::from_id_salt("map_view").width(130.0).selected_text(match self.settings.map_view { MapView::Treemap => tr("Treemap"), MapView::Flame => tr("Flame graph"), MapView::Sunburst => tr("Sunburst") }).show_ui(ui, |ui| {
+                    for (view, label) in [(MapView::Treemap, tr("Treemap")), (MapView::Flame, tr("Flame graph")), (MapView::Sunburst, tr("Sunburst"))] {
+                        if ui.selectable_value(&mut self.settings.map_view, view, label).changed() { self.map_viewport = MapViewport::default(); self.map_focus = None; }
+                    }
+                });
+                if ui.add_enabled(self.scope.is_some(), egui::Button::new(tr("Zoom out"))).clicked() {
+                    self.scope = self.scope.and_then(|index| snapshot.nodes[index].parent);
+                    self.map_viewport = MapViewport::default(); self.map_focus = None;
+                }
+                if ui.button(tr("Reset")).clicked() {
+                    self.scope = None; self.map_focus = None; self.map_viewport.reset();
+                }
+                if ui.add_enabled(self.selection.primary().is_some(), egui::Button::new(tr("Zoom to selection"))).clicked() {
+                    self.map_focus = self.selection.primary().and_then(|index| if snapshot.nodes[index].kind == EntryKind::Directory { Some(index) } else { snapshot.nodes[index].parent });
+                }
+                ui.label(format!("{:.0}%", self.map_viewport.scale * 100.0));
+            });
+            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).truncate());
+            let (bounds, canvas) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), (bottom - ui.cursor().top()).max(1.0)), Sense::click_and_drag());
+            let input = ui.input(|input| (input.pointer.hover_pos(), input.smooth_scroll_delta.y, input.zoom_delta(), input.pointer.delta(), input.pointer.primary_down() || input.pointer.middle_down(), input.pointer.press_origin(), input.pointer.is_decidedly_dragging(), input.stable_dt));
+            if let Some(pointer) = input.0.filter(|pointer| bounds.contains(*pointer)) {
+                let factor = ((input.1 * 0.003).exp() * input.2).clamp(0.5, 2.0);
+                if (factor - 1.0).abs() > 0.0001 {
+                    self.map_focus = None;
+                    self.map_viewport.zoom_at(pointer - bounds.min, factor, bounds.size());
+                    ui.ctx().input_mut(|input| { input.smooth_scroll_delta = Vec2::ZERO; input.raw_scroll_delta = Vec2::ZERO; });
+                }
+            }
+            if input.4 && input.6 && input.5.is_some_and(|origin| bounds.contains(origin)) {
+                self.map_focus = None; self.map_viewport.pan(input.3, bounds.size());
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            let detail = self.map_viewport.detail();
+            let (width, height) = map_resolution(self.settings.map_view, bounds.size(), detail);
+            let key = MapKey { scope: self.scope, allocated: self.settings.allocated, width, height, kind: match self.settings.map_view { MapView::Treemap => MapKind::Treemap, MapView::Flame => MapKind::Flame, MapView::Sunburst => MapKind::Sunburst } };
+            self.map_worker.request(key, Arc::clone(snapshot), ui.ctx());
+            let data = self.map_worker.data().map(Arc::clone);
+            if let (Some(index), Some(data)) = (self.map_focus, data.as_ref()) {
+                if let Some(tile) = data.frame(index).or_else(|| data.tiles.iter().find(|tile| tile.node == index).copied()) {
+                    self.map_viewport.zoom_to(base_rect(tile.rect, data, bounds.size()), bounds.size());
+                } else {
+                    self.map_viewport.zoom_at(bounds.size() / 2.0, if self.map_viewport.scale < 1.01 { 2.0 } else { 1.0 }, bounds.size());
+                }
+            }
+            let moving = self.map_viewport.tick(bounds.size(), input.7, self.settings.reduced_motion);
+            if moving { ui.ctx().request_repaint(); }
+            let painter = ui.painter().with_clip_rect(bounds.intersect(ui.clip_rect()));
+            painter.rect_filled(bounds, 5.0, ui.visuals().extreme_bg_color);
+            if let Some(data) = data.as_ref() {
+                if self.settings.map_view == MapView::Sunburst { self.sunburst_canvas(ui, snapshot, bounds, data); }
+                else {
+                    for tile in &data.frames {
+                        let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
+                        if !bounds.intersects(rect) { continue; }
+                        painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
+                        painter.rect_stroke(rect, 2.0, Stroke::new(0.6, muted(ui).gamma_multiply(0.5)), StrokeKind::Inside);
+                        let response = ui.interact(rect.intersect(bounds), ui.id().with(("directory-region", tile.node)), Sense::click());
+                        self.map_item(ui, response, tile.node, snapshot, base_rect(tile.rect, data, bounds.size()), bounds.size());
+                    }
+                    for tile in &data.aggregates {
+                        let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
+                        if !bounds.intersects(rect) { continue; }
+                        painter.rect_filled(rect, 1.0, muted(ui).gamma_multiply(0.4));
+                        if rect.height() >= 18.0 { paint_label(ui, rect.intersect(bounds).shrink(3.0), tr("Small files"), ui.visuals().text_color(), HELP_SIZE); }
+                    }
+                    for tile in &data.tiles {
+                        let base = base_rect(tile.rect, data, bounds.size());
+                        let rect = self.map_viewport.rect(base, bounds.min);
+                        if !bounds.intersects(rect) || rect.width() < 0.5 || rect.height() < 0.5 { continue; }
+                        let node = &snapshot.nodes[tile.node];
+                        let gap = (self.settings.tile_gap / 2.0).min(rect.width() / 5.0).min(rect.height() / 5.0);
+                        let tile_rect = rect.shrink(gap);
+                        let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
+                        let color = extension_color(&node.extension());
+                        let fill = Color32::from_rgb(color.r(), color.g(), color.b());
+                        painter.rect_filled(tile_rect, 3.0, fill);
+                        if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), 3.0, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside); }
+                        if self.settings.labels && tile_rect.height() >= 17.0 && tile_rect.width() >= 12.0 {
+                            let label = tile_rect.intersect(bounds).shrink2(Vec2::new(4.0, 1.0));
+                            paint_label(ui, egui::Rect::from_min_size(label.min, Vec2::new(label.width(), 18.0)), &node.name(), tile_text_color(fill), HELP_SIZE);
+                            if label.height() >= 37.0 { paint_label(ui, label.translate(Vec2::new(0.0, 19.0)).with_max_y(label.bottom()), &format_bytes(node.size(self.settings.allocated)), tile_text_color(fill), HELP_SIZE); }
+                        }
+                        self.map_item(ui, response, tile.node, snapshot, base, bounds.size());
+                    }
+                    for index in self.selection.indices() {
+                        if let Some(tile) = data.frame(index) {
+                            let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
+                            painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
+                        }
+                    }
+                }
+            }
+            if self.map_worker.pending() {
+                let (done, total) = self.map_worker.progress();
+                painter.rect_filled(egui::Rect::from_min_size(bounds.left_top(), Vec2::new(bounds.width().min(420.0), 30.0)), 4.0, ui.visuals().window_fill);
+                painter.text(bounds.left_top() + Vec2::splat(8.0), egui::Align2::LEFT_TOP, trf("Preparing map: {done} / {total}", &[("done", done.to_string()), ("total", total.to_string())]), FontId::proportional(HELP_SIZE), ui.visuals().text_color());
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            if let Some(error) = self.map_worker.error() { canvas.on_hover_text(trf("Error: {details}", &[("details", error.into())])); }
+            if !moving && data.is_some() && let Some(index) = self.map_focus.take() {
+                self.scope = Some(index); self.map_viewport = MapViewport::default(); ui.ctx().request_repaint();
+            }
+        });
+    }
+
+    fn map_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: egui::Response,
+        index: usize,
+        snapshot: &Snapshot,
+        base: egui::Rect,
+        size: Vec2,
+    ) {
+        self.item_response(response.clone(), index, snapshot, SelectionView::Single);
+        if response.double_clicked() {
+            self.map_viewport.zoom_to(base, size);
+            if snapshot.nodes[index].kind == EntryKind::Directory && self.scope != Some(index) {
+                self.map_focus = Some(index);
+            }
+            ui.ctx().request_repaint();
+        }
+        response.on_hover_ui(|ui| {
+            ui.label(snapshot.nodes[index].path.display().to_string());
+            ui.label(format_bytes(
+                snapshot.nodes[index].size(self.settings.allocated),
+            ));
+        });
+    }
+
+    fn sunburst_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        bounds: egui::Rect,
+        data: &MapData,
+    ) {
+        let size = bounds.size();
+        let center = egui::Pos2::ZERO + size / 2.0;
+        let radius = size.x.min(size.y) / 2.0 - 5.0;
+        let Some(summary) = self.map_worker.summary() else {
+            return;
+        };
+        let depth = summary.depth.min(11);
+        let band = radius / (depth + 2) as f32;
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        let painter = ui
+            .painter()
+            .with_clip_rect(bounds.intersect(ui.clip_rect()));
+        let mut hovered = None;
+        for sector in &data.sectors {
+            if sector.depth > depth {
+                continue;
+            }
+            let inner = band * (sector.depth + 1) as f32;
+            let outer = inner + band - 1.0;
+            let span = sector.end - sector.start;
+            if span * outer * self.map_viewport.scale < 1.0 {
+                continue;
+            }
+            let steps =
+                ((span * outer * self.map_viewport.scale / 6.0).ceil() as usize).clamp(2, 160);
+            let fill = extension_color(&snapshot.nodes[sector.node].extension());
+            let mut mesh = egui::Mesh::default();
+            for step in 0..=steps {
+                let angle =
+                    sector.start + span * step as f32 / steps as f32 - std::f32::consts::FRAC_PI_2;
+                for distance in [inner, outer] {
+                    let point = center + Vec2::angled(angle) * distance;
+                    mesh.colored_vertex(
+                        bounds.min
+                            + self.map_viewport.offset
+                            + point.to_vec2() * self.map_viewport.scale,
+                        fill,
+                    );
+                }
+                if step > 0 {
+                    let vertex = (step * 2) as u32;
+                    mesh.add_triangle(vertex - 2, vertex - 1, vertex);
+                    mesh.add_triangle(vertex - 1, vertex + 1, vertex);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            let middle = sector.start + span / 2.0 - std::f32::consts::FRAC_PI_2;
+            let point = center + Vec2::angled(middle) * ((inner + outer) / 2.0);
+            let label_center =
+                bounds.min + self.map_viewport.offset + point.to_vec2() * self.map_viewport.scale;
+            if self.settings.labels
+                && span * inner * self.map_viewport.scale > 50.0
+                && band * self.map_viewport.scale > 19.0
+            {
+                let width = (span * inner * self.map_viewport.scale * 0.7).min(140.0);
+                paint_label(
+                    ui,
+                    egui::Rect::from_center_size(label_center, Vec2::new(width, 18.0))
+                        .intersect(bounds),
+                    &snapshot.nodes[sector.node].name(),
+                    tile_text_color(fill),
+                    HELP_SIZE,
+                );
+            }
+            if selected_region(&self.selection, snapshot, sector.node) {
+                painter.circle_stroke(
+                    label_center,
+                    3.0,
+                    Stroke::new(2.0, ui.visuals().text_color()),
+                );
+            }
+            if let Some(pointer) = pointer.filter(|pointer| bounds.contains(*pointer)) {
+                let relative = (pointer - bounds.min - self.map_viewport.offset)
+                    / self.map_viewport.scale
+                    - center.to_vec2();
+                let angle = (relative.angle() + std::f32::consts::FRAC_PI_2)
+                    .rem_euclid(std::f32::consts::TAU);
+                if relative.length() >= inner
+                    && relative.length() <= outer
+                    && angle >= sector.start
+                    && angle <= sector.end
+                {
+                    hovered = Some((sector.node, point));
+                }
+            }
+        }
+        let response = ui.interact(bounds, ui.id().with("sunburst-hit"), Sense::click());
+        let target = if response.context_menu_opened() {
+            self.selection.primary().map(|index| (index, center))
+        } else {
+            hovered
+        };
+        if let Some((index, point)) = target {
+            let focus = egui::Rect::from_center_size(point, size / 2.0);
+            self.map_item(ui, response, index, snapshot, focus, size);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flame_refinement_never_changes_vertical_geometry() {
+        assert_eq!(
+            map_resolution(MapView::Flame, Vec2::new(800.0, 240.0), 4),
+            (3200, 240)
+        );
+        assert_eq!(
+            map_resolution(MapView::Treemap, Vec2::new(800.0, 240.0), 4),
+            (3200, 960)
+        );
+    }
+
+    #[test]
+    fn folder_selection_highlights_descendants_but_not_other_branches() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let folder = fixture.path().join("inside");
+        std::fs::create_dir(&folder).expect("directory");
+        std::fs::write(folder.join("child"), b"inside").expect("file");
+        std::fs::write(fixture.path().join("other"), b"outside").expect("file");
+        let snapshot = scanner::scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .expect("scan");
+        let find = |name: &str| {
+            snapshot
+                .nodes
+                .iter()
+                .position(|node| node.name() == name)
+                .expect("node")
+        };
+        let mut selection = Selection::default();
+        selection.click(find("inside"), &[], false, false);
+        assert!(selected_region(&selection, &snapshot, find("child")));
+        assert!(!selected_region(&selection, &snapshot, find("other")));
+    }
+}

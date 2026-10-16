@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, Metadata, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::model::{EntryKind, Node, Snapshot};
-use crate::scanner::{ScanControl, file_identity, path_identity, thread_pool};
+use crate::scanner::{ScanControl, ScanPhase, file_identity, path_identity, thread_pool};
 
 #[derive(Clone, Debug)]
 pub struct ExtensionStats {
@@ -35,10 +35,15 @@ pub fn extensions_with_control(
     if !control.checkpoint() {
         return Err("Analysis cancelled".into());
     }
+    control.start_work(snapshot.nodes.len() as u64);
+    control.set_phase(ScanPhase::Summarizing);
     let mut summary = BTreeMap::<String, (u64, u64)>::new();
-    for node in &snapshot.nodes {
+    for (position, node) in snapshot.nodes.iter().enumerate() {
         if !control.checkpoint() {
             return Err("Analysis cancelled".into());
+        }
+        if position % 256 == 0 && position > 0 {
+            control.advance_work(256);
         }
         if node.kind != EntryKind::File {
             continue;
@@ -47,12 +52,19 @@ pub fn extensions_with_control(
         item.0 = item.0.saturating_add(node.size(allocated));
         item.1 = item.1.saturating_add(1);
     }
+    control.advance_work((snapshot.nodes.len() % 256) as u64);
+    if !snapshot.nodes.is_empty() && snapshot.nodes.len().is_multiple_of(256) {
+        control.advance_work(256);
+    }
+    control.start_work((summary.len() as u64).saturating_mul(2));
+    control.set_phase(ScanPhase::Sorting);
     let mut ordered = BTreeMap::new();
     for (extension, (bytes, files)) in summary {
         if !control.checkpoint() {
             return Err("Analysis cancelled".into());
         }
         ordered.insert((Reverse(bytes), extension), files);
+        control.advance_work(1);
     }
     let mut result = Vec::with_capacity(ordered.len());
     for ((Reverse(bytes), extension), files) in ordered {
@@ -64,6 +76,7 @@ pub fn extensions_with_control(
             bytes,
             files,
         });
+        control.advance_work(1);
     }
     if !control.checkpoint() {
         return Err("Analysis cancelled".into());
@@ -79,6 +92,12 @@ pub fn largest_files_with_control(
     if !control.checkpoint() {
         return Err("Analysis cancelled".into());
     }
+    control.start_work(if limit == 0 {
+        0
+    } else {
+        snapshot.nodes.len() as u64
+    });
+    control.set_phase(ScanPhase::Summarizing);
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -86,6 +105,9 @@ pub fn largest_files_with_control(
     for (index, node) in snapshot.nodes.iter().enumerate() {
         if !control.checkpoint() {
             return Err("Analysis cancelled".into());
+        }
+        if index % 256 == 0 && index > 0 {
+            control.advance_work(256);
         }
         if node.kind != EntryKind::File {
             continue;
@@ -98,6 +120,10 @@ pub fn largest_files_with_control(
         if largest.len() > limit {
             largest.pop_last();
         }
+    }
+    control.advance_work((snapshot.nodes.len() % 256) as u64);
+    if !snapshot.nodes.is_empty() && snapshot.nodes.len().is_multiple_of(256) {
+        control.advance_work(256);
     }
     let mut result = Vec::with_capacity(largest.len());
     for (_, index) in largest {
@@ -196,11 +222,14 @@ pub fn find_duplicates_with_options(
     let mut sizes = BTreeMap::<u64, Vec<usize>>::new();
     let mut identities = HashSet::new();
     let mut hashes = BTreeMap::<(u64, String), Vec<usize>>::new();
+    control.start_work(snapshot.nodes.len() as u64);
+    control.set_phase(ScanPhase::Filtering);
     for (index, node) in snapshot.nodes.iter().enumerate() {
         if !control.checkpoint() {
             report.cancelled = true;
             return report;
         }
+        control.advance_work(1);
         if node.kind != EntryKind::File || node.logical_size == 0 {
             continue;
         }
@@ -213,29 +242,102 @@ pub fn find_duplicates_with_options(
         }
         sizes.entry(node.logical_size).or_default().push(index);
     }
-    let candidates: Vec<_> = sizes
+    let (large, small): (Vec<_>, Vec<_>) = sizes
         .into_values()
         .filter(|indices| indices.len() > 1)
         .flatten()
-        .collect();
+        .partition(|index| snapshot.nodes[*index].logical_size > 256 * 1024);
+    let mut candidates: Vec<_> = small.into_iter().map(|index| (index, None)).collect();
+    control.start_work(large.len() as u64);
+    control.set_phase(ScanPhase::Sampling);
+    let sampled: Vec<_> = pool.install(|| {
+        large
+            .into_par_iter()
+            .map(|index| match sample_file(&snapshot.nodes[index], control) {
+                Ok(None) => None,
+                result => {
+                    control.visited.fetch_add(1, Ordering::Relaxed);
+                    control.advance_work(1);
+                    Some((index, result))
+                }
+            })
+            .while_some()
+            .collect()
+    });
+    let mut samples = BTreeMap::<(u64, String), Vec<(usize, Metadata)>>::new();
+    let mut errors = Vec::new();
+    for (index, result) in sampled {
+        if !control.checkpoint() {
+            report.cancelled = true;
+            return report;
+        }
+        match result {
+            Ok(Some((hash, metadata))) => samples
+                .entry((snapshot.nodes[index].logical_size, hash))
+                .or_default()
+                .push((index, metadata)),
+            Err(error) => errors.push((
+                index,
+                format!("{}: {error}", snapshot.nodes[index].path.display()),
+            )),
+            Ok(None) => {}
+        }
+    }
+    errors.sort_unstable_by_key(|(index, _)| *index);
+    report
+        .errors
+        .extend(errors.into_iter().map(|(_, error)| error));
+    for nodes in samples.into_values().filter(|nodes| nodes.len() > 1) {
+        if !control.checkpoint() {
+            report.cancelled = true;
+            return report;
+        }
+        candidates.extend(
+            nodes
+                .into_iter()
+                .map(|(index, metadata)| (index, Some(metadata))),
+        );
+    }
+    if !control.checkpoint() {
+        report.cancelled = true;
+        return report;
+    }
+    control.start_work(candidates.len() as u64);
+    control.set_phase(ScanPhase::Hashing);
     let hashed: Vec<_> = pool.install(|| {
         candidates
             .into_par_iter()
-            .map(|index| {
+            .map(|(index, sampled_metadata)| {
                 let result = match options.algorithm {
                     HashAlgorithm::Sha256 => hash_file(&snapshot.nodes[index], control),
                     HashAlgorithm::Sha512 => {
-                        hash_file_digest::<Sha512>(&snapshot.nodes[index], control)
+                        hash_file_digest::<Sha512>(&snapshot.nodes[index], control, None)
                     }
                 };
+                let result = result.and_then(|result| match result {
+                    Some((_, ref metadata))
+                        if sampled_metadata
+                            .as_ref()
+                            .is_some_and(|sampled| !metadata_unchanged(sampled, metadata)) =>
+                    {
+                        Err("file changed since sampling".into())
+                    }
+                    result => Ok(result),
+                });
                 match result {
                     Ok(Some(result)) => {
-                        control.visited.fetch_add(1, Ordering::Relaxed);
+                        if sampled_metadata.is_none() {
+                            control.visited.fetch_add(1, Ordering::Relaxed);
+                        }
+                        control.advance_work(1);
                         Some((index, Ok(result)))
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        control.visited.fetch_add(1, Ordering::Relaxed);
+                        if sampled_metadata.is_none() {
+                            control.visited.fetch_add(1, Ordering::Relaxed);
+                        }
+                        control.advance_work(1);
                         Some((index, Err(error)))
                     }
                 }
@@ -269,6 +371,8 @@ pub fn find_duplicates_with_options(
         report.cancelled = true;
         return report;
     }
+    control.start_work(finished.len() as u64);
+    control.set_phase(ScanPhase::Validating);
     let validated: Vec<_> = pool.install(|| {
         finished
             .into_par_iter()
@@ -288,6 +392,7 @@ pub fn find_duplicates_with_options(
                     Ok(_) => Err(format!("{}: changed after hashing", node.path.display())),
                     Err(error) => Err(format!("{}: {error}", node.path.display())),
                 };
+                control.advance_work(1);
                 Some((index, result))
             })
             .while_some()
@@ -318,12 +423,15 @@ pub fn find_duplicates_with_options(
         report.cancelled = true;
         return report;
     }
+    control.start_work(hashes.len() as u64);
+    control.set_phase(ScanPhase::Sorting);
     for ((size, hash), mut nodes) in hashes {
         if !control.checkpoint() {
             report.cancelled = true;
             report.groups.clear();
             return report;
         }
+        control.advance_work(1);
         if nodes.len() > 1 {
             nodes.sort_unstable();
             report.groups.push(DuplicateGroup { size, hash, nodes });
@@ -347,12 +455,21 @@ pub fn find_duplicates_with_options(
 }
 
 fn hash_file(node: &Node, control: &ScanControl) -> Result<Option<(String, Metadata)>, String> {
-    hash_file_digest::<Sha256>(node, control)
+    hash_file_digest::<Sha256>(node, control, None)
+}
+
+fn sample_file(node: &Node, control: &ScanControl) -> Result<Option<(String, Metadata)>, String> {
+    hash_file_digest::<Sha256>(
+        node,
+        control,
+        Some([0, node.logical_size / 2 - 2048, node.logical_size - 4096]),
+    )
 }
 
 fn hash_file_digest<Hash: Digest>(
     node: &Node,
     control: &ScanControl,
+    sample_offsets: Option<[u64; 3]>,
 ) -> Result<Option<(String, Metadata)>, String>
 where
     sha2::digest::Output<Hash>: std::fmt::LowerHex,
@@ -423,24 +540,39 @@ where
     let mut buffer = vec![0; 64 * 1024];
     let mut hash = Hash::new();
     let mut length = 0_u64;
-    loop {
-        if !control.checkpoint() {
-            return Ok(None);
+    if let Some(offsets) = sample_offsets {
+        for offset in offsets {
+            if !control.checkpoint() {
+                return Ok(None);
+            }
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| error.to_string())?;
+            file.read_exact(&mut buffer[..4096])
+                .map_err(|error| error.to_string())?;
+            length += 4096;
+            hash.update(&buffer[..4096]);
+            control.bytes.fetch_add(4096, Ordering::Relaxed);
         }
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
+    } else {
+        loop {
+            if !control.checkpoint() {
+                return Ok(None);
+            }
+            let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            length = length.saturating_add(count as u64);
+            if length > before.len() {
+                return Err("file grew while hashing".into());
+            }
+            hash.update(&buffer[..count]);
+            control.bytes.fetch_add(count as u64, Ordering::Relaxed);
         }
-        length = length.saturating_add(count as u64);
-        if length > before.len() {
-            return Err("file grew while hashing".into());
-        }
-        hash.update(&buffer[..count]);
-        control.bytes.fetch_add(count as u64, Ordering::Relaxed);
     }
     let after = file.metadata().map_err(|error| error.to_string())?;
     let current = fs::symlink_metadata(&node.path).map_err(|error| error.to_string())?;
-    if length != before.len()
+    if length != sample_offsets.map_or(before.len(), |_| 3 * 4096)
         || !metadata_unchanged(&opened, &after)
         || !metadata_unchanged(&after, &current)
         || file_identity(&file, &after).as_ref() != Some(identity)
@@ -500,6 +632,7 @@ fn unavailable_content(_metadata: &Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::sync::atomic::Ordering;
 
     use super::*;
@@ -526,6 +659,151 @@ mod tests {
         assert_eq!(report.groups[0].nodes.len(), 2);
         assert_eq!(report.groups[0].hash.len(), 64);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn sampling_rejects_different_large_files_without_reading_all_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first"), vec![1; 2 * 1024 * 1024]).unwrap();
+        fs::write(directory.path().join("second"), vec![2; 2 * 1024 * 1024]).unwrap();
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let control = ScanControl::default();
+
+        let report = find_duplicates(&snapshot, &control);
+
+        assert!(report.groups.is_empty());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(control.bytes.load(Ordering::Relaxed) < 1024 * 1024);
+    }
+
+    #[test]
+    fn matching_samples_still_require_equal_full_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = vec![7; 2 * 1024 * 1024];
+        fs::write(directory.path().join("first"), &payload).unwrap();
+        fs::write(directory.path().join("copy"), &payload).unwrap();
+        let mut different = payload;
+        different[512 * 1024] = 8;
+        fs::write(directory.path().join("different"), &different).unwrap();
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        for algorithm in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+            let control = ScanControl::default();
+            let report = find_duplicates_with_options(
+                &snapshot,
+                &DuplicateOptions {
+                    algorithm,
+                    threads: 2,
+                },
+                &control,
+            );
+
+            assert_eq!(report.groups.len(), 1);
+            let mut names: Vec<_> = report.groups[0]
+                .nodes
+                .iter()
+                .map(|index| snapshot.nodes[*index].name())
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["copy", "first"]);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(control.bytes.load(Ordering::Relaxed) >= 6 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn duplicate_stages_report_work_and_honor_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::write(directory.path().join(name), vec![7; 2 * 1024 * 1024]).unwrap();
+        }
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        for phase in [
+            ScanPhase::Sampling,
+            ScanPhase::Hashing,
+            ScanPhase::Validating,
+        ] {
+            let control = ScanControl::default();
+            let gate = crate::scanner::tests::register_gate(&control, phase);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    find_duplicates_with_options(
+                        &snapshot,
+                        &DuplicateOptions {
+                            threads: 1,
+                            ..DuplicateOptions::default()
+                        },
+                        &control,
+                    )
+                });
+                gate.arrived.wait();
+                assert_eq!(control.phase(), phase);
+                assert_eq!(control.work_done.load(Ordering::Relaxed), 1);
+                assert_eq!(control.work_total.load(Ordering::Relaxed), 2);
+                control.cancel();
+                gate.release.wait();
+                let report = worker.join().unwrap();
+                assert!(report.cancelled);
+                assert!(report.groups.is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn files_changed_after_sampling_are_not_reported_as_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join("first"),
+            directory.path().join("second"),
+        ];
+        for path in &paths {
+            fs::write(path, vec![7; 2 * 1024 * 1024]).unwrap();
+        }
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let control = ScanControl::default();
+        let gate = crate::scanner::tests::register_gate(&control, ScanPhase::Sampling);
+        let report = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                find_duplicates_with_options(
+                    &snapshot,
+                    &DuplicateOptions {
+                        threads: 1,
+                        ..DuplicateOptions::default()
+                    },
+                    &control,
+                )
+            });
+            gate.arrived.wait();
+            for path in &paths {
+                let mut file = OpenOptions::new().write(true).open(path).unwrap();
+                file.seek(SeekFrom::Start(512 * 1024)).unwrap();
+                file.write_all(&[8]).unwrap();
+            }
+            gate.release.wait();
+            worker.join().unwrap()
+        });
+
+        assert!(report.groups.is_empty());
+        assert!(!report.errors.is_empty());
     }
 
     #[test]
@@ -557,14 +835,19 @@ mod tests {
     fn parallel_duplicates_match_serial_results() {
         let directory = tempfile::tempdir().unwrap();
         for number in 1..=24_u8 {
+            let length = if number < 20 {
+                number as usize
+            } else {
+                512 * 1024 + number as usize
+            };
             fs::write(
                 directory.path().join(format!("{number}-a")),
-                vec![number; number as usize],
+                vec![number; length],
             )
             .unwrap();
             fs::write(
                 directory.path().join(format!("{number}-b")),
-                vec![number; number as usize],
+                vec![number; length],
             )
             .unwrap();
         }
@@ -693,6 +976,65 @@ mod tests {
 
         assert!(extensions_with_control(&snapshot, false, &control).is_err());
         assert!(largest_files_with_control(&snapshot, 5, &control).is_err());
+    }
+
+    #[test]
+    fn summaries_report_completed_work_and_preserve_scan_totals() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("data.txt"), b"content").unwrap();
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let control = ScanControl::default();
+        control.visited.store(42, Ordering::Relaxed);
+        extensions_with_control(&snapshot, false, &control).unwrap();
+        assert_eq!(
+            control.work_done.load(Ordering::Relaxed),
+            control.work_total.load(Ordering::Relaxed)
+        );
+        largest_files_with_control(&snapshot, 5, &control).unwrap();
+        assert_eq!(
+            control.work_done.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64
+        );
+        assert_eq!(
+            control.work_total.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64
+        );
+        assert_eq!(control.visited.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn summaries_cancel_after_reporting_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("data.txt"), b"content").unwrap();
+        let snapshot = scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        for extensions in [true, false] {
+            let control = ScanControl::default();
+            let gate = crate::scanner::tests::register_gate(&control, ScanPhase::Summarizing);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    if extensions {
+                        extensions_with_control(&snapshot, false, &control).map(|_| ())
+                    } else {
+                        largest_files_with_control(&snapshot, 5, &control).map(|_| ())
+                    }
+                });
+                gate.arrived.wait();
+                assert!(control.work_done.load(Ordering::Relaxed) > 0);
+                control.cancel();
+                gate.release.wait();
+                assert!(worker.join().unwrap().is_err());
+            });
+        }
     }
 
     #[test]
@@ -918,8 +1260,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first");
         let second = directory.path().join("second");
-        fs::write(&first, b"same").unwrap();
-        fs::write(&second, b"same").unwrap();
+        let payload = vec![7; 512 * 1024];
+        fs::write(&first, &payload).unwrap();
+        fs::write(&second, &payload).unwrap();
         let control = ScanControl::default();
         let snapshot = scan(
             &[directory.path().into()],
@@ -928,7 +1271,7 @@ mod tests {
         )
         .unwrap();
         fs::rename(&second, directory.path().join("old")).unwrap();
-        fs::write(&second, b"same").unwrap();
+        fs::write(&second, &payload).unwrap();
 
         let report = find_duplicates(&snapshot, &control);
 

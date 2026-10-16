@@ -11,6 +11,9 @@ use std::{
 };
 
 use crate::i18n::{Language, set_language, tr, trf};
+use crate::map_job::{MapData, MapKey, MapKind, MapWorker};
+use crate::map_view::MapViewport;
+use crate::selection::Selection;
 use crate::volumes::{Volume, mounted_volumes};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Layout, RichText, Sense, Stroke, StrokeKind, Vec2,
@@ -20,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use unidirstat::{
     actions,
     analysis::{self, DuplicateReport, ExtensionStats, HashAlgorithm},
-    layout,
     model::{EntryKind, Node, Snapshot},
     report,
     scanner::{self, ScanControl, ScanOptions, ScanPhase},
@@ -28,7 +30,15 @@ use unidirstat::{
 };
 
 const ACCENT: Color32 = Color32::from_rgb(119, 131, 255);
+mod map_canvas;
+mod workspace;
+use workspace::language_icon;
 const PRIMARY_BUTTON: Color32 = Color32::from_rgb(90, 102, 220);
+const BODY_SIZE: f32 = 14.0;
+const HELP_SIZE: f32 = 13.0;
+const CONTROL_HEIGHT: f32 = 36.0;
+const ROW_HEIGHT: f32 = 34.0;
+const INPUT_MARGIN: egui::Margin = egui::Margin::symmetric(12, 8);
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(116, 132, 238),
     Color32::from_rgb(80, 182, 170),
@@ -63,6 +73,8 @@ enum MapView {
 struct Settings {
     language: Language,
     theme: Theme,
+    reduced_motion: bool,
+    mac_access_reviewed: bool,
     font_scale: f32,
     show_modified: bool,
     show_share: bool,
@@ -83,6 +95,8 @@ impl Default for Settings {
         Self {
             language: Language::System,
             theme: Theme::System,
+            reduced_motion: false,
+            mac_access_reviewed: false,
             font_scale: 1.0,
             show_modified: true,
             show_share: true,
@@ -183,6 +197,8 @@ fn build_rows(
     control: &ScanControl,
 ) -> Result<Vec<(usize, usize)>, String> {
     let found = index.search(query, control)?;
+    control.set_phase(ScanPhase::Mapping);
+    control.start_work(found.len() as u64);
     if flat {
         let mut rows = Vec::with_capacity(found.len());
         for index in found {
@@ -190,6 +206,7 @@ fn build_rows(
                 return Err(tr("Cancelled").into());
             }
             rows.push((index, 0));
+            control.advance_work(1);
         }
         return Ok(rows);
     }
@@ -206,15 +223,21 @@ fn build_rows(
             None => roots.push(index),
             _ => {}
         }
+        control.advance_work(1);
     }
     let mut pending: Vec<_> = roots.into_iter().rev().map(|index| (index, 0)).collect();
     let mut rows = Vec::new();
+    control.start_work(pending.len() as u64);
     while let Some((index, depth)) = pending.pop() {
         if !control.checkpoint() {
             return Err(tr("Cancelled").into());
         }
         rows.push((index, depth));
+        control.advance_work(1);
         if let Some(children) = children.remove(&index) {
+            control
+                .work_total
+                .fetch_add(children.len() as u64, Ordering::Relaxed);
             pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
         }
     }
@@ -295,6 +318,13 @@ impl JobKind {
     fn cancellable(self) -> bool {
         matches!(self, Self::Scan | Self::Refresh | Self::Duplicates)
     }
+
+    fn reports_work(self) -> bool {
+        matches!(
+            self,
+            Self::Scan | Self::Refresh | Self::Load | Self::Duplicates
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +342,86 @@ fn job_state(control: &ScanControl) -> JobState {
     } else {
         JobState::Running
     }
+}
+
+fn page_needs_rows(page: Page, largest: bool) -> bool {
+    matches!(page, Page::Overview | Page::Files | Page::Largest)
+        && (page == Page::Largest) != largest
+}
+
+fn clickable_row(response: egui::Response) -> egui::Response {
+    response.interact(Sense::click())
+}
+
+fn click_modifiers(context: &egui::Context) -> egui::Modifiers {
+    context.input(|input| {
+        input
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or(input.modifiers)
+    })
+}
+
+fn phase_label(phase: ScanPhase) -> &'static str {
+    match phase {
+        ScanPhase::Idle => tr("Starting"),
+        ScanPhase::Discovering => tr("Discovering files"),
+        ScanPhase::Finalizing => tr("Finalizing totals"),
+        ScanPhase::Complete => tr("Preparing results"),
+        ScanPhase::Indexing => tr("Indexing files"),
+        ScanPhase::Summarizing => tr("Calculating statistics"),
+        ScanPhase::Sorting => tr("Sorting results"),
+        ScanPhase::Mapping => tr("Building file view"),
+        ScanPhase::Filtering => tr("Filtering entries"),
+        ScanPhase::Sampling => tr("Comparing file samples"),
+        ScanPhase::Hashing => tr("Verifying full contents"),
+        ScanPhase::Validating => tr("Validating file identities"),
+    }
+}
+
+fn show_work_progress(ui: &mut egui::Ui, control: &ScanControl) {
+    let total = control.work_total.load(Ordering::Relaxed);
+    let done = control.work_done.load(Ordering::Relaxed).min(total);
+    if total > 0 {
+        ui.label(trf(
+            "{stage}: {done} / {total}",
+            &[
+                ("stage", phase_label(control.phase()).into()),
+                ("done", done.to_string()),
+                ("total", total.to_string()),
+            ],
+        ));
+        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_height(5.0));
+    } else {
+        ui.label(phase_label(control.phase()));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SelectionView {
+    Files,
+    Overview,
+    Duplicates,
+    Single,
+}
+
+fn duplicate_file_order(rows: &[DuplicateRow]) -> Vec<(usize, usize)> {
+    rows.iter()
+        .filter_map(|row| match row {
+            DuplicateRow::File(index) => Some((*index, 0)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn load_settings(path: &Path) -> Result<Settings, String> {
@@ -381,12 +491,15 @@ fn storage_buckets_with_control(
     timestamp: u64,
     control: &ScanControl,
 ) -> Option<([u64; 4], [u64; 4])> {
+    control.set_phase(ScanPhase::Summarizing);
+    control.start_work(snapshot.nodes.len() as u64);
     let mut sizes = [0_u64; 4];
     let mut files = [0_u64; 4];
     for node in &snapshot.nodes {
         if !control.checkpoint() {
             return None;
         }
+        control.advance_work(1);
         if node.kind != EntryKind::File {
             continue;
         }
@@ -484,11 +597,18 @@ pub struct UniDirStatApp {
     job_kind: Option<JobKind>,
     control: Arc<ScanControl>,
     job_started: Instant,
+    progress_marker: (u64, u64, u64, u8),
+    progress_changed: Instant,
     duplicates: Option<Arc<DuplicateReport>>,
     duplicate_rows: Vec<DuplicateRow>,
     duplicate_reclaimable: u64,
     extensions: [Vec<ExtensionStats>; 2],
     selected: Option<usize>,
+    selection: Selection,
+    rows_largest: bool,
+    last_page: Page,
+    access_open: bool,
+    scan_after_access: bool,
     scope: Option<usize>,
     expanded: HashSet<usize>,
     search_query: SearchQuery,
@@ -496,6 +616,7 @@ pub struct UniDirStatApp {
     search_receiver: Option<Receiver<RowsReady>>,
     search_control: Arc<ScanControl>,
     search_generation: u64,
+    search_started: Instant,
     filter_name: String,
     filter_error: Option<String>,
     rows: Vec<(usize, usize)>,
@@ -510,9 +631,11 @@ pub struct UniDirStatApp {
     changed: Arc<AtomicBool>,
     last_change: Option<Instant>,
     last_dark: Option<bool>,
-    map_tiles: Vec<layout::Tile>,
-    map_sectors: Vec<layout::Sector>,
-    map_key: Option<(usize, bool, u32, u32, u8)>,
+    map_worker: MapWorker,
+    map_viewport: MapViewport,
+    map_focus: Option<usize>,
+    reveal_row: Option<usize>,
+    column_widths: [f32; 4],
     permission_details: Option<(PathBuf, String)>,
     volumes: Vec<Volume>,
     largest: Vec<usize>,
@@ -565,6 +688,8 @@ impl UniDirStatApp {
         context.egui_ctx.set_zoom_factor(settings.font_scale);
         settings.tile_gap = settings.tile_gap.clamp(1.0, 6.0);
         settings.price_per_gib = settings.price_per_gib.clamp(0.0, 1000.0);
+        let access_open =
+            cfg!(target_os = "macos") && !settings.mac_access_reviewed && load.is_none();
         let mut app = Self {
             settings,
             settings_path,
@@ -577,11 +702,18 @@ impl UniDirStatApp {
             job_kind: None,
             control: Arc::default(),
             job_started: Instant::now(),
+            progress_marker: (0, 0, 0, 0),
+            progress_changed: Instant::now(),
             duplicates: None,
             duplicate_rows: Vec::new(),
             duplicate_reclaimable: 0,
             extensions: [Vec::new(), Vec::new()],
             selected: None,
+            selection: Selection::default(),
+            rows_largest: false,
+            last_page: Page::Overview,
+            access_open,
+            scan_after_access: false,
             scope: None,
             expanded: HashSet::new(),
             search_query: SearchQuery::default(),
@@ -589,6 +721,7 @@ impl UniDirStatApp {
             search_receiver: None,
             search_control: Arc::default(),
             search_generation: 0,
+            search_started: Instant::now(),
             filter_name: String::new(),
             filter_error: None,
             rows: Vec::new(),
@@ -608,9 +741,11 @@ impl UniDirStatApp {
             changed: Arc::new(AtomicBool::new(false)),
             last_change: None,
             last_dark: None,
-            map_tiles: Vec::new(),
-            map_sectors: Vec::new(),
-            map_key: None,
+            map_worker: MapWorker::default(),
+            map_viewport: MapViewport::default(),
+            map_focus: None,
+            reveal_row: None,
+            column_widths: [0.0, 112.0, 128.0, 160.0],
             permission_details: None,
             volumes: mounted_volumes(),
             largest: Vec::new(),
@@ -635,6 +770,14 @@ impl UniDirStatApp {
             Theme::Light => egui::ThemePreference::Light,
             Theme::Dark => egui::ThemePreference::Dark,
         });
+        let animation_time = if self.settings.reduced_motion {
+            0.0
+        } else {
+            0.16
+        };
+        if context.style().animation_time != animation_time {
+            context.style_mut(|style| style.animation_time = animation_time);
+        }
         let dark = context.style().visuals.dark_mode;
         if self.last_dark == Some(dark) {
             return;
@@ -642,17 +785,20 @@ impl UniDirStatApp {
         self.last_dark = Some(dark);
         let mut style = (*context.style()).clone();
         style.spacing.item_spacing = Vec2::new(10.0, 10.0);
-        style.spacing.button_padding = Vec2::new(14.0, 9.0);
-        style.spacing.interact_size.y = 32.0;
+        style.spacing.button_padding = Vec2::new(12.0, 8.0);
+        style.spacing.interact_size.y = CONTROL_HEIGHT;
         style
             .text_styles
             .insert(egui::TextStyle::Heading, FontId::proportional(29.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+            .insert(egui::TextStyle::Body, FontId::proportional(BODY_SIZE));
         style
             .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(14.0));
+            .insert(egui::TextStyle::Button, FontId::proportional(BODY_SIZE));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, FontId::proportional(HELP_SIZE));
         style.visuals.panel_fill = if dark {
             Color32::from_rgb(17, 21, 31)
         } else {
@@ -697,6 +843,7 @@ impl UniDirStatApp {
         self.receiver = Some(receiver);
         self.job_kind = Some(kind);
         self.job_started = Instant::now();
+        self.progress_changed = Instant::now();
         std::thread::spawn(move || {
             let result = task();
             let _ = sender.send(result);
@@ -706,6 +853,11 @@ impl UniDirStatApp {
 
     fn start_scan(&mut self, context: &egui::Context) {
         if self.roots.is_empty() || self.receiver.is_some() {
+            return;
+        }
+        if cfg!(target_os = "macos") && !self.settings.mac_access_reviewed {
+            self.access_open = true;
+            self.scan_after_access = true;
             return;
         }
         self.cleanup = None;
@@ -774,6 +926,19 @@ impl UniDirStatApp {
     }
 
     fn poll(&mut self, context: &egui::Context) {
+        self.map_worker.poll();
+        if self.receiver.is_some() {
+            let marker = (
+                self.control.visited.load(Ordering::Relaxed),
+                self.control.bytes.load(Ordering::Relaxed),
+                self.control.work_done.load(Ordering::Relaxed),
+                self.control.phase() as u8,
+            );
+            if marker != self.progress_marker {
+                self.progress_marker = marker;
+                self.progress_changed = Instant::now();
+            }
+        }
         let result = self.receiver.as_ref().map(Receiver::try_recv);
         if let Some(Ok(result)) = result {
             self.receiver = None;
@@ -822,8 +987,11 @@ impl UniDirStatApp {
                         (self.age_sizes, self.age_files) = prepared.age;
                         self.age_day = timestamp / 86_400;
                         self.selected = None;
+                        self.selection.clear();
                         self.scope = None;
-                        self.map_key = None;
+                        self.map_viewport = MapViewport::default();
+                        self.map_focus = None;
+                        self.map_worker.clear();
                         self.duplicates = None;
                         self.duplicate_rows.clear();
                         self.duplicate_reclaimable = 0;
@@ -921,7 +1089,11 @@ impl UniDirStatApp {
             self.last_change = None;
             self.start_scan(context);
         }
-        if self.receiver.is_some() || self.search_receiver.is_some() || self.watching {
+        if self.receiver.is_some()
+            || self.search_receiver.is_some()
+            || self.map_worker.pending()
+            || (self.watching && self.last_change.is_some())
+        {
             context.request_repaint_after(Duration::from_millis(150));
         }
     }
@@ -986,32 +1158,17 @@ impl UniDirStatApp {
                     .inner_margin(18),
             )
             .show(context, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let (icon, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                    for offset in [
-                        Vec2::ZERO,
-                        Vec2::new(12.0, 0.0),
-                        Vec2::new(0.0, 12.0),
-                        Vec2::splat(12.0),
-                    ] {
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(icon.min + offset, Vec2::splat(9.0)),
-                            2.0,
-                            ACCENT,
-                        );
-                    }
+                    crate::icon::paint(ui.painter(), icon);
                     ui.label(RichText::new("UniDirStat").size(21.0).strong());
                 });
-                ui.label(
-                    RichText::new(tr("A clearer view of your space"))
-                        .size(10.5)
-                        .color(muted(ui)),
-                );
-                ui.add_space(25.0);
+                ui.add_space(12.0);
                 ui.label(
                     RichText::new(tr("WORKSPACE"))
-                        .size(10.0)
+                        .size(HELP_SIZE)
                         .color(muted(ui))
                         .strong(),
                 );
@@ -1025,46 +1182,73 @@ impl UniDirStatApp {
                     Page::Issues,
                 ] {
                     let selected = self.page == page;
+                    let blend = context.animate_bool_with_time(
+                        ui.id().with(("navigation", page as u8)),
+                        selected,
+                        if self.settings.reduced_motion {
+                            0.0
+                        } else {
+                            0.16
+                        },
+                    );
                     let text = RichText::new(page.title()).color(ui.visuals().text_color());
                     if ui
                         .add_sized(
                             [168.0, 37.0],
-                            egui::Button::new(text).selected(selected).frame(selected),
+                            egui::Button::new(text)
+                                .selected(selected)
+                                .frame(selected)
+                                .fill(ui.visuals().selection.bg_fill.linear_multiply(blend)),
                         )
                         .clicked()
                     {
                         self.page = page;
-                        self.rebuild = true;
+                        self.rebuild |= page_needs_rows(page, self.rows_largest);
                     }
                 }
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(
-                        RichText::new(tr("UniDirStat 0.1.0 | Rust"))
-                            .size(11.0)
-                            .color(muted(ui)),
+                let controls = egui::Rect::from_min_max(
+                    egui::pos2(
+                        ui.max_rect().left(),
+                        (ui.max_rect().bottom() - 190.0).max(ui.cursor().top()),
+                    ),
+                    ui.max_rect().max,
+                );
+                let mut controls_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(controls)
+                        .layout(Layout::top_down(Align::LEFT)),
+                );
+                if self.snapshot.is_some() {
+                    controls_ui.label(
+                        RichText::new(if self.live {
+                            tr("Live filesystem")
+                        } else {
+                            tr("Saved snapshot")
+                        })
+                        .color(if self.live {
+                            PALETTE[1]
+                        } else {
+                            muted(&controls_ui)
+                        })
+                        .size(HELP_SIZE),
                     );
-                    if ui
-                        .add_sized(
-                            [168.0, 37.0],
-                            egui::Button::new(tr("Settings")).selected(self.page == Page::Settings),
-                        )
-                        .clicked()
-                    {
-                        self.page = Page::Settings;
-                    }
-                    ui.separator();
-                    if self.snapshot.is_some() {
-                        ui.label(
-                            RichText::new(if self.live {
-                                tr("Live filesystem")
-                            } else {
-                                tr("Saved snapshot")
-                            })
-                            .color(if self.live { PALETTE[1] } else { muted(ui) })
-                            .size(12.0),
-                        );
-                    }
-                });
+                }
+                self.appearance_controls(&mut controls_ui);
+                controls_ui.separator();
+                if controls_ui
+                    .add_sized(
+                        [168.0, CONTROL_HEIGHT],
+                        egui::Button::new(tr("Settings")).selected(self.page == Page::Settings),
+                    )
+                    .clicked()
+                {
+                    self.page = Page::Settings;
+                }
+                controls_ui.label(
+                    RichText::new(tr("UniDirStat 0.1.0 | Rust"))
+                        .size(HELP_SIZE)
+                        .color(muted(&controls_ui)),
+                );
             });
     }
 
@@ -1171,11 +1355,78 @@ impl UniDirStatApp {
                 });
             });
         });
-        ui.add_space(14.0);
+        ui.add_space(12.0);
         if self.receiver.is_some() {
-            let kind = self.job_kind;
-            let state = job_state(&self.control);
-            card(ui).show(ui, |ui| {
+            self.job_card(ui);
+        }
+        if let Some(error) = self.error.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(PALETTE[5], trf("Error: {details}", &[("details", error)]));
+                if ui.button(tr("Dismiss")).clicked() {
+                    self.error = None;
+                }
+            });
+        }
+    }
+
+    fn appearance_controls(&mut self, ui: &mut egui::Ui) {
+        let previous = self.settings.language;
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                language_icon(ui);
+                egui::ComboBox::from_id_salt("sidebar-language")
+                    .width(128.0)
+                    .selected_text(match self.settings.language {
+                        Language::System => tr("System language"),
+                        Language::English => "English",
+                        Language::Russian => "Русский",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.settings.language,
+                            Language::System,
+                            tr("System language"),
+                        );
+                        ui.selectable_value(
+                            &mut self.settings.language,
+                            Language::English,
+                            "English",
+                        );
+                        ui.selectable_value(
+                            &mut self.settings.language,
+                            Language::Russian,
+                            "Русский",
+                        );
+                    });
+            });
+            if previous != self.settings.language {
+                set_language(self.settings.language);
+                self.status = tr("Language updated").into();
+            }
+            egui::ComboBox::from_id_salt("sidebar-theme")
+                .width(164.0)
+                .selected_text(match self.settings.theme {
+                    Theme::System => tr("System"),
+                    Theme::Light => tr("Light"),
+                    Theme::Dark => tr("Dark"),
+                })
+                .show_ui(ui, |ui| {
+                    for (theme, label) in [
+                        (Theme::System, tr("System")),
+                        (Theme::Light, tr("Light")),
+                        (Theme::Dark, tr("Dark")),
+                    ] {
+                        ui.selectable_value(&mut self.settings.theme, theme, label);
+                    }
+                });
+        });
+    }
+
+    fn job_card(&mut self, ui: &mut egui::Ui) {
+        let kind = self.job_kind;
+        let state = job_state(&self.control);
+        card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.spinner();
                     ui.strong(kind.map_or(tr("Working"), JobKind::label));
@@ -1220,30 +1471,24 @@ impl UniDirStatApp {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(job_progress(
+                    if matches!(kind, Some(JobKind::Scan | JobKind::Refresh | JobKind::Duplicates)) { ui.label(job_progress(
                         &self.control,
                         self.job_started.elapsed().as_secs_f64(),
                         matches!(kind, Some(JobKind::Scan | JobKind::Refresh)),
-                    ));
-                    if matches!(kind, Some(JobKind::Scan | JobKind::Refresh)) {
-                        ui.label(match self.control.phase() {
-                            ScanPhase::Idle => tr("Starting"),
-                            ScanPhase::Discovering => tr("Discovering files"),
-                            ScanPhase::Finalizing => tr("Finalizing totals"),
-                            ScanPhase::Complete => tr("Preparing results"),
-                        });
-                    }
+                    )); } else { ui.label(trf("Elapsed: {seconds} s", &[("seconds", format!("{:.1}", self.job_started.elapsed().as_secs_f64()))])); }
                 });
-            });
-        }
-        if let Some(error) = self.error.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(PALETTE[5], trf("Error: {details}", &[("details", error)]));
-                if ui.small_button(tr("Dismiss")).clicked() {
-                    self.error = None;
+                if kind.is_some_and(JobKind::reports_work) {
+                    show_work_progress(ui, &self.control);
+                }
+                if matches!(kind, Some(JobKind::Scan | JobKind::Refresh)) && self.control.phase() == ScanPhase::Discovering {
+                    if let Some(path) = self.control.current_path() {
+                        ui.add(egui::Label::new(trf("Last directory: {path}", &[("path", path.display().to_string())])).truncate()).on_hover_text(path.display().to_string());
+                    }
+                    if state == JobState::Running && self.progress_changed.elapsed() >= Duration::from_secs(3) {
+                        ui.label(trf("No new results for {seconds} s. A filesystem operation or permission dialog may be waiting.", &[("seconds", self.progress_changed.elapsed().as_secs().to_string())]));
+                    }
                 }
             });
-        }
     }
 }
 
@@ -1371,6 +1616,8 @@ impl UniDirStatApp {
                 let response = ui.add_sized(
                     [ui.available_width() - 140.0, 36.0],
                     egui::TextEdit::singleline(&mut self.path_input)
+                        .margin(INPUT_MARGIN)
+                        .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                         .hint_text(tr("Enter a folder path...")),
                 );
                 let explore = ui
@@ -1458,314 +1705,12 @@ impl UniDirStatApp {
         }
     }
 
-    fn overview(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        if !self.analysis_complete {
-            ui.colored_label(
-                PALETTE[3],
-                tr("Analysis was cancelled. Refresh to calculate all statistics."),
-            );
-        }
-        let allocated = snapshot.roots.iter().try_fold(0_u64, |total, &root| {
-            snapshot.nodes[root]
-                .allocated_size
-                .map(|size| total.saturating_add(size))
-        });
-        ui.columns(4, |columns| {
-            for (index, title, value, caption, color) in [
-                (
-                    0,
-                    if self.settings.allocated {
-                        tr("Allocated size")
-                    } else {
-                        tr("Logical size")
-                    },
-                    format_bytes(snapshot.total_size(self.settings.allocated)),
-                    if self.settings.allocated {
-                        trf(
-                            "Logical: {bytes}",
-                            &[("bytes", format_bytes(snapshot.total_size(false)))],
-                        )
-                    } else {
-                        trf(
-                            "Allocated: {bytes}",
-                            &[(
-                                "bytes",
-                                allocated.map_or_else(|| tr("Unavailable").into(), format_bytes),
-                            )],
-                        )
-                    },
-                    ACCENT,
-                ),
-                (
-                    1,
-                    tr("FILES"),
-                    snapshot.file_count().to_string(),
-                    trf(
-                        "Across {folders} folders",
-                        &[("folders", snapshot.directory_count().to_string())],
-                    ),
-                    PALETTE[1],
-                ),
-                (
-                    2,
-                    tr("FILE TYPES"),
-                    if self.analysis_complete {
-                        self.extensions[usize::from(self.settings.allocated)]
-                            .len()
-                            .to_string()
-                    } else {
-                        tr("Unavailable").to_owned()
-                    },
-                    tr("A color for every extension").into(),
-                    PALETTE[2],
-                ),
-                (
-                    3,
-                    tr("SCAN HEALTH"),
-                    if snapshot.errors.is_empty() {
-                        tr("All clear").into()
-                    } else {
-                        trf(
-                            "{count} issues",
-                            &[("count", snapshot.errors.len().to_string())],
-                        )
-                    },
-                    if snapshot.cancelled {
-                        tr("Partial scan")
-                    } else {
-                        tr("No files modified by scanning")
-                    }
-                    .into(),
-                    if snapshot.errors.is_empty() {
-                        PALETTE[1]
-                    } else {
-                        PALETTE[3]
-                    },
-                ),
-            ] {
-                card(&columns[index]).show(&mut columns[index], |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(RichText::new(title).size(10.0).strong().color(muted(ui)));
-                    ui.label(RichText::new(value).size(26.0).strong().color(
-                        if ui.visuals().dark_mode {
-                            color
-                        } else {
-                            let color = color.gamma_multiply(0.7);
-                            Color32::from_rgb(color.r(), color.g(), color.b())
-                        },
-                    ));
-                    ui.label(RichText::new(caption).size(11.0).color(muted(ui)));
-                });
-            }
-        });
-        ui.label(
-            RichText::new(tr("Logical size can exceed disk capacity (sparse files, hard links). Allocated blocks may be shared; snapshots and filesystem metadata are not included."))
-                .small()
-                .color(muted(ui)),
-        );
-        ui.add_space(8.0);
-        self.map(ui, snapshot, ui.available_height().clamp(260.0, 410.0));
-        ui.add_space(8.0);
-        ui.columns(2, |columns| {
-            card(&columns[0]).show(&mut columns[0], |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong(tr("File types"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button(tr("View all")).clicked() {
-                            self.page = Page::Types;
-                            self.rebuild = true;
-                        }
-                    });
-                });
-                let total = snapshot.total_size(self.settings.allocated).max(1) as f64;
-                for stats in self.extensions[usize::from(self.settings.allocated)]
-                    .iter()
-                    .take(5)
-                {
-                    ui.horizontal(|ui| {
-                        color_dot(ui, extension_color(&stats.extension));
-                        ui.label(extension_label(&stats.extension));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format_bytes(stats.bytes));
-                        });
-                    });
-                    ui.add(
-                        egui::ProgressBar::new((stats.bytes as f64 / total) as f32)
-                            .fill(extension_color(&stats.extension))
-                            .desired_height(4.0),
-                    );
-                }
-            });
-            card(&columns[1]).show(&mut columns[1], |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong(tr("Largest files"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button(tr("View all")).clicked() {
-                            self.page = Page::Largest;
-                            self.rebuild = true;
-                        }
-                    });
-                });
-                for index in self.largest.iter().copied() {
-                    let node = &snapshot.nodes[index];
-                    ui.horizontal(|ui| {
-                        color_dot(ui, extension_color(&node.extension()));
-                        if ui
-                            .add(
-                                egui::Label::new(node.name())
-                                    .truncate()
-                                    .sense(Sense::click()),
-                            )
-                            .clicked()
-                        {
-                            self.selected = Some(index);
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format_bytes(node.logical_size)).strong());
-                        });
-                    });
-                }
-            });
-        });
+    fn overview(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
+        self.workspace(ui, snapshot);
     }
 
-    fn map(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, height: f32) {
-        card(ui).show(ui,|ui| {
-            ui.horizontal(|ui| {
-                ui.strong(tr("Storage map")); ui.label(RichText::new(tr("Click to inspect | double-click to zoom")).size(11.0).color(muted(ui)));
-                ui.with_layout(Layout::right_to_left(Align::Center),|ui| {
-                    egui::ComboBox::from_id_salt("map_view").width(105.0).selected_text(match self.settings.map_view { MapView::Treemap=>tr("Treemap"),MapView::Flame=>tr("Flame graph"),MapView::Sunburst=>tr("Sunburst") }).show_ui(ui,|ui| {
-                        for (view, label) in [(MapView::Treemap, tr("Treemap")), (MapView::Flame, tr("Flame graph")), (MapView::Sunburst, tr("Sunburst"))] {
-                            if ui.selectable_value(&mut self.settings.map_view, view, label).clicked() { ui.close(); }
-                        }
-                    });
-                    if self.scope.is_some() && ui.small_button(tr("Zoom out")).clicked() { self.scope=self.scope.and_then(|index|snapshot.nodes[index].parent); self.map_key=None; }
-                    if self.scope.is_some() && ui.small_button(tr("Reset")).clicked() { self.scope=None; self.map_key=None; }
-                });
-            });
-            ui.label(RichText::new(self.scope.map_or_else(||tr("All scanned locations").into(),|index|snapshot.nodes[index].path.display().to_string())).size(11.0).color(muted(ui)));
-            let (bounds,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),(height-70.0).max(160.0)),Sense::hover());
-            let key=(self.scope.unwrap_or(usize::MAX),self.settings.allocated,bounds.width().round() as u32,bounds.height().round() as u32,self.settings.map_view as u8);
-            if self.map_key!=Some(key) {
-                let roots=self.scope.map_or_else(||snapshot.roots.clone(),|index|vec![index]);
-                let area=layout::Rect { x:0.0,y:0.0,width:bounds.width(),height:bounds.height() };
-                if self.settings.map_view==MapView::Treemap {
-                    let mut pending=roots; let mut weights=Vec::new();
-                    while let Some(index)=pending.pop() { let node=&snapshot.nodes[index]; if node.kind==EntryKind::File { weights.push((index,node.size(self.settings.allocated))); } else { pending.extend(&node.children); } }
-                    self.map_tiles=layout::treemap(&weights,area);
-                } else if self.settings.map_view==MapView::Flame { self.map_tiles=layout::flame(snapshot,&roots,self.settings.allocated,area); }
-                else { self.map_sectors=layout::sunburst(snapshot,&roots,self.settings.allocated); }
-                self.map_key=Some(key);
-            }
-            if self.settings.map_view==MapView::Sunburst { self.draw_sunburst(ui,snapshot,bounds); }
-            else {
-                for tile_index in 0..self.map_tiles.len() {
-                    let tile=self.map_tiles[tile_index];
-                    let rect=egui::Rect::from_min_size(bounds.min+Vec2::new(tile.rect.x,tile.rect.y),Vec2::new(tile.rect.width,tile.rect.height)).shrink(self.settings.tile_gap/2.0);
-                    if rect.width()<1.0 || rect.height()<1.0 || !rect.is_finite() { continue; }
-                    let node=&snapshot.nodes[tile.node];
-                    let color=extension_color(&node.extension());
-                    let response=ui.interact(rect,ui.id().with(("tile",tile.node)),Sense::click());
-                    let selected=self.selected==Some(tile.node);
-                    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button,ui.is_enabled(),selected,format!("{} {}",node.name(),format_bytes(node.size(self.settings.allocated)))));
-                    let fill=if response.hovered() { color } else { color.gamma_multiply(if ui.visuals().dark_mode { 0.81 } else { 0.93 }) };
-                    let fill=Color32::from_rgb(fill.r(),fill.g(),fill.b());
-                    let text_color=tile_text_color(fill);
-                    ui.painter().rect_filled(rect,5.0,fill);
-                    ui.painter().rect_stroke(rect,5.0,Stroke::new(if selected { 2.5 } else { 0.7 },if selected { ui.visuals().text_color() } else { Color32::from_white_alpha(35) }),StrokeKind::Inside);
-                    if self.settings.labels && rect.width()>70.0 && rect.height()>35.0 {
-                        let painter=ui.painter().with_clip_rect(rect.shrink(7.0));
-                        painter.text(rect.left_top()+Vec2::splat(9.0),egui::Align2::LEFT_TOP,node.name(),FontId::proportional(12.0),text_color);
-                        if rect.height()>53.0 { painter.text(rect.left_top()+Vec2::new(9.0,27.0),egui::Align2::LEFT_TOP,format_bytes(node.size(self.settings.allocated)),FontId::proportional(10.0),text_color); }
-                    }
-                    if response.clicked() { self.selected=Some(tile.node); }
-                    if response.double_clicked() { self.scope=if node.kind==EntryKind::Directory { Some(tile.node) } else { node.parent }; self.map_key=None; }
-                    response.on_hover_ui(|ui| { ui.strong(node.name()); ui.label(node.path.display().to_string()); ui.label(format_bytes(node.size(self.settings.allocated))); });
-                }
-            }
-            if snapshot.total_size(self.settings.allocated)==0 { ui.painter().text(bounds.center(),egui::Align2::CENTER_CENTER,tr("No file data to display"),FontId::proportional(15.0),muted(ui)); }
-            response.on_hover_text(tr("File area represents size. Tiny files below one pixel are not drawn. Zero-byte files remain visible in All files."));
-        });
-    }
-
-    fn draw_sunburst(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, bounds: egui::Rect) {
-        let center = bounds.center();
-        let radius = bounds.width().min(bounds.height()) / 2.0 - 5.0;
-        let max_depth = self
-            .map_sectors
-            .iter()
-            .map(|sector| sector.depth)
-            .max()
-            .unwrap_or(0)
-            .min(11);
-        let band = radius / (max_depth + 2) as f32;
-        let pointer = ui.input(|input| input.pointer.hover_pos());
-        let mut hovered = None;
-        for sector in &self.map_sectors {
-            if sector.depth > max_depth {
-                continue;
-            }
-            let inner = band * (sector.depth + 1) as f32;
-            let outer = inner + band - 2.0;
-            let span = sector.end - sector.start;
-            if span * outer < 1.0 {
-                continue;
-            }
-            let segments = ((span * outer / 6.0).ceil() as usize).clamp(2, 100);
-            let color = extension_color(&snapshot.nodes[sector.node].extension());
-            let mut mesh = egui::Mesh::default();
-            for step in 0..=segments {
-                let angle = sector.start + span * step as f32 / segments as f32
-                    - std::f32::consts::FRAC_PI_2;
-                let direction = Vec2::angled(angle);
-                mesh.colored_vertex(center + direction * inner, color.gamma_multiply(0.85));
-                mesh.colored_vertex(center + direction * outer, color);
-                if step > 0 {
-                    let vertex = (step * 2) as u32;
-                    mesh.add_triangle(vertex - 2, vertex - 1, vertex);
-                    mesh.add_triangle(vertex - 1, vertex + 1, vertex);
-                }
-            }
-            ui.painter().add(egui::Shape::mesh(mesh));
-            if let Some(pointer) = pointer {
-                let delta = pointer - center;
-                let distance = delta.length();
-                let angle =
-                    (delta.angle() + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU);
-                if distance >= inner
-                    && distance <= outer
-                    && angle >= sector.start
-                    && angle <= sector.end
-                {
-                    hovered = Some(sector.node);
-                }
-            }
-        }
-        ui.painter().text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            format_bytes(self.scope.map_or_else(
-                || snapshot.total_size(self.settings.allocated),
-                |index| snapshot.nodes[index].size(self.settings.allocated),
-            )),
-            FontId::proportional(12.0),
-            ui.visuals().text_color(),
-        );
-        if let Some(index) = hovered {
-            let response = ui.interact(bounds, ui.id().with("sunburst-hit"), Sense::click());
-            if response.clicked() {
-                self.selected = Some(index);
-            }
-            if response.double_clicked() {
-                self.scope = Some(index);
-                self.map_key = None;
-            }
-            response.on_hover_text(format!(
-                "{}\n{}",
-                snapshot.nodes[index].path.display(),
-                format_bytes(snapshot.nodes[index].size(self.settings.allocated))
-            ));
-        }
+    fn map(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>, height: f32) {
+        self.map_canvas(ui, snapshot, height);
     }
 
     fn filters(&mut self, ui: &mut egui::Ui) {
@@ -1775,6 +1720,8 @@ impl UniDirStatApp {
                 .add_sized(
                     [ui.available_width().min(320.0), 34.0],
                     egui::TextEdit::singleline(&mut self.search_query.text)
+                        .margin(INPUT_MARGIN)
+                        .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                         .hint_text(tr("Search files and folders...")),
                 )
                 .changed();
@@ -1790,7 +1737,7 @@ impl UniDirStatApp {
                 };
                 changed = true;
             }
-            if ui.small_button(tr("Clear")).clicked() {
+            if ui.button(tr("Clear")).clicked() {
                 self.search_query = SearchQuery::default();
                 changed = true;
             }
@@ -1883,7 +1830,7 @@ impl UniDirStatApp {
                 }
                 if let Some(extension) = &mut self.search_query.extension {
                     changed |= ui
-                        .add_sized([110.0, 24.0], egui::TextEdit::singleline(extension))
+                        .add_sized([110.0, 24.0], egui::TextEdit::singleline(extension).margin(INPUT_MARGIN).min_size(Vec2::new(0.0, CONTROL_HEIGHT)))
                         .changed();
                 }
                 if ui.button(tr("Empty folder candidates")).clicked() {
@@ -1900,7 +1847,7 @@ impl UniDirStatApp {
             ui.horizontal_wrapped(|ui| {
                 ui.add_sized(
                     [140.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.filter_name).hint_text(tr("Filter name")),
+                    egui::TextEdit::singleline(&mut self.filter_name).margin(INPUT_MARGIN).min_size(Vec2::new(0.0, CONTROL_HEIGHT)).hint_text(tr("Filter name")),
                 );
                 if ui.button(tr("Save filter")).clicked() {
                     let mut query = self.search_query.clone();
@@ -1932,7 +1879,7 @@ impl UniDirStatApp {
                                     changed = true;
                                     ui.close();
                                 }
-                                if ui.small_button(tr("Remove")).clicked() {
+                                if ui.button(tr("Remove")).clicked() {
                                     remove = Some(index);
                                 }
                             });
@@ -1946,7 +1893,6 @@ impl UniDirStatApp {
         if changed {
             self.filter_error = None;
             self.rebuild = true;
-            self.map_key = None;
         }
         if let Some(error) = &self.filter_error {
             ui.colored_label(
@@ -1964,6 +1910,8 @@ impl UniDirStatApp {
             return;
         };
         self.rebuild = false;
+        self.search_started = Instant::now();
+        self.rows_largest = self.page == Page::Largest;
         self.search_control.cancel();
         self.search_control = Arc::default();
         self.search_generation = self.search_generation.wrapping_add(1);
@@ -1979,6 +1927,7 @@ impl UniDirStatApp {
         query.descending = self.descending;
         if self.page == Page::Largest {
             query.kinds = vec![EntryKind::File];
+            query.scope = self.scope;
         }
         let flat = self.page == Page::Largest || has_filters(&query);
         let expanded = self.expanded.clone();
@@ -1986,7 +1935,6 @@ impl UniDirStatApp {
         let threads = self.settings.threads;
         let (sender, receiver) = mpsc::channel();
         self.search_receiver = Some(receiver);
-        self.rows.clear();
         let context = context.clone();
         std::thread::spawn(move || {
             let index = index.map(Ok).unwrap_or_else(|| {
@@ -2013,233 +1961,7 @@ impl UniDirStatApp {
     }
 
     fn files(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        self.filters(ui);
-        self.rebuild_rows(ui.ctx());
-        if self.search_receiver.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(tr("Searching..."));
-                if ui
-                    .button(if self.search_control.is_paused() {
-                        tr("Resume")
-                    } else {
-                        tr("Pause")
-                    })
-                    .clicked()
-                {
-                    if self.search_control.is_paused() {
-                        self.search_control.resume();
-                    } else {
-                        self.search_control.pause();
-                    }
-                }
-                if ui.button(tr("Cancel")).clicked() {
-                    self.search_control.cancel();
-                }
-            });
-        }
-        ui.label(
-            RichText::new(trf(
-                "{count} visible entries",
-                &[("count", self.rows.len().to_string())],
-            ))
-            .small()
-            .color(muted(ui)),
-        );
-        let extra_width = 150.0
-            + if self.settings.show_modified {
-                110.0
-            } else {
-                0.0
-            }
-            + if self.settings.show_share { 150.0 } else { 0.0 };
-        let table_width = ui.available_width().max(230.0 + extra_width);
-        egui::ScrollArea::horizontal()
-            .id_salt("file-columns")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_width(table_width);
-                let name_width = table_width - extra_width;
-                ui.horizontal(|ui| {
-                    for (label, sort, width, visible) in [
-                        (tr("Name"), SortBy::Name, name_width, true),
-                        (tr("Size"), SortBy::Size, 95.0, true),
-                        (
-                            tr("Modified"),
-                            SortBy::Modified,
-                            100.0,
-                            self.settings.show_modified,
-                        ),
-                    ] {
-                        if !visible {
-                            continue;
-                        }
-                        let label = format!(
-                            "{label}{}",
-                            if self.sort_by == sort {
-                                if self.descending { " v" } else { " ^" }
-                            } else {
-                                ""
-                            }
-                        );
-                        if ui
-                            .add_sized([width, 26.0], egui::Button::new(label).frame(false))
-                            .clicked()
-                        {
-                            if self.sort_by == sort {
-                                self.descending = !self.descending;
-                            } else {
-                                self.sort_by = sort;
-                                self.descending = sort != SortBy::Name;
-                            }
-                            self.rebuild = true;
-                        }
-                    }
-                    if self.settings.show_share {
-                        ui.label(tr("Share"));
-                    }
-                });
-                ui.separator();
-                let total = snapshot.total_size(self.settings.allocated).max(1) as f64;
-                egui::ScrollArea::vertical()
-                    .id_salt("file-list")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, 32.0, self.rows.len(), |ui, range| {
-                        for row in range {
-                            let (index, depth) = self.rows[row];
-                            let node = &snapshot.nodes[index];
-                            let response = egui::Frame::new()
-                                .fill(if self.selected == Some(index) {
-                                    ui.visuals().selection.bg_fill
-                                } else if row % 2 == 0 {
-                                    ui.visuals().faint_bg_color
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .corner_radius(5)
-                                .inner_margin(egui::Margin::symmetric(6, 2))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(name_width, 28.0),
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                ui.add_space((depth.min(15) * 14) as f32);
-                                                if node.kind == EntryKind::Directory {
-                                                    if ui
-                                                        .small_button(
-                                                            if self.expanded.contains(&index) {
-                                                                "v"
-                                                            } else {
-                                                                ">"
-                                                            },
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        if !self.expanded.remove(&index) {
-                                                            self.expanded.insert(index);
-                                                        }
-                                                        self.rebuild = true;
-                                                    }
-                                                    color_dot(ui, ACCENT);
-                                                } else {
-                                                    color_dot(
-                                                        ui,
-                                                        extension_color(&node.extension()),
-                                                    );
-                                                }
-                                                let label = if self.page == Page::Largest
-                                                    || has_filters(&self.search_query)
-                                                {
-                                                    node.path.display().to_string()
-                                                } else {
-                                                    node.name()
-                                                };
-                                                let response = ui.add(
-                                                    egui::Label::new(label)
-                                                        .truncate()
-                                                        .sense(Sense::click()),
-                                                );
-                                                if response.clicked() {
-                                                    self.selected = Some(index);
-                                                }
-                                                if response.double_clicked()
-                                                    && node.kind == EntryKind::Directory
-                                                {
-                                                    self.scope = Some(index);
-                                                    self.page = Page::Overview;
-                                                    self.map_key = None;
-                                                }
-                                                response
-                                                    .on_hover_text(node.path.display().to_string());
-                                            },
-                                        );
-                                        ui.add_sized(
-                                            [95.0, 28.0],
-                                            egui::Label::new(
-                                                RichText::new(format_bytes(
-                                                    node.size(self.settings.allocated),
-                                                ))
-                                                .strong(),
-                                            ),
-                                        );
-                                        if self.settings.show_modified {
-                                            ui.add_sized(
-                                                [100.0, 28.0],
-                                                egui::Label::new(age(node.modified)).truncate(),
-                                            );
-                                        }
-                                        if self.settings.show_share {
-                                            let share =
-                                                node.size(self.settings.allocated) as f64 / total;
-                                            ui.add_sized(
-                                                [80.0, 6.0],
-                                                egui::ProgressBar::new(share as f32)
-                                                    .fill(if node.kind == EntryKind::Directory {
-                                                        ACCENT
-                                                    } else {
-                                                        extension_color(&node.extension())
-                                                    })
-                                                    .desired_height(5.0),
-                                            );
-                                            ui.label(
-                                                RichText::new(format!("{:.1}%", share * 100.0))
-                                                    .small()
-                                                    .color(muted(ui)),
-                                            );
-                                        }
-                                    });
-                                })
-                                .response;
-                            response.context_menu(|ui| {
-                                if ui.button(tr("Inspect")).clicked() {
-                                    self.selected = Some(index);
-                                    ui.close();
-                                }
-                                if ui.button(tr("Copy path")).clicked() {
-                                    ui.ctx().copy_text(node.path.display().to_string());
-                                    ui.close();
-                                }
-                                if ui.button(tr("Reveal in file manager")).clicked() {
-                                    self.run_open(node, true);
-                                    ui.close();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        self.live
-                                            && self.receiver.is_none()
-                                            && node.parent.is_some(),
-                                        egui::Button::new(tr("Move to trash...")),
-                                    )
-                                    .clicked()
-                                {
-                                    self.cleanup = Some(Cleanup::Trash(index));
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-            });
+        self.file_table(ui, snapshot);
     }
 
     fn types(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -2249,7 +1971,28 @@ impl UniDirStatApp {
             ));
             return;
         }
-        let total = snapshot.total_size(self.settings.allocated).max(1) as f64;
+        let summary = self.map_worker.summary().map(Arc::clone);
+        let extensions = if self.scope.is_some() {
+            let Some(summary) = summary.as_ref() else {
+                ui.spinner();
+                ui.label(tr("Calculating statistics"));
+                return;
+            };
+            if self.settings.allocated {
+                &summary.extensions_allocated
+            } else {
+                &summary.extensions_logical
+            }
+        } else {
+            &self.extensions[usize::from(self.settings.allocated)]
+        };
+        let total = self
+            .scope
+            .map_or_else(
+                || snapshot.total_size(self.settings.allocated),
+                |index| snapshot.nodes[index].size(self.settings.allocated),
+            )
+            .max(1) as f64;
         card(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(tr("Extension"));
@@ -2261,10 +2004,10 @@ impl UniDirStatApp {
             egui::ScrollArea::vertical().id_salt("types").show_rows(
                 ui,
                 44.0,
-                self.extensions[usize::from(self.settings.allocated)].len(),
+                extensions.len(),
                 |ui, range| {
                     for index in range {
-                        let stats = &self.extensions[usize::from(self.settings.allocated)][index];
+                        let stats = &extensions[index];
                         ui.horizontal(|ui| {
                             color_dot(ui, extension_color(&stats.extension));
                             if ui
@@ -2276,9 +2019,9 @@ impl UniDirStatApp {
                                 .clicked()
                             {
                                 self.search_query.extension = Some(stats.extension.clone());
+                                self.search_query.scope = self.scope;
                                 self.page = Page::Files;
                                 self.rebuild = true;
-                                self.map_key = None;
                             }
                             ui.add_sized(
                                 [90.0, 24.0],
@@ -2327,7 +2070,7 @@ impl UniDirStatApp {
                 }
             });
         });
-        if let Some(report) = &self.duplicates {
+        if let Some(report) = self.duplicates.as_ref().map(Arc::clone) {
             ui.label(
                 RichText::new(trf(
                     "{groups} groups | up to {bytes} redundant logical bytes",
@@ -2379,19 +2122,21 @@ impl UniDirStatApp {
                             }
                             DuplicateRow::File(index) => {
                                 let path = snapshot.nodes[index].path.display().to_string();
-                                if ui
+                                let response = ui
                                     .add_sized(
                                         [width, 32.0],
                                         egui::Button::new(&path)
-                                            .selected(self.selected == Some(index))
+                                            .selected(self.selection.contains(index))
                                             .frame(false)
                                             .truncate(),
                                     )
-                                    .on_hover_text(path)
-                                    .clicked()
-                                {
-                                    self.selected = Some(index);
-                                }
+                                    .on_hover_text(path);
+                                self.item_response(
+                                    response,
+                                    index,
+                                    snapshot,
+                                    SelectionView::Duplicates,
+                                );
                             }
                         }
                     }
@@ -2431,6 +2176,11 @@ impl UniDirStatApp {
         card(ui).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.strong(tr("Appearance"));
+            ui.checkbox(&mut self.settings.reduced_motion, tr("Reduce motion"));
+            if cfg!(target_os = "macos") && ui.button(tr("Set up macOS file access...")).clicked() {
+                self.access_open = true;
+                self.scan_after_access = false;
+            }
             let previous_language = self.settings.language;
             ui.horizontal_wrapped(|ui| {
                 ui.label(tr("Language"));
@@ -2510,7 +2260,6 @@ impl UniDirStatApp {
                 .changed()
             {
                 self.rebuild = true;
-                self.map_key = None;
             }
             if !allocation_available {
                 ui.label(
@@ -2529,11 +2278,18 @@ impl UniDirStatApp {
             ui.horizontal_wrapped(|ui| { ui.label(tr("Scan workers")); ui.add(egui::DragValue::new(&mut self.settings.threads).range(0..=64)); ui.label(tr("0 uses available CPU threads")); });
             ui.add_enabled(cfg!(unix),egui::Checkbox::new(&mut self.settings.one_file_system,tr("Stay on the same filesystem (Unix)")));
             ui.label(tr("Exclude paths matching these regular expressions (one per line)"));
-            ui.add(egui::TextEdit::multiline(&mut self.settings.exclude).hint_text("(^|/)(node_modules|target|\\.git)(/|$)").desired_width(f32::INFINITY).desired_rows(4));
+            ui.add(egui::TextEdit::multiline(&mut self.settings.exclude).margin(INPUT_MARGIN).hint_text("(^|/)(node_modules|target|\\.git)(/|$)").desired_width(f32::INFINITY).desired_rows(4));
             for expression in self.settings.exclude.lines().filter(|line|!line.is_empty()) { if let Err(error)=regex::Regex::new(expression) { ui.colored_label(PALETTE[5],error.to_string()); } }
             let response=ui.add_enabled(self.live && self.receiver.is_none(),egui::Checkbox::new(&mut self.watching,tr("Watch filesystem changes and refresh automatically")));
             if response.changed() { self.install_watcher(ui.ctx()); }
             ui.label(RichText::new(tr("Watch notifications are debounced for two seconds. Large/network filesystems may exceed OS watcher limits.")).small().color(muted(ui)));
+        });
+        ui.add_space(12.0);
+        card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong(tr("Updates"));
+            ui.add_enabled(false, egui::Button::new(tr("Check for updates")));
+            ui.label(tr("Releases have not been published yet. Update checks will be available after publication."));
         });
         ui.add_space(12.0);
         card(ui).show(ui,|ui| { ui.set_min_width(ui.available_width()); ui.strong(tr("UniDirStat 0.1.0")); ui.label(tr("A Rust disk usage explorer inspired by WinDirStat. Native Windows, macOS and Linux architecture. Your scan stays on your computer.")); ui.hyperlink_to(tr("WinDirStat reference project"),"https://github.com/windirstat/windirstat"); ui.label(RichText::new(tr("Raw NTFS/MTP scanning, deleted-file recovery, ACL editing and OS-specific cleanup tools are not implemented.")).small().color(muted(ui))); });
@@ -2546,167 +2302,378 @@ impl UniDirStatApp {
         let Some(index) = self.selected else {
             return;
         };
-        let Some(node) = snapshot.nodes.get(index) else {
-            return;
-        };
         egui::SidePanel::right("inspector")
-            .default_width(260.0)
-            .width_range(230.0..=360.0)
+            .default_width(280.0)
+            .width_range(230.0..=420.0)
             .frame(
                 egui::Frame::new()
                     .fill(context.style().visuals.window_fill)
-                    .inner_margin(20),
+                    .inner_margin(16),
             )
             .show(context, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector-scroll")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(tr("File details"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button(tr("Close")).clicked() {
-                                    self.selected = None;
-                                }
-                            });
-                        });
-                        ui.separator();
-                        ui.label(RichText::new(node.name()).size(18.0).strong());
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(node.path.display().to_string())
-                                    .small()
-                                    .color(muted(ui)),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(10.0);
-                        for (label, value) in [
-                            (tr("Logical size"), format_bytes(node.logical_size)),
-                            (
-                                tr("Allocated size"),
-                                node.allocated_size
-                                    .map_or_else(|| tr("Unavailable").into(), format_bytes),
-                            ),
-                            (tr("Kind"), kind_label(node.kind).to_owned()),
-                            (tr("Modified"), age(node.modified)),
-                            (
-                                tr("Read only"),
-                                if node.readonly { tr("Yes") } else { tr("No") }.into(),
-                            ),
-                            (
-                                tr("Unix mode"),
-                                node.permissions.map_or_else(
-                                    || tr("Unavailable").into(),
-                                    |mode| format!("{:04o}", mode & 0o7777),
-                                ),
-                            ),
-                            (
-                                tr("Owner UID"),
-                                node.owner.map_or_else(
-                                    || tr("Unavailable").into(),
-                                    |owner| owner.to_string(),
-                                ),
-                            ),
-                        ] {
-                            ui.label(RichText::new(label).small().color(muted(ui)));
-                            ui.label(value);
-                        }
-                        if node.kind == EntryKind::Directory {
-                            ui.label(trf(
-                                "{files} files | {folders} folders",
-                                &[
-                                    ("files", node.files.to_string()),
-                                    ("folders", node.directories.to_string()),
-                                ],
-                            ));
-                            if ui.button(tr("Zoom into folder")).clicked() {
-                                self.scope = Some(index);
-                                self.page = Page::Overview;
-                                self.map_key = None;
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.live && self.receiver.is_none(),
-                                    egui::Button::new(tr("Refresh this folder")),
-                                )
-                                .clicked()
-                            {
-                                self.refresh_folder(index, context);
-                            }
-                        }
-                        ui.separator();
-                        if ui.button(tr("Copy path")).clicked() {
-                            context.copy_text(node.path.display().to_string());
-                        }
-                        if ui.button(tr("Reveal in file manager")).clicked() {
-                            self.run_open(node, true);
-                        }
-                        if ui.button(tr("Open")).clicked() {
-                            self.run_open(node, false);
-                        }
-                        if ui
-                            .add_enabled(
-                                self.live && self.receiver.is_none(),
-                                egui::Button::new(tr("Inspect system ACL")),
-                            )
-                            .clicked()
-                        {
-                            let path = node.path.clone();
-                            self.job(JobKind::FileOperation, context, move || {
-                                JobResult::Permissions(
-                                    path.clone(),
-                                    actions::permission_details(&path),
-                                )
-                            });
-                        }
-                        let can_clean = self.live
-                            && self.receiver.is_none()
-                            && node.parent.is_some()
-                            && matches!(node.kind, EntryKind::File | EntryKind::Directory);
-                        if ui
-                            .add_enabled(can_clean, egui::Button::new(tr("Move...")))
-                            .clicked()
-                            && let Some(destination) = rfd::FileDialog::new()
-                                .set_title(tr("Choose destination folder"))
-                                .pick_folder()
-                        {
-                            self.cleanup = Some(Cleanup::Move(index, destination));
-                        }
-                        if ui
-                            .add_enabled(
-                                can_clean,
-                                egui::Button::new(
-                                    RichText::new(tr("Move to trash...")).color(PALETTE[5]),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.cleanup = Some(Cleanup::Trash(index));
-                        }
-                        if node.kind == EntryKind::Directory
-                            && node.children.is_empty()
-                            && node.error.is_none()
-                            && ui
-                                .add_enabled(
-                                    can_clean,
-                                    egui::Button::new(tr("Move empty folder to trash...")),
-                                )
-                                .clicked()
-                        {
-                            self.cleanup = Some(Cleanup::TrashEmpty(index));
-                        }
-                        if !self.live {
-                            ui.label(
-                                RichText::new(tr("Cleanup is disabled for imported snapshots."))
-                                    .small()
-                                    .color(muted(ui)),
-                            );
-                        }
-                        if let Some(error) = &node.error {
-                            ui.colored_label(PALETTE[3], error);
+                    .show(ui, |ui| self.inspector_contents(ui, &snapshot, index));
+            });
+    }
+
+    fn inspector_contents(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>, index: usize) {
+        let context = ui.ctx().clone();
+        let Some(node) = snapshot.nodes.get(index) else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.strong(tr("File details"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(tr("Close")).clicked() {
+                    self.selected = None;
+                    self.selection.clear();
+                }
+            });
+        });
+        ui.separator();
+        if self.selection.len() > 1 {
+            ui.strong(trf(
+                "{count} selected",
+                &[("count", self.selection.len().to_string())],
+            ));
+            ui.label(tr("Cmd/Ctrl toggles items; Shift selects a range. File actions apply to one item at a time."));
+            if ui.button(tr("Copy selected paths")).clicked() {
+                context.copy_text(
+                    self.selection
+                        .indices()
+                        .filter_map(|index| snapshot.nodes.get(index))
+                        .map(|node| node.path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        ui.label(RichText::new(node.name()).size(18.0).strong());
+        ui.add(
+            egui::Label::new(
+                RichText::new(node.path.display().to_string())
+                    .small()
+                    .color(muted(ui)),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        for (label, value) in [
+            (tr("Logical size"), format_bytes(node.logical_size)),
+            (
+                tr("Allocated size"),
+                node.allocated_size
+                    .map_or_else(|| tr("Unavailable").into(), format_bytes),
+            ),
+            (tr("Kind"), kind_label(node.kind).to_owned()),
+            (tr("Modified"), age(node.modified)),
+            (
+                tr("Read only"),
+                if node.readonly { tr("Yes") } else { tr("No") }.into(),
+            ),
+            (
+                tr("Unix mode"),
+                node.permissions.map_or_else(
+                    || tr("Unavailable").into(),
+                    |mode| format!("{:04o}", mode & 0o7777),
+                ),
+            ),
+            (
+                tr("Owner UID"),
+                node.owner
+                    .map_or_else(|| tr("Unavailable").into(), |owner| owner.to_string()),
+            ),
+        ] {
+            ui.label(RichText::new(label).small().color(muted(ui)));
+            ui.label(value);
+        }
+        if node.kind == EntryKind::Directory {
+            ui.label(trf(
+                "{files} files | {folders} folders",
+                &[
+                    ("files", node.files.to_string()),
+                    ("folders", node.directories.to_string()),
+                ],
+            ));
+            if ui.button(tr("Zoom into folder")).clicked() {
+                self.map_focus = Some(index);
+                self.page = Page::Overview;
+            }
+            if ui
+                .add_enabled(
+                    self.live && self.receiver.is_none(),
+                    egui::Button::new(tr("Refresh this folder")),
+                )
+                .clicked()
+            {
+                self.refresh_folder(index, &context);
+            }
+        }
+        ui.separator();
+        if ui.button(tr("Copy path")).clicked() {
+            context.copy_text(node.path.display().to_string());
+        }
+        if ui.button(tr("Reveal in file manager")).clicked() {
+            self.run_open(node, true);
+        }
+        if ui.button(tr("Open")).clicked() {
+            self.run_open(node, false);
+        }
+        if ui
+            .add_enabled(
+                self.live && self.receiver.is_none(),
+                egui::Button::new(tr("Inspect system ACL")),
+            )
+            .clicked()
+        {
+            let path = node.path.clone();
+            self.job(JobKind::FileOperation, &context, move || {
+                JobResult::Permissions(path.clone(), actions::permission_details(&path))
+            });
+        }
+        let can_clean = self.live
+            && self.receiver.is_none()
+            && node.parent.is_some()
+            && matches!(node.kind, EntryKind::File | EntryKind::Directory);
+        if ui
+            .add_enabled(can_clean, egui::Button::new(tr("Move...")))
+            .clicked()
+            && let Some(destination) = rfd::FileDialog::new()
+                .set_title(tr("Choose destination folder"))
+                .pick_folder()
+        {
+            self.cleanup = Some(Cleanup::Move(index, destination));
+        }
+        if ui
+            .add_enabled(
+                can_clean,
+                egui::Button::new(RichText::new(tr("Move to trash...")).color(PALETTE[5])),
+            )
+            .clicked()
+        {
+            self.cleanup = Some(Cleanup::Trash(index));
+        }
+        if node.kind == EntryKind::Directory
+            && node.children.is_empty()
+            && node.error.is_none()
+            && ui
+                .add_enabled(
+                    can_clean,
+                    egui::Button::new(tr("Move empty folder to trash...")),
+                )
+                .clicked()
+        {
+            self.cleanup = Some(Cleanup::TrashEmpty(index));
+        }
+        if !self.live {
+            ui.label(
+                RichText::new(tr("Cleanup is disabled for imported snapshots."))
+                    .small()
+                    .color(muted(ui)),
+            );
+        }
+        if let Some(error) = &node.error {
+            ui.colored_label(PALETTE[3], error);
+        }
+    }
+
+    fn item_response(
+        &mut self,
+        response: egui::Response,
+        index: usize,
+        snapshot: &Snapshot,
+        view: SelectionView,
+    ) {
+        if response.clicked() {
+            let modifiers = click_modifiers(&response.ctx);
+            let toggle = modifiers.command || modifiers.ctrl;
+            match view {
+                SelectionView::Files => {
+                    self.selection
+                        .click(index, &self.rows, toggle, modifiers.shift)
+                }
+                SelectionView::Overview => {
+                    let summary = self.map_worker.summary().map(Arc::clone);
+                    let largest = summary.as_ref().map_or(&self.largest, |summary| {
+                        if self.settings.allocated {
+                            &summary.largest_allocated
+                        } else {
+                            &summary.largest_logical
                         }
                     });
+                    let order: Vec<_> = largest.iter().map(|&index| (index, 0)).collect();
+                    self.selection.click(index, &order, toggle, modifiers.shift);
+                }
+                SelectionView::Duplicates => {
+                    if modifiers.shift {
+                        let order = duplicate_file_order(&self.duplicate_rows);
+                        self.selection.click(index, &order, toggle, true);
+                    } else {
+                        self.selection.click(index, &[(index, 0)], toggle, false);
+                    }
+                }
+                SelectionView::Single => self.selection.click(index, &[(index, 0)], toggle, false),
+            }
+            self.selected = self.selection.primary();
+            if matches!(view, SelectionView::Single | SelectionView::Overview) {
+                let mut parent = snapshot.nodes[index].parent;
+                while let Some(ancestor) = parent {
+                    self.rebuild |= self.expanded.insert(ancestor);
+                    parent = snapshot.nodes[ancestor].parent;
+                }
+                self.reveal_row = Some(index);
+            }
+        }
+        if response.secondary_clicked() {
+            self.selection.right_click(index);
+            if self.selected.is_some() {
+                self.selected = self.selection.primary();
+            }
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                response.enabled(),
+                self.selection.contains(index),
+                trf(
+                    "{path} | {bytes} | {share}% of parent",
+                    &[
+                        ("path", snapshot.nodes[index].path.display().to_string()),
+                        (
+                            "bytes",
+                            format_bytes(snapshot.nodes[index].size(self.settings.allocated)),
+                        ),
+                        (
+                            "share",
+                            format!(
+                                "{:.1}",
+                                workspace::parent_share(snapshot, index, self.settings.allocated)
+                                    * 100.0
+                            ),
+                        ),
+                    ],
+                ),
+            )
+        });
+        let node = &snapshot.nodes[index];
+        if response.double_clicked()
+            && node.kind == EntryKind::Directory
+            && !matches!(view, SelectionView::Single)
+        {
+            self.map_focus = Some(index);
+            self.page = Page::Overview;
+            response.ctx.request_repaint();
+        }
+        response.context_menu(|ui| {
+            if ui.button(tr("Zoom to selection")).clicked() {
+                self.map_focus = if node.kind == EntryKind::Directory {
+                    Some(index)
+                } else {
+                    node.parent
+                };
+                self.page = Page::Overview;
+                ui.close();
+            }
+            let single = self.selection.len() <= 1;
+            if !single {
+                ui.label(trf(
+                    "{count} selected",
+                    &[("count", self.selection.len().to_string())],
+                ));
+            }
+            if ui.button(tr("Inspect")).clicked() {
+                self.selected = self.selection.primary().or(Some(index));
+                ui.close();
+            }
+            if ui
+                .button(if single {
+                    tr("Copy path")
+                } else {
+                    tr("Copy selected paths")
+                })
+                .clicked()
+            {
+                let paths = if self.selection.is_empty() {
+                    node.path.display().to_string()
+                } else {
+                    self.selection
+                        .indices()
+                        .filter_map(|index| snapshot.nodes.get(index))
+                        .map(|node| node.path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                ui.ctx().copy_text(paths);
+                ui.close();
+            }
+            if ui
+                .add_enabled(single, egui::Button::new(tr("Open")))
+                .clicked()
+            {
+                self.run_open(node, false);
+                ui.close();
+            }
+            if ui
+                .add_enabled(single, egui::Button::new(tr("Reveal in file manager")))
+                .clicked()
+            {
+                self.run_open(node, true);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    single && self.live && self.receiver.is_none() && node.parent.is_some(),
+                    egui::Button::new(tr("Move to trash...")),
+                )
+                .clicked()
+            {
+                self.cleanup = Some(Cleanup::Trash(index));
+                ui.close();
+            }
+        });
+    }
+
+    fn access_dialog(&mut self, context: &egui::Context) {
+        if !self.access_open {
+            return;
+        }
+        let mut open = true;
+        let mut proceed = false;
+        egui::Window::new(tr("Set up macOS file access"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(510.0)
+            .show(context, |ui| {
+                ui.label(tr("Before scanning the whole disk, add UniDirStat to Full Disk Access in System Settings → Privacy & Security. This avoids many separate folder-access prompts."));
+                ui.label(tr("Full Disk Access can expose private files, messages and browser data. Enable it only if you want a whole-disk scan; limited scanning is also available."));
+                ui.label(tr("UniDirStat cannot grant this permission or reliably verify it. If macOS asks you to restart the app, do so before scanning."));
+                if ui.button(tr("Open macOS privacy settings")).clicked() {
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = std::process::Command::new("/usr/bin/open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                        .spawn()
+                    {
+                        self.error = Some(error.to_string());
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    proceed |= ui.button(tr("Continue after setup")).clicked();
+                    proceed |= ui.button(tr("Use limited access")).clicked();
+                });
+                ui.label(RichText::new(tr("Protected paths may still be unavailable. Local ad-hoc builds can require permission again after an update.")).small().color(muted(ui)));
             });
+        if proceed {
+            self.settings.mac_access_reviewed = true;
+            self.access_open = false;
+            if std::mem::take(&mut self.scan_after_access) {
+                self.start_scan(context);
+            }
+        } else if !open {
+            self.access_open = false;
+            self.scan_after_access = false;
+        }
     }
 
     fn run_open(&mut self, node: &Node, reveal: bool) {
@@ -2791,7 +2758,30 @@ impl eframe::App for UniDirStatApp {
             }
         }
         self.sidebar(context);
-        self.inspector(context);
+        if self.last_page != self.page {
+            self.rebuild |= page_needs_rows(self.page, self.rows_largest);
+            context.animate_value_with_time(egui::Id::new("page-opacity"), 0.0, 0.0);
+            self.last_page = self.page;
+        }
+        if context
+            .memory(|memory| memory.focused())
+            .is_none_or(|id| egui::TextEdit::load_state(context, id).is_none())
+            && context.input_mut(|input| {
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
+                    || input.consume_key(egui::Modifiers::CTRL, egui::Key::A)
+            })
+        {
+            if matches!(self.page, Page::Overview | Page::Files | Page::Largest) {
+                self.selection.select_all(&self.rows);
+            } else if self.page == Page::Duplicates {
+                self.selection
+                    .select_all(&duplicate_file_order(&self.duplicate_rows));
+            }
+            self.selected = self.selection.primary();
+        }
+        if !matches!(self.page, Page::Overview | Page::Files) {
+            self.inspector(context);
+        }
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -2801,23 +2791,18 @@ impl eframe::App for UniDirStatApp {
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.status).small().color(muted(ui)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(tr("LOCAL | PRIVATE | CROSS-PLATFORM"))
-                                .size(9.0)
-                                .color(muted(ui)),
-                        );
-                    });
                 });
             });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(context.style().visuals.panel_fill).inner_margin(24)).show(context,|ui| {
+            ui.set_opacity(context.animate_value_with_time(egui::Id::new("page-opacity"),1.0,if self.settings.reduced_motion {0.0} else {0.16}));
             self.header(ui);
             if self.page==Page::Settings { egui::ScrollArea::vertical().show(ui,|ui|self.settings_page(ui)); return; }
             let Some(snapshot)=self.snapshot.as_ref().map(Arc::clone) else { egui::ScrollArea::vertical().show(ui,|ui|self.welcome(ui)); return; };
-            if self.settings.allocated && snapshot.roots.iter().any(|&index|snapshot.nodes[index].allocated_size.is_none()) { self.settings.allocated=false; self.rebuild=true; self.map_key=None; }
+            if matches!(self.page, Page::Overview | Page::Files | Page::Types | Page::Largest) { self.map_worker.request_summary(self.scope, Arc::clone(&snapshot), ui.ctx()); }
+            if self.settings.allocated && snapshot.roots.iter().any(|&index|snapshot.nodes[index].allocated_size.is_none()) { self.settings.allocated=false; self.rebuild=true;  }
             match self.page {
-                Page::Overview=>{ egui::ScrollArea::vertical().show(ui,|ui|self.overview(ui,&snapshot)); },
-                Page::Files|Page::Largest=>self.files(ui,&snapshot),
+                Page::Overview|Page::Files=>self.overview(ui,&snapshot),
+                Page::Largest=>self.files(ui,&snapshot),
                 Page::Types=>self.types(ui,&snapshot),
                 Page::Duplicates=>self.duplicates_page(ui,&snapshot),
                 Page::Storage=>{ egui::ScrollArea::vertical().show(ui,|ui|self.storage(ui,&snapshot)); },
@@ -2825,6 +2810,7 @@ impl eframe::App for UniDirStatApp {
                 Page::Settings=>{},
             }
         });
+        self.access_dialog(context);
         self.confirm_cleanup(context);
         if let Some((path, details)) = &self.permission_details {
             let mut open = true;
@@ -2886,6 +2872,30 @@ fn age(modified: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_keeps_its_command_modifier_if_released_in_the_same_frame() {
+        let context = egui::Context::default();
+        let mut toggle = false;
+        let _ = context.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::Pos2::ZERO,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers {
+                        command: true,
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            },
+            |context| {
+                toggle = click_modifiers(context).command;
+            },
+        );
+        assert!(toggle);
+    }
 
     #[test]
     fn duplicate_hash_caption_uses_the_completed_reports_algorithm() {
@@ -2963,6 +2973,47 @@ mod tests {
     }
 
     #[test]
+    fn row_assembly_and_age_statistics_report_their_own_work() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::write(fixture.path().join("file"), [1; 4]).expect("file");
+        let snapshot = Arc::new(
+            scanner::scan(
+                &[fixture.path().into()],
+                &ScanOptions::default(),
+                &ScanControl::default(),
+            )
+            .expect("scan"),
+        );
+        let control = ScanControl::default();
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        let rows = build_rows(
+            &snapshot,
+            &index,
+            &SearchQuery::default(),
+            true,
+            &HashSet::new(),
+            &control,
+        )
+        .expect("rows");
+        assert_eq!(control.phase(), ScanPhase::Mapping);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), rows.len() as u64);
+        assert_eq!(
+            control.work_total.load(Ordering::Relaxed),
+            rows.len() as u64
+        );
+        storage_buckets_with_control(&snapshot, now(), &control).expect("buckets");
+        assert_eq!(control.phase(), ScanPhase::Summarizing);
+        assert_eq!(
+            control.work_done.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64
+        );
+        assert_eq!(
+            control.work_total.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64
+        );
+    }
+
+    #[test]
     fn saved_filters_roundtrip_without_snapshot_specific_indices() {
         let mut settings = Settings::default();
         let query = SearchQuery {
@@ -2990,6 +3041,17 @@ mod tests {
         assert_eq!(job_state(&control), JobState::Paused);
         control.cancel();
         assert_eq!(job_state(&control), JobState::Cancelling);
+    }
+
+    #[test]
+    fn non_scan_jobs_do_not_show_previous_scan_phase_progress() {
+        assert!(JobKind::Scan.reports_work());
+        assert!(JobKind::Refresh.reports_work());
+        assert!(JobKind::Load.reports_work());
+        assert!(!JobKind::SaveReport.reports_work());
+        assert!(!JobKind::SaveDuplicates.reports_work());
+        assert!(!JobKind::FileOperation.reports_work());
+        assert!(JobKind::Duplicates.reports_work());
     }
 
     #[test]
@@ -3108,6 +3170,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_range_selection_skips_group_and_hash_headers() {
+        let rows = [
+            DuplicateRow::Group(0),
+            DuplicateRow::Hash(0),
+            DuplicateRow::File(7),
+            DuplicateRow::File(3),
+            DuplicateRow::Group(1),
+            DuplicateRow::File(8),
+        ];
+        let order = duplicate_file_order(&rows);
+        assert_eq!(order, [(7, 0), (3, 0), (8, 0)]);
+        let mut selection = Selection::default();
+        selection.click(7, &order, false, false);
+        selection.click(8, &order, false, true);
+        assert_eq!(selection.len(), 3);
+    }
+
+    #[test]
     fn storage_buckets_handle_age_boundaries_unknown_dates_and_future_dates() {
         let fixture = tempfile::tempdir().expect("fixture");
         let timestamp = 200 * 86_400;
@@ -3174,4 +3254,68 @@ mod tests {
                 .expect("roundtrip");
         assert!(restored.theme == Theme::Light);
     }
+}
+#[test]
+fn navigating_back_to_the_same_file_view_keeps_rows() {
+    assert!(!page_needs_rows(Page::Overview, false));
+    assert!(!page_needs_rows(Page::Files, false));
+    assert!(page_needs_rows(Page::Overview, true));
+    assert!(!page_needs_rows(Page::Largest, true));
+    assert!(page_needs_rows(Page::Largest, false));
+    assert!(page_needs_rows(Page::Files, true));
+}
+
+#[test]
+fn file_row_background_accepts_secondary_clicks() {
+    let context = egui::Context::default();
+    let mut position = egui::Pos2::ZERO;
+    let mut opened = false;
+    for pressed in [None, Some(true), Some(false)] {
+        let events = pressed.map_or_else(Vec::new, |pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        });
+        let _ = context.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let row = egui::Frame::new().show(ui, |ui| ui.label("file"));
+                    position = row.response.rect.center();
+                    let response = clickable_row(row.response);
+                    assert!(response.sense.senses_click());
+                    response.context_menu(|ui| {
+                        opened = true;
+                        ui.label("context");
+                    });
+                });
+            },
+        );
+    }
+    assert!(
+        opened,
+        "right click over the file label must open its row menu"
+    );
+}
+
+#[test]
+fn new_preferences_require_access_review_and_allow_reduced_motion() {
+    let mut value = serde_json::to_value(Settings::default()).expect("preferences");
+    assert_eq!(value["mac_access_reviewed"], false);
+    assert_eq!(value["reduced_motion"], false);
+    value["mac_access_reviewed"] = true.into();
+    value["reduced_motion"] = true.into();
+    let restored: Settings = serde_json::from_value(value).expect("preferences");
+    let value = serde_json::to_value(restored).expect("preferences");
+    assert_eq!(value["mac_access_reviewed"], true);
+    assert_eq!(value["reduced_motion"], true);
 }

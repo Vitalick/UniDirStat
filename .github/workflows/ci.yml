@@ -1,29 +1,164 @@
-name: Checks
+name: Desktop builds
 
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   desktop:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Windows SDK environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev desktop-file-utils patchelf libfuse2
+      - name: Version and icons
+        shell: bash
+        run: |
+          python scripts/generate-icons.py --check
+          version=$(cargo metadata --no-deps --locked --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
       - run: cargo fmt --all -- --check
-      - run: cargo test --all-features --locked
-      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo build --release --locked
-      - run: cargo test --no-default-features --locked
+      - run: cargo test --all-features --locked --target ${{ matrix.target }}
+      - run: cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --no-default-features --locked --target ${{ matrix.target }}
+      - name: macOS DMG
+        if: runner.os == 'macOS'
+        run: sh scripts/package-macos.sh ${{ matrix.target }}
+      - name: Linux AppImage and Debian package
+        if: runner.os == 'Linux'
+        env:
+          LINUXDEPLOY: ${{ runner.temp }}/linuxdeploy-x86_64.AppImage
+        run: |
+          curl --fail --location --retry 3 --output "$LINUXDEPLOY" https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          echo 'c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  '"$LINUXDEPLOY" | sha256sum --check
+          chmod +x "$LINUXDEPLOY"
+          sh scripts/package-linux.sh ${{ matrix.target }}
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Pyrsys B\.V\.') { throw 'Invalid Inno Setup publisher signature.' }
+          $process = Start-Process $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Inno Setup installation failed.' }
+          ./scripts/package-windows.ps1
+      - name: Windows installation smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem target/packages/*-setup.exe).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'UniDirStat-install-test'
+          $process = Start-Process $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$destination`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'UniDirStat installation failed.' }
+          $binary = Join-Path $destination 'unidirstat.exe'
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed UniDirStat did not start.' }
+          $dependencies = & dumpbin /dependents $binary
+          if ($LASTEXITCODE -ne 0 -or ($dependencies -match '(?i)(VCRUNTIME|MSVCP)[0-9].*\.dll')) { throw 'Unexpected Visual C++ runtime dependency.' }
+          Add-Type -AssemblyName System.Drawing
+          foreach ($path in @($installer, $binary)) {
+            $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
+            $bitmap = $icon.ToBitmap()
+            $color = $bitmap.GetPixel([int]($bitmap.Width / 4), [int]($bitmap.Height / 4))
+            $bitmap.Dispose()
+            $icon.Dispose()
+            if ($color.R -ne 119 -or $color.G -ne 131 -or $color.B -ne 255) { throw 'The packaged application icon is missing.' }
+          }
+          $process = Start-Process (Join-Path $destination 'unins000.exe') -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'UniDirStat uninstallation failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: target/packages/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: desktop
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: target/packages
+      - name: Verify complete installer set
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          expected = {
+              f'UniDirStat-{version}-macos-arm64.dmg',
+              f'UniDirStat-{version}-macos-x86_64.dmg',
+              f'UniDirStat-{version}-windows-x86_64-setup.exe',
+              f'UniDirStat-{version}-linux-x86_64.AppImage',
+              f'UniDirStat-{version}-linux-x86_64.deb',
+          }
+          files = list(Path('target/packages').iterdir())
+          assert {path.name for path in files} == expected, 'Installer set is incomplete'
+          assert all(path.is_file() and path.stat().st_size > 0 for path in files)
+          PY
+      - name: Upload, verify downloads, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+            gh release upload "$GITHUB_REF_NAME" target/packages/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" target/packages/* --verify-tag --draft --title "UniDirStat ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
+          gh release view "$GITHUB_REF_NAME" --json assets | python3 -c 'import json,pathlib,sys; assert {asset["name"] for asset in json.load(sys.stdin)["assets"]} == {path.name for path in pathlib.Path("target/packages").iterdir()}'
+          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/release-download"
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          downloaded = Path(os.environ['RUNNER_TEMP']) / 'release-download'
+          for source in Path('target/packages').iterdir():
+              assert hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256((downloaded / source.name).read_bytes()).digest(), source.name
+          PY
+          numeric_tag="${GITHUB_REF_NAME%%+*}"
+          if [[ "$numeric_tag" == *-* ]]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest
+          fi

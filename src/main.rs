@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 use std::{ffi::OsString, path::PathBuf, process::ExitCode};
 
 use unidirstat::{
@@ -15,7 +17,19 @@ mod app;
 mod i18n;
 
 #[cfg(feature = "gui")]
+mod icon;
+
+#[cfg(feature = "gui")]
 mod volumes;
+
+#[cfg(feature = "gui")]
+mod selection;
+
+#[cfg(feature = "gui")]
+mod map_job;
+
+#[cfg(feature = "gui")]
+mod map_view;
 
 const HELP: &str = r#"UniDirStat — modern disk usage explorer
 
@@ -322,6 +336,8 @@ fn run() -> Result<(), String> {
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_title("UniDirStat")
+                .with_app_id("unidirstat")
+                .with_icon(icon::window_icon()?)
                 .with_inner_size([1380.0, 900.0])
                 .with_min_inner_size([900.0, 640.0]),
             ..Default::default()

@@ -36,6 +36,25 @@ fn language_for_locale(locale: Option<&str>) -> Language {
     }
 }
 
+fn language_for_locales(mut locales: impl Iterator<Item = String>) -> Language {
+    locales
+        .find(|locale| {
+            locale.split(['-', '_', '.']).next().is_some_and(|base| {
+                base.eq_ignore_ascii_case("en") || base.eq_ignore_ascii_case("ru")
+            })
+        })
+        .map_or(Language::English, |locale| {
+            language_for_locale(Some(&locale))
+        })
+}
+
+fn lookup<'catalog>(preferred: Option<&'catalog Catalog>, key: &str) -> Option<&'catalog str> {
+    preferred
+        .and_then(|catalog| catalog.get(key))
+        .or_else(|| catalog(Language::English).ok()?.get(key))
+        .map(String::as_str)
+}
+
 fn catalog(language: Language) -> Result<&'static Catalog, &'static serde_json::Error> {
     let (storage, source) = if language == Language::Russian {
         (&RUSSIAN, include_str!("../locales/ru.json"))
@@ -48,18 +67,13 @@ fn catalog(language: Language) -> Result<&'static Catalog, &'static serde_json::
 }
 
 fn translate(language: Language, key: &str) -> &'static str {
-    match catalog(language) {
-        Ok(catalog) => catalog
-            .get(key)
-            .map_or("[Missing translation]", String::as_str),
-        Err(_) => "[Invalid language catalog]",
-    }
+    lookup(catalog(language).ok(), key).unwrap_or("[Missing translation]")
 }
 
 /// Changes the GUI language. This never changes filenames or report field names.
 pub fn set_language(language: Language) {
     let language = if language == Language::System {
-        language_for_locale(sys_locale::get_locale().as_deref())
+        language_for_locales(sys_locale::get_locales())
     } else {
         language
     };
@@ -69,7 +83,7 @@ pub fn set_language(language: Language) {
     );
 }
 
-/// Looks up a bundled GUI string, returning an explicit marker for missing keys.
+/// Looks up a bundled GUI string with English fallback.
 pub fn tr(key: &str) -> &'static str {
     translate(
         if ACTIVE.load(Ordering::Relaxed) == 2 {
@@ -136,6 +150,24 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_preferred_locale_does_not_hide_the_next_supported_language() {
+        assert_eq!(
+            language_for_locales(["de-DE", "ru-KZ", "en-GB"].into_iter().map(String::from)),
+            Language::Russian
+        );
+        assert_eq!(
+            language_for_locales(["en-GB", "ru-RU"].into_iter().map(String::from)),
+            Language::English
+        );
+    }
+
+    #[test]
+    fn missing_translation_falls_back_to_english() {
+        assert_eq!(lookup(Some(&Catalog::new()), "System"), Some("System"));
+        assert_eq!(lookup(None, "System"), Some("System"));
+    }
+
+    #[test]
     fn named_values_are_not_reinterpreted_as_placeholders() {
         assert_eq!(
             format_in(
@@ -180,7 +212,11 @@ mod tests {
     fn every_literal_gui_translation_key_exists_in_both_catalogs() {
         let calls =
             regex::Regex::new(r#"\btrf?\(\s*("(?:[^"\\]|\\.)*")"#).expect("GUI call pattern");
-        for capture in calls.captures_iter(include_str!("app.rs")) {
+        for capture in calls.captures_iter(concat!(
+            include_str!("app.rs"),
+            include_str!("app/workspace.rs"),
+            include_str!("app/map_canvas.rs")
+        )) {
             let key: String =
                 serde_json::from_str(&capture[1]).expect("Rust key is JSON-compatible");
             for language in [Language::English, Language::Russian] {

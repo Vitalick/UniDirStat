@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=UniDirStat
+Comment=Explore disk usage and find large files
+Comment[ru]=Анализ занятого места и поиск больших файлов
+Exec=unidirstat %F
+Icon=unidirstat
+Terminal=false
+Categories=Utility;System;FileTools;
+StartupNotify=true
+StartupWMClass=unidirstat
+Keywords=disk;space;storage;files;
+Keywords[ru]=диск;место;файлы;

@@ -25,6 +25,14 @@ pub enum ScanPhase {
     Discovering,
     Finalizing,
     Complete,
+    Indexing,
+    Summarizing,
+    Sorting,
+    Mapping,
+    Filtering,
+    Sampling,
+    Hashing,
+    Validating,
 }
 
 #[derive(Default, Debug)]
@@ -36,6 +44,9 @@ pub struct ScanControl {
     pub allocated_bytes: AtomicU64,
     pub unknown_allocations: AtomicU64,
     pub phase: AtomicU8,
+    pub work_done: AtomicU64,
+    pub work_total: AtomicU64,
+    current_path: Mutex<Option<PathBuf>>,
     waiting: AtomicU64,
 }
 
@@ -66,8 +77,38 @@ impl ScanControl {
             1 => ScanPhase::Discovering,
             2 => ScanPhase::Finalizing,
             3 => ScanPhase::Complete,
+            4 => ScanPhase::Indexing,
+            5 => ScanPhase::Summarizing,
+            6 => ScanPhase::Sorting,
+            7 => ScanPhase::Mapping,
+            8 => ScanPhase::Filtering,
+            9 => ScanPhase::Sampling,
+            10 => ScanPhase::Hashing,
+            11 => ScanPhase::Validating,
             _ => ScanPhase::Idle,
         }
+    }
+
+    pub fn set_phase(&self, phase: ScanPhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub fn start_work(&self, total: u64) {
+        self.work_done.store(0, Ordering::Relaxed);
+        self.work_total.store(total, Ordering::Release);
+    }
+
+    pub fn advance_work(&self, count: u64) {
+        self.work_done.fetch_add(count, Ordering::Relaxed);
+        #[cfg(test)]
+        tests::gate(self, self.phase());
+    }
+
+    pub fn current_path(&self) -> Option<PathBuf> {
+        self.current_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn checkpoint(&self) -> bool {
@@ -135,6 +176,11 @@ fn scan_with_directories(
         .map_err(|error| format!("Invalid exclusion expression: {error}"))?;
     let pool = thread_pool(options.threads)?;
     let started = Instant::now();
+    control.start_work(0);
+    *control
+        .current_path
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     control
         .phase
         .store(ScanPhase::Discovering as u8, Ordering::Release);
@@ -494,6 +540,11 @@ impl Traversal<'_> {
             self.record_error(index, message);
             return;
         }
+        *self
+            .control
+            .current_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
         let entries = match fs::read_dir(&path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -665,11 +716,24 @@ fn insert_node(
 }
 
 fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
-    for index in (0..snapshot.nodes.len()).rev() {
-        if index % 256 == 0 {
+    let nodes = snapshot.nodes.len();
+    control.start_work(
+        nodes as u64
+            + snapshot
+                .nodes
+                .iter()
+                .map(|node| node.children.len() as u64)
+                .sum::<u64>(),
+    );
+    control.set_phase(ScanPhase::Finalizing);
+    for (position, index) in (0..nodes).rev().enumerate() {
+        if position % 256 == 0 {
             control.checkpoint();
         }
         if snapshot.nodes[index].kind != EntryKind::Directory {
+            if (position + 1) % 256 == 0 || position + 1 == nodes {
+                control.advance_work(((position % 256) + 1) as u64);
+            }
             continue;
         }
         let mut logical = 0_u64;
@@ -689,18 +753,45 @@ fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
                     .saturating_add(node.directories)
                     .saturating_add(u64::from(node.kind == EntryKind::Directory));
             }
-        }
-        let mut children = std::mem::take(&mut snapshot.nodes[index].children);
-        if !control.is_cancelled() {
-            sort_children(&mut children, &snapshot.nodes, control);
+            control.advance_work(chunk.len() as u64);
         }
         let node = &mut snapshot.nodes[index];
-        node.children = children;
         node.logical_size = logical;
         node.allocated_size = allocated;
         node.files = files;
         node.directories = directories;
+        if (position + 1) % 256 == 0 || position + 1 == nodes {
+            control.advance_work(((position % 256) + 1) as u64);
+        }
     }
+    if control.is_cancelled() {
+        return;
+    }
+    control.start_work(
+        snapshot
+            .nodes
+            .iter()
+            .map(|node| sort_work_total(node.children.len(), 1024))
+            .sum(),
+    );
+    control.set_phase(ScanPhase::Sorting);
+    for index in 0..nodes {
+        if index % 256 == 0 && !control.checkpoint() {
+            return;
+        }
+        let mut children = std::mem::take(&mut snapshot.nodes[index].children);
+        sort_children(&mut children, &snapshot.nodes, control);
+        snapshot.nodes[index].children = children;
+    }
+}
+
+pub(crate) fn sort_work_total(length: usize, mut run: usize) -> u64 {
+    let mut passes = 1;
+    while run < length {
+        passes += 1;
+        run = run.saturating_mul(2);
+    }
+    (length as u64).saturating_mul(passes)
 }
 
 fn sort_children(children: &mut [usize], nodes: &[Node], control: &ScanControl) {
@@ -716,6 +807,7 @@ fn sort_children(children: &mut [usize], nodes: &[Node], control: &ScanControl) 
             return;
         }
         run.sort_unstable_by(compare);
+        control.advance_work(run.len() as u64);
     }
     if children.len() <= RUN {
         return;
@@ -741,6 +833,9 @@ fn sort_children(children: &mut [usize], nodes: &[Node], control: &ScanControl) 
                     right += 1;
                 }
                 output += 1;
+                if output % 256 == 0 {
+                    control.advance_work(256);
+                }
             }
             let remaining = if left < middle {
                 &run[left..middle]
@@ -748,6 +843,7 @@ fn sort_children(children: &mut [usize], nodes: &[Node], control: &ScanControl) 
                 &run[right..]
             };
             scratch[output..output + remaining.len()].copy_from_slice(remaining);
+            control.advance_work((output % 256 + remaining.len()) as u64);
         }
         children.copy_from_slice(&scratch);
         width *= 2;
@@ -982,7 +1078,7 @@ fn is_link(metadata: &Metadata) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::Ordering;
@@ -990,10 +1086,65 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn work_progress_advances_monotonically_without_changing_scan_counters() {
+        let control = ScanControl::default();
+        control.visited.store(17, Ordering::Relaxed);
+        control.bytes.store(1234, Ordering::Relaxed);
+        control.start_work(10);
+        control.set_phase(ScanPhase::Indexing);
+        control.advance_work(3);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 3);
+        control.advance_work(4);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 7);
+        assert_eq!(control.work_total.load(Ordering::Relaxed), 10);
+        assert_eq!(control.visited.load(Ordering::Relaxed), 17);
+        assert_eq!(control.bytes.load(Ordering::Relaxed), 1234);
+        control.start_work(5);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 0);
+        assert_eq!(control.phase(), ScanPhase::Indexing);
+    }
+
+    #[test]
+    fn scan_sorting_reports_all_completed_work() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(directory.path().join(format!("file-{index}")), [7; 10]).unwrap();
+        }
+        let control = ScanControl::default();
+        scan(
+            &[directory.path().into()],
+            &ScanOptions::default(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(control.work_total.load(Ordering::Relaxed), 8);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn scan_reports_the_last_directory_and_resets_it_for_each_scan() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let file = first.path().join("data");
+        fs::write(&file, b"content").unwrap();
+        let control = ScanControl::default();
+        assert_eq!(control.current_path(), None);
+        for directory in [first.path(), second.path()] {
+            let snapshot = scan(&[directory.into()], &ScanOptions::default(), &control).unwrap();
+            assert_eq!(
+                control.current_path().as_ref(),
+                Some(&snapshot.nodes[snapshot.roots[0]].path)
+            );
+        }
+        scan(&[file], &ScanOptions::default(), &control).unwrap();
+        assert_eq!(control.current_path(), None);
+    }
+
     #[derive(Debug)]
-    struct Gate {
-        arrived: Barrier,
-        release: Barrier,
+    pub(crate) struct Gate {
+        pub(crate) arrived: Barrier,
+        pub(crate) release: Barrier,
     }
 
     type GateMap = HashMap<usize, (ScanPhase, Arc<Gate>)>;
@@ -1003,7 +1154,7 @@ mod tests {
         GATES.get_or_init(Mutex::default)
     }
 
-    fn register_gate(control: &ScanControl, phase: ScanPhase) -> Arc<Gate> {
+    pub(crate) fn register_gate(control: &ScanControl, phase: ScanPhase) -> Arc<Gate> {
         let gate = Arc::new(Gate {
             arrived: Barrier::new(2),
             release: Barrier::new(2),
@@ -1217,7 +1368,11 @@ mod tests {
             })
             .collect();
         let mut children: Vec<_> = (0..nodes.len()).rev().collect();
-        sort_children(&mut children, &nodes, &ScanControl::default());
+        let control = ScanControl::default();
+        control.start_work(sort_work_total(children.len(), 1024));
+        sort_children(&mut children, &nodes, &control);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 16388);
+        assert_eq!(control.work_total.load(Ordering::Relaxed), 16388);
         assert_eq!(
             children
                 .iter()

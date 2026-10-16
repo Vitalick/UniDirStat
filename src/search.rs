@@ -9,7 +9,7 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{EntryKind, Node, Snapshot};
-use crate::scanner::{ScanControl, thread_pool};
+use crate::scanner::{ScanControl, ScanPhase, sort_work_total, thread_pool};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchTarget {
@@ -137,13 +137,17 @@ impl SearchIndex {
     ) -> Result<Self, String> {
         checkpoint(control)?;
         let pool = thread_pool(threads)?;
+        control.start_work((snapshot.nodes.len() as u64).saturating_mul(3));
+        control.set_phase(ScanPhase::Indexing);
         let paths: Result<Vec<_>, String> = pool.install(|| {
             snapshot
                 .nodes
                 .par_iter()
                 .map(|node| {
                     checkpoint(control)?;
-                    Ok(CachedPath::new(node))
+                    let path = CachedPath::new(node);
+                    control.advance_work(1);
+                    Ok(path)
                 })
                 .collect()
         });
@@ -157,6 +161,7 @@ impl SearchIndex {
             .rev()
             .map(|&root| (root, false))
             .collect();
+        let mut completed = 0;
         while let Some((index, exiting)) = pending.pop() {
             checkpoint(control)?;
             let Some(node) = snapshot.nodes.get(index) else {
@@ -164,13 +169,20 @@ impl SearchIndex {
             };
             if exiting {
                 subtrees[index].end = order.len();
+                completed += 1;
             } else if !std::mem::replace(&mut seen[index], true) {
                 subtrees[index].start = order.len();
                 order.push(index);
                 pending.push((index, true));
                 pending.extend(node.children.iter().rev().map(|&child| (child, false)));
+                completed += 1;
+            }
+            if completed == 256 {
+                control.advance_work(completed);
+                completed = 0;
             }
         }
+        control.advance_work(completed);
         checkpoint(control)?;
         Ok(Self {
             snapshot,
@@ -228,6 +240,8 @@ impl SearchIndex {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        control.start_work(candidates.len() as u64);
+        control.set_phase(ScanPhase::Filtering);
         let mut found: Vec<_> = pool.install(|| {
             candidates
                 .par_iter()
@@ -289,6 +303,7 @@ impl SearchIndex {
                         && query
                             .max_age_seconds
                             .is_none_or(|maximum| age.is_some_and(|age| age <= maximum));
+                    control.advance_work(1);
                     Some(matches.then_some(index))
                 })
                 .while_some()
@@ -364,10 +379,13 @@ fn sort_cancellable(
     control: &ScanControl,
 ) -> Result<(), String> {
     const SORT_CHUNK: usize = 2048;
+    control.start_work(sort_work_total(indices.len(), SORT_CHUNK));
+    control.set_phase(ScanPhase::Sorting);
     pool.install(|| {
         indices.par_chunks_mut(SORT_CHUNK).try_for_each(|chunk| {
             checkpoint(control)?;
             chunk.sort_unstable_by(compare);
+            control.advance_work(chunk.len() as u64);
             checkpoint(control)
         })
     })?;
@@ -402,7 +420,11 @@ fn sort_cancellable(
                                 *item = indices[right];
                                 right += 1;
                             }
+                            if (position + 1) % 256 == 0 {
+                                control.advance_work(256);
+                            }
                         }
+                        control.advance_work((output.len() % 256) as u64);
                         Ok::<(), String>(())
                     })
             })?;
@@ -421,6 +443,59 @@ mod tests {
 
     use super::*;
     use crate::scanner::{ScanOptions, scan};
+
+    #[test]
+    fn indexing_and_search_report_complete_work_without_resetting_scan_totals() {
+        let (_directory, snapshot) = fixture();
+        let control = ScanControl::default();
+        control.bytes.store(1234, Ordering::Relaxed);
+        let index = SearchIndex::with_control(Arc::clone(&snapshot), 2, &control).unwrap();
+        assert_eq!(
+            control.work_total.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64 * 3
+        );
+        assert_eq!(
+            control.work_done.load(Ordering::Relaxed),
+            control.work_total.load(Ordering::Relaxed)
+        );
+        let found = index.search(&SearchQuery::default(), &control).unwrap();
+        assert_eq!(
+            control.work_total.load(Ordering::Relaxed),
+            found.len() as u64
+        );
+        assert_eq!(
+            control.work_done.load(Ordering::Relaxed),
+            found.len() as u64
+        );
+        assert_eq!(
+            control.visited.load(Ordering::Relaxed),
+            snapshot.nodes.len() as u64
+        );
+        assert_eq!(control.bytes.load(Ordering::Relaxed), 1234);
+    }
+
+    #[test]
+    fn indexing_and_filtering_cancel_after_reporting_progress() {
+        let (_directory, snapshot) = fixture();
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        for phase in [ScanPhase::Indexing, ScanPhase::Filtering] {
+            let control = ScanControl::default();
+            let gate = crate::scanner::tests::register_gate(&control, phase);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| match phase {
+                    ScanPhase::Indexing => {
+                        SearchIndex::with_control(Arc::clone(&snapshot), 2, &control).map(|_| ())
+                    }
+                    _ => index.search(&SearchQuery::default(), &control).map(|_| ()),
+                });
+                gate.arrived.wait();
+                assert!(control.work_done.load(Ordering::Relaxed) > 0);
+                control.cancel();
+                gate.release.wait();
+                assert!(worker.join().unwrap().is_err());
+            });
+        }
+    }
 
     fn fixture() -> (tempfile::TempDir, Arc<Snapshot>) {
         let directory = tempfile::tempdir().unwrap();
@@ -648,6 +723,23 @@ mod tests {
 
         assert!(sort_cancellable(&mut indices, &compare, &pool, &control).is_err());
         assert!(comparisons.load(Ordering::Relaxed) < 25000);
+    }
+
+    #[test]
+    fn merge_sort_reports_each_pass_without_exceeding_total_work() {
+        let pool = thread_pool(2).unwrap();
+        let mut indices: Vec<_> = (0..25000).rev().collect();
+        let control = ScanControl::default();
+        let compare = |left: &usize, right: &usize| {
+            assert!(
+                control.work_done.load(Ordering::Relaxed)
+                    <= control.work_total.load(Ordering::Relaxed)
+            );
+            left.cmp(right)
+        };
+        sort_cancellable(&mut indices, &compare, &pool, &control).unwrap();
+        assert_eq!(control.work_total.load(Ordering::Relaxed), 125000);
+        assert_eq!(control.work_done.load(Ordering::Relaxed), 125000);
     }
 
     #[test]
