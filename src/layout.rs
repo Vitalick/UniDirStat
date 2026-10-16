@@ -346,7 +346,11 @@ fn partition_visible(
     control.add_work(1);
     while let Some((start, end, bounds)) = pending.pop() {
         control.advance()?;
-        if bounds.width < 1.0 || bounds.height < 1.0 {
+        let total = prefixes[end] - prefixes[start];
+        let largest_area = f64::from(bounds.width)
+            * f64::from(bounds.height)
+            * (sorted[start].1 as f64 / total as f64);
+        if bounds.width < 4.0 || bounds.height < 4.0 || largest_area < 24.0 {
             tiles.push((None, bounds));
             continue;
         }
@@ -354,7 +358,6 @@ fn partition_visible(
             tiles.push((sorted[start].0, bounds));
             continue;
         }
-        let total = prefixes[end] - prefixes[start];
         let half = total as f64 / 2.0;
         let mut split = start
             + 1
@@ -877,6 +880,36 @@ mod tests {
         assert!((tiles[0].rect.width * tiles[0].rect.height - 100.0 * 10.0 / 11.0).abs() < 0.001);
         let (processed, total) = control.progress();
         assert!(processed > 1_000 && processed == total);
+    }
+
+    #[test]
+    fn dense_treemap_aggregates_unreadable_tiles_without_losing_area() {
+        let weights: Vec<_> = (0..4_096).map(|index| (index, 1)).collect();
+        let control = LayoutControl::default();
+        let partitions = partition_visible(
+            &weights,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            &control,
+        )
+        .unwrap();
+
+        assert_eq!(partitions.len(), 1);
+        assert!(partitions.iter().all(|(node, rect)| {
+            node.is_none()
+                || rect.width >= 4.0 && rect.height >= 4.0 && rect.width * rect.height >= 24.0
+        }));
+        let area: f32 = partitions
+            .iter()
+            .map(|(_, rect)| rect.width * rect.height)
+            .sum();
+        assert!((area - 20_000.0).abs() < 0.01);
+        let (processed, total) = control.progress();
+        assert_eq!(processed, total);
     }
 
     #[test]

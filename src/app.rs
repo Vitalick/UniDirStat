@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -34,11 +34,40 @@ mod map_canvas;
 mod workspace;
 use workspace::language_icon;
 const PRIMARY_BUTTON: Color32 = Color32::from_rgb(90, 102, 220);
-const BODY_SIZE: f32 = 14.0;
-const HELP_SIZE: f32 = 13.0;
-const CONTROL_HEIGHT: f32 = 36.0;
-const ROW_HEIGHT: f32 = 34.0;
+const BODY_SIZE: f32 = 16.0;
+const HELP_SIZE: f32 = 14.0;
+const CONTROL_HEIGHT: f32 = 40.0;
+const ROW_HEIGHT: f32 = 38.0;
+const DEFAULT_COLUMN_WIDTHS: [f32; 4] = [0.0, 132.0, 144.0, 176.0];
+const CONTROL_BORDER: [Color32; 2] = [
+    Color32::from_rgb(112, 126, 147),
+    Color32::from_rgb(137, 148, 169),
+];
+const ERROR_TEXT: [Color32; 2] = [
+    Color32::from_rgb(164, 34, 59),
+    Color32::from_rgb(255, 163, 178),
+];
+const WARNING_TEXT: [Color32; 2] = [
+    Color32::from_rgb(133, 77, 9),
+    Color32::from_rgb(246, 193, 104),
+];
 const INPUT_MARGIN: egui::Margin = egui::Margin::symmetric(12, 8);
+
+fn interface_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Ubuntu-Regular".into(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Ubuntu-Regular.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Ubuntu-Regular".into());
+    fonts
+}
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(116, 132, 238),
     Color32::from_rgb(80, 182, 170),
@@ -196,10 +225,10 @@ fn build_rows(
     expanded: &HashSet<usize>,
     control: &ScanControl,
 ) -> Result<Vec<(usize, usize)>, String> {
-    let found = index.search(query, control)?;
-    control.set_phase(ScanPhase::Mapping);
-    control.start_work(found.len() as u64);
     if flat {
+        let found = index.search(query, control)?;
+        control.set_phase(ScanPhase::Mapping);
+        control.start_work(found.len() as u64);
         let mut rows = Vec::with_capacity(found.len());
         for index in found {
             if !control.checkpoint() {
@@ -210,37 +239,24 @@ fn build_rows(
         }
         return Ok(rows);
     }
-    let mut children = HashMap::<usize, Vec<usize>>::new();
-    let mut roots = Vec::new();
-    for index in found {
-        if !control.checkpoint() {
-            return Err(tr("Cancelled").into());
-        }
-        match snapshot.nodes[index].parent {
-            Some(parent) if expanded.contains(&parent) => {
-                children.entry(parent).or_default().push(index)
-            }
-            None => roots.push(index),
-            _ => {}
-        }
-        control.advance_work(1);
-    }
+    let mut roots = snapshot.roots.clone();
+    index.sort_nodes(&mut roots, query, control)?;
     let mut pending: Vec<_> = roots.into_iter().rev().map(|index| (index, 0)).collect();
     let mut rows = Vec::new();
-    control.start_work(pending.len() as u64);
-    while let Some((index, depth)) = pending.pop() {
+    while let Some((node_index, depth)) = pending.pop() {
         if !control.checkpoint() {
             return Err(tr("Cancelled").into());
         }
-        rows.push((index, depth));
-        control.advance_work(1);
-        if let Some(children) = children.remove(&index) {
-            control
-                .work_total
-                .fetch_add(children.len() as u64, Ordering::Relaxed);
+        rows.push((node_index, depth));
+        if expanded.contains(&node_index) {
+            let mut children = snapshot.nodes[node_index].children.clone();
+            index.sort_nodes(&mut children, query, control)?;
             pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
         }
     }
+    control.set_phase(ScanPhase::Mapping);
+    control.start_work(rows.len() as u64);
+    control.advance_work(rows.len() as u64);
     Ok(rows)
 }
 
@@ -393,7 +409,7 @@ fn show_work_progress(ui: &mut egui::Ui, control: &ScanControl) {
     let total = control.work_total.load(Ordering::Relaxed);
     let done = control.work_done.load(Ordering::Relaxed).min(total);
     if total > 0 {
-        ui.label(trf(
+        ui.monospace(trf(
             "{stage}: {done} / {total}",
             &[
                 ("stage", phase_label(control.phase()).into()),
@@ -636,6 +652,8 @@ pub struct UniDirStatApp {
     map_focus: Option<usize>,
     reveal_row: Option<usize>,
     column_widths: [f32; 4],
+    summary_open: bool,
+    compact_map: bool,
     permission_details: Option<(PathBuf, String)>,
     volumes: Vec<Volume>,
     largest: Vec<usize>,
@@ -684,7 +702,8 @@ impl UniDirStatApp {
             settings.threads = options.threads;
         }
         settings.threads = settings.threads.min(64);
-        settings.font_scale = settings.font_scale.clamp(0.85, 1.5);
+        settings.font_scale = settings.font_scale.clamp(0.85, 2.0);
+        context.egui_ctx.set_fonts(interface_fonts());
         context.egui_ctx.set_zoom_factor(settings.font_scale);
         settings.tile_gap = settings.tile_gap.clamp(1.0, 6.0);
         settings.price_per_gib = settings.price_per_gib.clamp(0.0, 1000.0);
@@ -745,7 +764,9 @@ impl UniDirStatApp {
             map_viewport: MapViewport::default(),
             map_focus: None,
             reveal_row: None,
-            column_widths: [0.0, 112.0, 128.0, 160.0],
+            column_widths: DEFAULT_COLUMN_WIDTHS,
+            summary_open: false,
+            compact_map: false,
             permission_details: None,
             volumes: mounted_volumes(),
             largest: Vec::new(),
@@ -799,6 +820,16 @@ impl UniDirStatApp {
         style
             .text_styles
             .insert(egui::TextStyle::Small, FontId::proportional(HELP_SIZE));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, FontId::monospace(BODY_SIZE));
+        style.visuals.error_fg_color = ERROR_TEXT[usize::from(dark)];
+        style.visuals.warn_fg_color = WARNING_TEXT[usize::from(dark)];
+        style.visuals.weak_text_color = Some(if dark {
+            Color32::from_rgb(162, 173, 194)
+        } else {
+            Color32::from_rgb(84, 97, 120)
+        });
         style.visuals.panel_fill = if dark {
             Color32::from_rgb(17, 21, 31)
         } else {
@@ -820,8 +851,11 @@ impl UniDirStatApp {
             Color32::from_rgb(239, 242, 248)
         };
         style.visuals.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.35 } else { 0.25 });
-        style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        style.visuals.hyperlink_color = ACCENT;
+        style.visuals.widgets.inactive.bg_stroke =
+            Stroke::new(1.0, CONTROL_BORDER[usize::from(dark)]);
+        style.visuals.selection.stroke =
+            Stroke::new(2.0, if dark { ACCENT } else { PRIMARY_BUTTON });
+        style.visuals.hyperlink_color = if dark { ACCENT } else { PRIMARY_BUTTON };
         for widget in [
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.hovered,
@@ -1145,8 +1179,44 @@ impl UniDirStatApp {
     }
 
     fn sidebar(&mut self, context: &egui::Context) {
+        if context.content_rect().width() < 1100.0 || context.content_rect().height() < 720.0 {
+            egui::TopBottomPanel::top("compact-navigation")
+                .frame(
+                    egui::Frame::new()
+                        .fill(context.style().visuals.panel_fill)
+                        .inner_margin(12),
+                )
+                .show(context, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::new("compact-page", tr("View"))
+                            .selected_text(self.page.title())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for page in [
+                                    Page::Overview,
+                                    Page::Files,
+                                    Page::Largest,
+                                    Page::Types,
+                                    Page::Duplicates,
+                                    Page::Storage,
+                                    Page::Issues,
+                                ] {
+                                    ui.selectable_value(&mut self.page, page, page.title());
+                                }
+                            });
+                        if ui.button(tr("Settings")).clicked() {
+                            self.page = Page::Settings;
+                        }
+                        if context.content_rect().height() < 500.0 {
+                            ui.menu_button(tr("Actions"), |ui| self.header_actions(ui));
+                        }
+                    });
+                    self.appearance_controls(ui, true);
+                });
+            return;
+        }
         egui::SidePanel::left("sidebar")
-            .exact_width(204.0)
+            .exact_width(224.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -1194,7 +1264,7 @@ impl UniDirStatApp {
                     let text = RichText::new(page.title()).color(ui.visuals().text_color());
                     if ui
                         .add_sized(
-                            [168.0, 37.0],
+                            [188.0, CONTROL_HEIGHT],
                             egui::Button::new(text)
                                 .selected(selected)
                                 .frame(selected)
@@ -1209,7 +1279,7 @@ impl UniDirStatApp {
                 let controls = egui::Rect::from_min_max(
                     egui::pos2(
                         ui.max_rect().left(),
-                        (ui.max_rect().bottom() - 190.0).max(ui.cursor().top()),
+                        (ui.max_rect().bottom() - 204.0).max(ui.cursor().top()),
                     ),
                     ui.max_rect().max,
                 );
@@ -1225,19 +1295,15 @@ impl UniDirStatApp {
                         } else {
                             tr("Saved snapshot")
                         })
-                        .color(if self.live {
-                            PALETTE[1]
-                        } else {
-                            muted(&controls_ui)
-                        })
+                        .color(muted(&controls_ui))
                         .size(HELP_SIZE),
                     );
                 }
-                self.appearance_controls(&mut controls_ui);
+                self.appearance_controls(&mut controls_ui, false);
                 controls_ui.separator();
                 if controls_ui
                     .add_sized(
-                        [168.0, CONTROL_HEIGHT],
+                        [188.0, CONTROL_HEIGHT],
                         egui::Button::new(tr("Settings")).selected(self.page == Page::Settings),
                     )
                     .clicked()
@@ -1253,115 +1319,35 @@ impl UniDirStatApp {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.heading(self.page.title());
-                ui.label(RichText::new(self.page.subtitle()).color(muted(ui)));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        self.receiver.is_none(),
-                        egui::Button::new(RichText::new(tr("Add folder")).color(Color32::WHITE))
-                            .fill(PRIMARY_BUTTON),
-                    )
-                    .clicked()
-                    && let Some(paths) = rfd::FileDialog::new()
-                        .set_title(tr("Choose folders to scan"))
-                        .pick_folders()
-                {
-                    self.roots.extend(paths);
-                    self.start_scan(ui.ctx());
-                }
-                if ui
-                    .add_enabled(
-                        self.receiver.is_none() && self.snapshot.is_some(),
-                        egui::Button::new(tr("Refresh")),
-                    )
-                    .clicked()
-                {
-                    self.start_scan(ui.ctx());
-                }
-                ui.menu_button(tr("Reports"), |ui| {
-                    let idle = self.receiver.is_none();
-                    if ui
-                        .add_enabled(idle, egui::Button::new(tr("Open snapshot...")))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(tr("UniDirStat snapshot"), &["json", "csv"])
-                            .pick_file()
-                        {
-                            self.load(path, ui.ctx());
-                        }
-                        ui.close();
-                    }
-                    for (label, extension) in [
-                        (tr("Save JSON snapshot..."), "json"),
-                        (tr("Export CSV report..."), "csv"),
-                    ] {
-                        if ui
-                            .add_enabled(idle && self.snapshot.is_some(), egui::Button::new(label))
-                            .clicked()
-                        {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_file_name(format!("unidirstat.{extension}"))
-                                .add_filter(tr("Report"), &[extension])
-                                .save_file()
-                                && let Some(snapshot) = self.snapshot.as_ref().map(Arc::clone)
-                            {
-                                self.job(JobKind::SaveReport, ui.ctx(), move || {
-                                    JobResult::Io(
-                                        (if extension == "json" {
-                                            report::save_snapshot(&path, &snapshot)
-                                        } else {
-                                            report::export_csv(&path, &snapshot)
-                                        })
-                                        .map(|()| {
-                                            trf(
-                                                "Saved {path}",
-                                                &[("path", path.display().to_string())],
-                                            )
-                                        }),
-                                    )
-                                });
-                            }
-                            ui.close();
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            idle && self.snapshot.is_some(),
-                            egui::Button::new(tr("Export permission metadata...")),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("permissions.csv")
-                            .add_filter(tr("Permission metadata"), &["csv", "json"])
-                            .save_file()
-                            && let Some(snapshot) = self.snapshot.as_ref().map(Arc::clone)
-                        {
-                            self.job(JobKind::SaveReport, ui.ctx(), move || {
-                                JobResult::Io(report::export_permissions(&path, &snapshot).map(
-                                    |()| {
-                                        trf("Saved {path}", &[("path", path.display().to_string())])
-                                    },
-                                ))
-                            });
-                        }
-                        ui.close();
-                    }
+        let compact_header = ui.ctx().content_rect().height() < 500.0;
+        if !compact_header && ui.available_width() < 900.0 {
+            ui.heading(self.page.title());
+            ui.label(RichText::new(self.page.subtitle()).color(muted(ui)));
+            ui.horizontal_wrapped(|ui| self.header_actions(ui));
+        } else if !compact_header {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading(self.page.title());
+                    ui.label(RichText::new(self.page.subtitle()).color(muted(ui)));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.header_actions(ui)
                 });
             });
-        });
-        ui.add_space(12.0);
+        }
+        ui.add_space(if compact_header { 4.0 } else { 12.0 });
         if self.receiver.is_some() {
             self.job_card(ui);
         }
         if let Some(error) = self.error.clone() {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(PALETTE[5], trf("Error: {details}", &[("details", error)]));
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    trf("Error: {details}", &[("details", error)]),
+                );
+                ui.label(tr(
+                    "Try again, choose another folder, or check file access.",
+                ));
                 if ui.button(tr("Dismiss")).clicked() {
                     self.error = None;
                 }
@@ -1369,56 +1355,163 @@ impl UniDirStatApp {
         }
     }
 
-    fn appearance_controls(&mut self, ui: &mut egui::Ui) {
+    fn header_actions(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_enabled(
+                self.receiver.is_none(),
+                egui::Button::new(RichText::new(tr("Add folder")).color(Color32::WHITE))
+                    .fill(PRIMARY_BUTTON),
+            )
+            .clicked()
+            && let Some(paths) = rfd::FileDialog::new()
+                .set_title(tr("Choose folders to scan"))
+                .pick_folders()
+        {
+            self.roots.extend(paths);
+            self.start_scan(ui.ctx());
+        }
+        if ui
+            .add_enabled(
+                self.receiver.is_none() && self.snapshot.is_some(),
+                egui::Button::new(tr("Refresh")),
+            )
+            .clicked()
+        {
+            self.start_scan(ui.ctx());
+        }
+        ui.menu_button(tr("Reports"), |ui| {
+            let idle = self.receiver.is_none();
+            if ui
+                .add_enabled(idle, egui::Button::new(tr("Open snapshot...")))
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(tr("UniDirStat snapshot"), &["json", "csv"])
+                    .pick_file()
+                {
+                    self.load(path, ui.ctx());
+                }
+                ui.close();
+            }
+            for (label, extension) in [
+                (tr("Save JSON snapshot..."), "json"),
+                (tr("Export CSV report..."), "csv"),
+            ] {
+                if ui
+                    .add_enabled(idle && self.snapshot.is_some(), egui::Button::new(label))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("unidirstat.{extension}"))
+                        .add_filter(tr("Report"), &[extension])
+                        .save_file()
+                        && let Some(snapshot) = self.snapshot.as_ref().map(Arc::clone)
+                    {
+                        self.job(JobKind::SaveReport, ui.ctx(), move || {
+                            JobResult::Io(
+                                (if extension == "json" {
+                                    report::save_snapshot(&path, &snapshot)
+                                } else {
+                                    report::export_csv(&path, &snapshot)
+                                })
+                                .map(|()| {
+                                    trf("Saved {path}", &[("path", path.display().to_string())])
+                                }),
+                            )
+                        });
+                    }
+                    ui.close();
+                }
+            }
+            if ui
+                .add_enabled(
+                    idle && self.snapshot.is_some(),
+                    egui::Button::new(tr("Export permission metadata...")),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("permissions.csv")
+                    .add_filter(tr("Permission metadata"), &["csv", "json"])
+                    .save_file()
+                    && let Some(snapshot) = self.snapshot.as_ref().map(Arc::clone)
+                {
+                    self.job(JobKind::SaveReport, ui.ctx(), move || {
+                        JobResult::Io(
+                            report::export_permissions(&path, &snapshot).map(|()| {
+                                trf("Saved {path}", &[("path", path.display().to_string())])
+                            }),
+                        )
+                    });
+                }
+                ui.close();
+            }
+        });
+    }
+
+    fn appearance_controls(&mut self, ui: &mut egui::Ui, compact: bool) {
         let previous = self.settings.language;
-        ui.vertical(|ui| {
+        let layout = if compact {
+            Layout::left_to_right(Align::Center).with_main_wrap(true)
+        } else {
+            Layout::top_down(Align::LEFT)
+        };
+        ui.with_layout(layout, |ui| {
             ui.horizontal(|ui| {
                 language_icon(ui);
-                egui::ComboBox::from_id_salt("sidebar-language")
-                    .width(128.0)
-                    .selected_text(match self.settings.language {
-                        Language::System => tr("System language"),
-                        Language::English => "English",
-                        Language::Russian => "Русский",
-                    })
+                let language = match self.settings.language {
+                    Language::System => tr("System language"),
+                    Language::English => "English",
+                    Language::Russian => "Русский",
+                };
+                let response = egui::ComboBox::from_id_salt("sidebar-language")
+                    .width(146.0)
+                    .selected_text(language)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.settings.language,
-                            Language::System,
-                            tr("System language"),
-                        );
-                        ui.selectable_value(
-                            &mut self.settings.language,
-                            Language::English,
-                            "English",
-                        );
-                        ui.selectable_value(
-                            &mut self.settings.language,
-                            Language::Russian,
-                            "Русский",
-                        );
-                    });
+                        for (value, label) in [
+                            (Language::System, tr("System language")),
+                            (Language::English, "English"),
+                            (Language::Russian, "Русский"),
+                        ] {
+                            ui.selectable_value(&mut self.settings.language, value, label);
+                        }
+                    })
+                    .response;
+                response.widget_info(|| {
+                    let mut info =
+                        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, tr("Language"));
+                    info.current_text_value = Some(language.into());
+                    info
+                });
             });
             if previous != self.settings.language {
                 set_language(self.settings.language);
                 self.status = tr("Language updated").into();
             }
-            egui::ComboBox::from_id_salt("sidebar-theme")
-                .width(164.0)
-                .selected_text(match self.settings.theme {
-                    Theme::System => tr("System"),
-                    Theme::Light => tr("Light"),
-                    Theme::Dark => tr("Dark"),
-                })
+            let theme = match self.settings.theme {
+                Theme::System => tr("System"),
+                Theme::Light => tr("Light"),
+                Theme::Dark => tr("Dark"),
+            };
+            let response = egui::ComboBox::from_id_salt("sidebar-theme")
+                .width(184.0)
+                .selected_text(theme)
                 .show_ui(ui, |ui| {
-                    for (theme, label) in [
+                    for (value, label) in [
                         (Theme::System, tr("System")),
                         (Theme::Light, tr("Light")),
                         (Theme::Dark, tr("Dark")),
                     ] {
-                        ui.selectable_value(&mut self.settings.theme, theme, label);
+                        ui.selectable_value(&mut self.settings.theme, value, label);
                     }
-                });
+                })
+                .response;
+            response.widget_info(|| {
+                let mut info =
+                    egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, tr("Theme"));
+                info.current_text_value = Some(theme.into());
+                info
+            });
         });
     }
 
@@ -1428,7 +1521,7 @@ impl UniDirStatApp {
         card(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.spinner();
+                    if state == JobState::Running && !self.settings.reduced_motion { ui.spinner(); }
                     ui.strong(kind.map_or(tr("Working"), JobKind::label));
                     if kind.is_some_and(JobKind::cancellable) {
                         if ui
@@ -1612,18 +1705,29 @@ impl UniDirStatApp {
                 .color(muted(ui)),
             );
             ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                let response = ui.add_sized(
-                    [ui.available_width() - 140.0, 36.0],
-                    egui::TextEdit::singleline(&mut self.path_input)
-                        .margin(INPUT_MARGIN)
-                        .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
-                        .hint_text(tr("Enter a folder path...")),
-                );
+            let path_label = ui.label(tr("Folder path"));
+            let input_width = if ui.available_width() < 460.0 {
+                ui.available_width()
+            } else {
+                ui.available_width() - 180.0
+            };
+            ui.horizontal_wrapped(|ui| {
+                let response = ui
+                    .add_sized(
+                        [input_width.max(1.0), CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.path_input)
+                            .margin(INPUT_MARGIN)
+                            .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+                            .hint_text(tr("Enter a folder path...")),
+                    )
+                    .labelled_by(path_label.id);
                 let explore = ui
                     .add_sized(
-                        [125.0, 36.0],
-                        egui::Button::new(tr("Explore folder")).fill(ACCENT),
+                        [160.0, CONTROL_HEIGHT],
+                        egui::Button::new(
+                            RichText::new(tr("Explore folder")).color(Color32::WHITE),
+                        )
+                        .fill(PRIMARY_BUTTON),
                     )
                     .clicked()
                     || (response.lost_focus()
@@ -1715,15 +1819,17 @@ impl UniDirStatApp {
 
     fn filters(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
+        let search_label = ui.label(tr("Search files and folders"));
         ui.horizontal_wrapped(|ui| {
             changed |= ui
                 .add_sized(
-                    [ui.available_width().min(320.0), 34.0],
+                    [ui.available_width().min(360.0), CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.search_query.text)
                         .margin(INPUT_MARGIN)
                         .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                         .hint_text(tr("Search files and folders...")),
                 )
+                .labelled_by(search_label.id)
                 .changed();
             changed |= ui
                 .checkbox(&mut self.search_query.regex, tr("Regex"))
@@ -1767,7 +1873,8 @@ impl UniDirStatApp {
                     ),
                 ] {
                     let mut enabled = field.is_some();
-                    if ui.checkbox(&mut enabled, label).changed() {
+                    let field_label = ui.checkbox(&mut enabled, label);
+                    if field_label.changed() {
                         *field = enabled.then_some(0);
                         changed = true;
                     }
@@ -1779,6 +1886,7 @@ impl UniDirStatApp {
                                     .range(0.0..=1e12)
                                     .speed(1.0),
                             )
+                            .labelled_by(field_label.id)
                             .changed()
                         {
                             *value = (display * unit as f64) as u64;
@@ -1805,32 +1913,30 @@ impl UniDirStatApp {
                     }
                 }
                 let mut owner_enabled = self.search_query.owner.is_some();
-                if ui
-                    .add_enabled(
+                let owner_label = ui.add_enabled(
                         cfg!(unix),
                         egui::Checkbox::new(&mut owner_enabled, tr("Owner UID")),
-                    )
-                    .changed()
-                {
+                    );
+                if owner_label.changed() {
                     self.search_query.owner = owner_enabled.then_some(0);
                     changed = true;
                 }
                 if let Some(owner) = &mut self.search_query.owner {
                     changed |= ui
                         .add(egui::DragValue::new(owner).range(0..=u32::MAX))
+                        .labelled_by(owner_label.id)
                         .changed();
                 }
                 let mut extension_enabled = self.search_query.extension.is_some();
-                if ui
-                    .checkbox(&mut extension_enabled, tr("Extension"))
-                    .changed()
-                {
+                let extension_label = ui.checkbox(&mut extension_enabled, tr("Extension"));
+                if extension_label.changed() {
                     self.search_query.extension = extension_enabled.then(String::new);
                     changed = true;
                 }
                 if let Some(extension) = &mut self.search_query.extension {
                     changed |= ui
                         .add_sized([110.0, 24.0], egui::TextEdit::singleline(extension).margin(INPUT_MARGIN).min_size(Vec2::new(0.0, CONTROL_HEIGHT)))
+                        .labelled_by(extension_label.id)
                         .changed();
                 }
                 if ui.button(tr("Empty folder candidates")).clicked() {
@@ -1845,10 +1951,11 @@ impl UniDirStatApp {
                 ui.label(tr("Candidates are empty in the scan. Exclusions can hide contents; cleanup rechecks the live folder."));
             }
             ui.horizontal_wrapped(|ui| {
+                let filter_label = ui.label(tr("Filter name"));
                 ui.add_sized(
                     [140.0, 24.0],
                     egui::TextEdit::singleline(&mut self.filter_name).margin(INPUT_MARGIN).min_size(Vec2::new(0.0, CONTROL_HEIGHT)).hint_text(tr("Filter name")),
-                );
+                ).labelled_by(filter_label.id);
                 if ui.button(tr("Save filter")).clicked() {
                     let mut query = self.search_query.clone();
                     query.sort = match self.sort_by {
@@ -1896,9 +2003,12 @@ impl UniDirStatApp {
         }
         if let Some(error) = &self.filter_error {
             ui.colored_label(
-                PALETTE[5],
+                ui.visuals().error_fg_color,
                 trf("Search error: {error}", &[("error", error.to_owned())]),
             );
+            ui.label(tr(
+                "Edit the search, turn off Regex, or clear filters to try again.",
+            ));
         }
     }
 
@@ -1961,6 +2071,7 @@ impl UniDirStatApp {
     }
 
     fn files(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        self.file_controls(ui);
         self.file_table(ui, snapshot);
     }
 
@@ -1974,7 +2085,9 @@ impl UniDirStatApp {
         let summary = self.map_worker.summary().map(Arc::clone);
         let extensions = if self.scope.is_some() {
             let Some(summary) = summary.as_ref() else {
-                ui.spinner();
+                if !self.settings.reduced_motion {
+                    ui.spinner();
+                }
                 ui.label(tr("Calculating statistics"));
                 return;
             };
@@ -2021,6 +2134,8 @@ impl UniDirStatApp {
                                 self.search_query.extension = Some(stats.extension.clone());
                                 self.search_query.scope = self.scope;
                                 self.page = Page::Files;
+                                self.compact_map = false;
+                                self.summary_open = false;
                                 self.rebuild = true;
                             }
                             ui.add_sized(
@@ -2142,7 +2257,7 @@ impl UniDirStatApp {
                     }
                 });
             for error in report.errors.iter().take(20) {
-                ui.colored_label(PALETTE[3], error);
+                ui.colored_label(ui.visuals().warn_fg_color, error);
             }
         }
     }
@@ -2222,7 +2337,7 @@ impl UniDirStatApp {
             });
             if ui
                 .add(
-                    egui::Slider::new(&mut self.settings.font_scale, 0.85..=1.5)
+                    egui::Slider::new(&mut self.settings.font_scale, 0.85..=2.0)
                         .text(tr("Interface scale"))
                         .fixed_decimals(2),
                 )
@@ -2279,7 +2394,7 @@ impl UniDirStatApp {
             ui.add_enabled(cfg!(unix),egui::Checkbox::new(&mut self.settings.one_file_system,tr("Stay on the same filesystem (Unix)")));
             ui.label(tr("Exclude paths matching these regular expressions (one per line)"));
             ui.add(egui::TextEdit::multiline(&mut self.settings.exclude).margin(INPUT_MARGIN).hint_text("(^|/)(node_modules|target|\\.git)(/|$)").desired_width(f32::INFINITY).desired_rows(4));
-            for expression in self.settings.exclude.lines().filter(|line|!line.is_empty()) { if let Err(error)=regex::Regex::new(expression) { ui.colored_label(PALETTE[5],error.to_string()); } }
+            for expression in self.settings.exclude.lines().filter(|line|!line.is_empty()) { if let Err(error)=regex::Regex::new(expression) { ui.colored_label(ui.visuals().error_fg_color,error.to_string()); } }
             let response=ui.add_enabled(self.live && self.receiver.is_none(),egui::Checkbox::new(&mut self.watching,tr("Watch filesystem changes and refresh automatically")));
             if response.changed() { self.install_watcher(ui.ctx()); }
             ui.label(RichText::new(tr("Watch notifications are debounced for two seconds. Large/network filesystems may exceed OS watcher limits.")).small().color(muted(ui)));
@@ -2448,7 +2563,9 @@ impl UniDirStatApp {
         if ui
             .add_enabled(
                 can_clean,
-                egui::Button::new(RichText::new(tr("Move to trash...")).color(PALETTE[5])),
+                egui::Button::new(
+                    RichText::new(tr("Move to trash...")).color(ui.visuals().error_fg_color),
+                ),
             )
             .clicked()
         {
@@ -2474,7 +2591,7 @@ impl UniDirStatApp {
             );
         }
         if let Some(error) = &node.error {
-            ui.colored_label(PALETTE[3], error);
+            ui.colored_label(ui.visuals().warn_fg_color, error);
         }
     }
 
@@ -2584,6 +2701,7 @@ impl UniDirStatApp {
             }
             if ui.button(tr("Inspect")).clicked() {
                 self.selected = self.selection.primary().or(Some(index));
+                self.summary_open = true;
                 ui.close();
             }
             if ui
@@ -2779,7 +2897,7 @@ impl eframe::App for UniDirStatApp {
             }
             self.selected = self.selection.primary();
         }
-        if !matches!(self.page, Page::Overview | Page::Files) {
+        if !matches!(self.page, Page::Overview | Page::Files | Page::Settings) {
             self.inspector(context);
         }
         egui::TopBottomPanel::bottom("status")
@@ -2790,10 +2908,19 @@ impl eframe::App for UniDirStatApp {
             )
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).small().color(muted(ui)));
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.status).small().color(muted(ui)))
+                            .truncate(),
+                    )
+                    .on_hover_text(&self.status);
                 });
             });
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(context.style().visuals.panel_fill).inner_margin(24)).show(context,|ui| {
+        let margin = if context.content_rect().width() < 1100.0 {
+            12
+        } else {
+            24
+        };
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(context.style().visuals.panel_fill).inner_margin(margin)).show(context,|ui| {
             ui.set_opacity(context.animate_value_with_time(egui::Id::new("page-opacity"),1.0,if self.settings.reduced_motion {0.0} else {0.16}));
             self.header(ui);
             if self.page==Page::Settings { egui::ScrollArea::vertical().show(ui,|ui|self.settings_page(ui)); return; }
@@ -2924,7 +3051,50 @@ mod tests {
     }
 
     #[test]
-    fn background_rows_preserve_sorted_hierarchy_and_expansion() {
+    fn background_tree_rows_skip_filtering_collapsed_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("folder")).unwrap();
+        std::fs::write(fixture.path().join("folder/file"), b"data").unwrap();
+        std::fs::write(fixture.path().join("small"), b"x").unwrap();
+        std::fs::write(fixture.path().join("large"), [0; 64]).unwrap();
+        let snapshot = Arc::new(
+            scanner::scan(
+                &[fixture.path().into()],
+                &ScanOptions::default(),
+                &ScanControl::default(),
+            )
+            .unwrap(),
+        );
+        let root = snapshot.roots[0];
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        let control = ScanControl::default();
+        let rows = build_rows(
+            &snapshot,
+            &index,
+            &SearchQuery::default(),
+            false,
+            &HashSet::from([root]),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], (root, 0));
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .map(|&(index, depth)| (snapshot.nodes[index].name(), depth))
+                .collect::<Vec<_>>(),
+            [
+                ("large".into(), 1),
+                ("folder".into(), 1),
+                ("small".into(), 1)
+            ]
+        );
+        assert_eq!(control.visited.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn background_flat_rows_include_matches_inside_collapsed_folders() {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::create_dir(fixture.path().join("folder")).unwrap();
         std::fs::write(fixture.path().join("folder/file"), b"data").unwrap();
@@ -2936,21 +3106,28 @@ mod tests {
             )
             .unwrap(),
         );
-        let root = snapshot.roots[0];
         let index = SearchIndex::new(Arc::clone(&snapshot));
+        let query = SearchQuery {
+            text: "file".into(),
+            target: SearchTarget::Name,
+            kinds: vec![EntryKind::File],
+            ..SearchQuery::default()
+        };
         let rows = build_rows(
             &snapshot,
             &index,
-            &SearchQuery::default(),
-            false,
-            &HashSet::from([root]),
+            &query,
+            true,
+            &HashSet::new(),
             &ScanControl::default(),
         )
         .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (root, 0));
-        assert_eq!(rows[1].1, 1);
-        assert_eq!(snapshot.nodes[rows[1].0].kind, EntryKind::Directory);
+        assert_eq!(
+            rows.iter()
+                .map(|&(index, depth)| (snapshot.nodes[index].name(), depth))
+                .collect::<Vec<_>>(),
+            [("file".into(), 0)]
+        );
     }
 
     #[test]
@@ -3120,6 +3297,39 @@ mod tests {
     #[test]
     fn primary_button_has_readable_white_text() {
         assert!(contrast(Color32::WHITE, PRIMARY_BUTTON) >= 4.5);
+    }
+
+    #[test]
+    fn semantic_status_text_has_readable_contrast_on_both_surfaces() {
+        for (dark, surfaces) in [
+            (false, [Color32::WHITE, Color32::from_rgb(246, 247, 251)]),
+            (
+                true,
+                [Color32::from_rgb(25, 30, 43), Color32::from_rgb(17, 21, 31)],
+            ),
+        ] {
+            for surface in surfaces {
+                for foreground in [
+                    ERROR_TEXT[usize::from(dark)],
+                    WARNING_TEXT[usize::from(dark)],
+                ] {
+                    assert!(contrast(foreground, surface) >= 4.5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interface_uses_regular_weight_and_readable_default_metrics() {
+        let fonts = interface_fonts();
+        assert_eq!(
+            fonts.families[&egui::FontFamily::Proportional][0],
+            "Ubuntu-Regular"
+        );
+        const {
+            assert!(BODY_SIZE >= 16.0 && HELP_SIZE >= 14.0);
+            assert!(CONTROL_HEIGHT >= 40.0 && ROW_HEIGHT >= 36.0);
+        }
     }
 
     #[test]

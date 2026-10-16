@@ -311,6 +311,24 @@ impl SearchIndex {
                 .collect()
         });
         checkpoint(control)?;
+        self.sort_nodes(&mut found, query, control)?;
+        Ok(found)
+    }
+
+    pub fn sort_nodes(
+        &self,
+        indices: &mut Vec<usize>,
+        query: &SearchQuery,
+        control: &ScanControl,
+    ) -> Result<(), String> {
+        checkpoint(control)?;
+        for &index in indices.iter() {
+            checkpoint(control)?;
+            if index >= self.snapshot.nodes.len() {
+                return Err("Invalid node index".into());
+            }
+        }
+        let pool = self.pool.as_ref().map_err(|error| error.clone())?;
         let compare = |left: &usize, right: &usize| {
             let left_node = &self.snapshot.nodes[*left];
             let right_node = &self.snapshot.nodes[*right];
@@ -344,8 +362,7 @@ impl SearchIndex {
                 .then_with(|| self.paths[*left].value.cmp(&self.paths[*right].value))
                 .then_with(|| left.cmp(right))
         };
-        sort_cancellable(&mut found, &compare, pool, control)?;
-        Ok(found)
+        sort_cancellable(indices, &compare, pool, control)
     }
 }
 
@@ -659,6 +676,78 @@ mod tests {
         let repeated = index.search(&query, &ScanControl::default()).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(snapshot.nodes[first[0]].extension(), "rs");
+    }
+
+    #[test]
+    fn sorting_supplied_siblings_keeps_unknown_allocations_last() {
+        let (_directory, snapshot) = fixture();
+        let mut snapshot = Arc::try_unwrap(snapshot).unwrap();
+        let root = snapshot.roots[0];
+        for &index in &snapshot.nodes[root].children.clone() {
+            let node = &mut snapshot.nodes[index];
+            node.allocated_size = match node.name().as_str() {
+                "nested" => Some(15),
+                "image.PNG" => Some(40),
+                _ => None,
+            };
+        }
+        let snapshot = Arc::new(snapshot);
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        for (descending, expected) in [
+            (false, ["nested", "image.PNG", "Документ.RS"]),
+            (true, ["image.PNG", "nested", "Документ.RS"]),
+        ] {
+            let mut children = snapshot.nodes[root].children.clone();
+            let query = SearchQuery {
+                allocated: true,
+                descending,
+                ..SearchQuery::default()
+            };
+            let control = ScanControl::default();
+
+            index.sort_nodes(&mut children, &query, &control).unwrap();
+
+            assert_eq!(
+                children
+                    .iter()
+                    .map(|&index| snapshot.nodes[index].name())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(control.work_done.load(Ordering::Relaxed), 3);
+            assert_eq!(control.work_total.load(Ordering::Relaxed), 3);
+            assert_eq!(control.visited.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn supplied_sibling_sort_cancels_after_reporting_progress() {
+        let (_directory, snapshot) = fixture();
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        let control = ScanControl::default();
+        let gate = crate::scanner::tests::register_gate(&control, ScanPhase::Sorting);
+        let mut children = snapshot.nodes[snapshot.roots[0]].children.clone();
+        std::thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| index.sort_nodes(&mut children, &SearchQuery::default(), &control));
+            gate.arrived.wait();
+            control.cancel();
+            gate.release.wait();
+            assert!(worker.join().unwrap().is_err());
+        });
+    }
+
+    #[test]
+    fn supplied_sibling_sort_rejects_invalid_indices() {
+        let (_directory, snapshot) = fixture();
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        let mut nodes = vec![snapshot.nodes.len()];
+
+        assert!(
+            index
+                .sort_nodes(&mut nodes, &SearchQuery::default(), &ScanControl::default())
+                .is_err()
+        );
     }
 
     #[test]

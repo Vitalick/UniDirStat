@@ -28,7 +28,7 @@ The default build includes the native GUI. Multiple folders, mounted volumes, an
 - **File browser and search:** a virtualized directory tree and largest-file list; sorting by name, size, or modified time; asynchronous indexed parallel text/regex searches by name or path. Filters cover minimum/maximum size and modified age, kind, extension, owner UID where available, and folders empty in the scan. Save and reuse named filter profiles.
 - **Linked workspace:** an expandable size-descending file tree above the map, resizable panes and columns, parent-relative size bars, shared multi-selection and folder-region highlights. Clicking a map item reveals it in the tree. The side panel shows file types and largest files for the focused folder.
 - **Storage maps:** hierarchical treemap, readable flame graph, and sunburst with clipped/ellipsized labels, tiny-content aggregates, pointer-anchored wheel zoom, drag panning and animated double-click focus. Zoom out and Reset remain explicit controls.
-- **Appearance and language:** persistent System/Light/Dark themes and System/English/Russian choices, visible above Settings in the left sidebar. System checks preferred locales in order for supported English/Russian variants, otherwise English. Missing translations fall back to English. Short navigation transitions can be reduced in Settings. Interface scale and Modified/Share columns are configurable.
+- **Appearance and language:** persistent System/Light/Dark themes and System/English/Russian choices, visible above Settings in the sidebar or compact top navigation. System checks preferred locales in order for supported English/Russian variants, otherwise English. Missing translations fall back to English. Readable regular-weight text, interface scale up to 200%, reduced motion and configurable Modified/Share columns. Short windows switch between tree and map; Summary and Search remain available.
 - **Responsive interaction:** map generation runs in a cancellable background job with a small cache; returning from Overview to the same file view preserves its rows. File rows, overview previews and maps have context menus. Cmd/Ctrl toggles selection, Shift selects row ranges, and Cmd/Ctrl+A selects the current file list; selected paths can be copied together. Cleanup remains per-item with confirmation.
 - **Visible progress:** scanning shows the last directory, logical/allocated bytes and elapsed time; finalization, indexing, sorting, filtering and result assembly show actual stage counters. Map counters show discovered work rather than a guessed overall percentage. A stalled scan suggests checking filesystem operations or a permission dialog.
 - **Logical and allocated size:** Unix blocks and Windows allocation metadata where available. Logical bytes count each path; allocated bytes count identified hard links once. Unavailable metadata is marked.
@@ -99,7 +99,7 @@ Not implemented: raw NTFS/MFT acceleration, MTP access, deleted-file recovery, N
 
 A scan observes a changing filesystem; it is not an atomic filesystem snapshot. File actions require confirmation and current metadata validation. Cross-filesystem moves fail without deleting the source. Windows identity uses a 64-bit file index; 128-bit ReFS identity is not supported. On Unix, paths containing invalid UTF-8 cannot be exported to JSON/CSV.
 
-JSON/CSV snapshot imports are limited to 256 MiB. All scan nodes and the search index remain in memory. Subpixel map contents are represented by aggregate regions; flame depth adapts to readable bands (up to 64 levels) and the GUI sunburst shows up to 12. Zoom into a deeper folder to continue. Storage cost is an estimate, not a provider bill. Technical OS errors and native ACL output may retain their source language.
+JSON/CSV snapshot imports are limited to 256 MiB. All scan nodes and the search index remain in memory. Map contents too small to distinguish are grouped into proportional regions that reveal more detail when zoomed; flame depth adapts to readable bands (up to 64 levels) and the GUI sunburst shows up to 12. Zoom into a deeper folder to continue. Storage cost is an estimate, not a provider bill. Technical OS errors and native ACL output may retain their source language.
 
 ### Checks and project notes
 
@@ -113,7 +113,7 @@ cargo test --no-default-features --locked
 
 [CI](.github/workflows/ci.yml) defines checks and packaging for macOS arm64/x86_64, Windows x86_64, and Linux x86_64. Pushing a `v<package-version>` tag builds all five installer assets and publishes a GitHub Release only after every job and asset verification succeeds. No release is currently published. The in-app update check is intentionally disabled until publication; it makes no network requests. macOS packages are ad-hoc signed, Windows packages are unsigned. Native GUI checks are performed on the macOS host; Windows/Linux execution and hosted Actions are not yet verified. Translation contributions: [localization guide](docs/localization.md).
 
-License: **GPL-3.0-or-later**.
+License: **GPL-3.0-or-later**. The bundled Ubuntu font retains its [Ubuntu Font Licence](assets/fonts/Ubuntu-LICENSE.txt).
 
 ### Support development
 
@@ -151,7 +151,7 @@ cargo run --release --locked -- --settings ./unidirstat-settings.json ~/Download
 - **Дерево и поиск:** виртуализированные списки папок и крупнейших файлов; сортировка по имени, размеру и времени изменения; асинхронный индексированный параллельный поиск текста/regex по имени или пути. Фильтры охватывают минимальный/максимальный размер и возраст изменения, тип, расширение, доступный UID владельца и папки, пустые по данным скана. Именованные профили фильтров можно сохранять и применять повторно.
 - **Связанная рабочая область:** дерево файлов над картой, тяжёлые объекты сверху, регулируемые панели и столбцы, полосы доли от родителя, общее мультивыделение и подсветка области папки. Щелчок по карте раскрывает путь в дереве. Боковая панель показывает типы и крупнейшие файлы открытой папки.
 - **Карты файлов:** иерархические прямоугольники, читаемый flame graph и sunburst с обрезанными подписями, группами мелких файлов, масштабированием колесом к указателю, перетаскиванием и плавным приближением двойным щелчком. Кнопки возврата и сброса остаются доступны.
-- **Внешний вид и язык:** сохраняемые темы «Системная / Светлая / Тёмная» и язык «Системный / English / Русский» доступны в левом сайдбаре над настройками. Системный режим перебирает предпочитаемые локали до первого поддерживаемого варианта русского/английского, иначе выбирает английский. Отсутствующий перевод заменяется английским. Короткие анимации навигации можно уменьшить в настройках. Настраиваются масштаб интерфейса и столбцы «Изменён»/«Доля».
+- **Внешний вид и язык:** сохраняемые темы «Системная / Светлая / Тёмная» и язык «Системный / English / Русский» доступны над настройками в сайдбаре или компактной верхней панели. Системный режим перебирает предпочитаемые локали до первого поддерживаемого варианта русского/английского, иначе выбирает английский. Отсутствующий перевод заменяется английским. Читаемый шрифт обычной толщины, масштаб до 200%, уменьшение анимаций и настройка столбцов «Изменён»/«Доля». В невысоком окне дерево и карта переключаются; «Сводка» и «Поиск» остаются доступны.
 - **Отзывчивое управление:** карта строится в отменяемом фоновом задании с небольшим кэшем; возврат из обзора к прежнему списку файлов сохраняет строки. Строки файлов, списки обзора и карты имеют контекстные меню. Cmd/Ctrl добавляет или снимает выделение, Shift выделяет диапазон строк, Cmd/Ctrl+A — текущий список файлов; выбранные пути можно скопировать вместе. Очистка остаётся по одному объекту с подтверждением.
 - **Понятный прогресс:** скан показывает последний каталог, логический/занятый размер и время; подведение итогов, индексирование, сортировка, фильтрация и сборка результатов показывают реальные счётчики этапа. Счётчики карты отражают обнаруженную работу, а не выдуманный общий процент. При остановке прогресса появляется подсказка проверить файловую систему или окно разрешений.
 - **Логический и занятый размер:** используются blocks Unix и доступные данные allocation Windows. Логический размер учитывается по каждому пути; занятое место жёстких ссылок — один раз на идентификатор. Недоступные значения помечаются.
@@ -222,7 +222,7 @@ cargo build --release --no-default-features --locked
 
 Скан наблюдает за меняющейся файловой системой, а не создаёт её атомарный снимок. Действия с файлами требуют подтверждения и проверки актуальных метаданных. Перенос между файловыми системами завершается ошибкой без удаления исходника. В Windows используется 64-битный индекс файла; 128-битные идентификаторы ReFS не поддерживаются. На Unix пути с некорректным UTF-8 нельзя экспортировать в JSON/CSV.
 
-Импорт снимков JSON/CSV ограничен 256 МиБ. Все узлы сканирования и поисковый индекс хранятся в памяти. Содержимое меньше пикселя обозначается сгруппированными областями; глубина flame подбирается под читаемую высоту полос (до 64 уровней), sunburst в GUI показывает до 12. Более глубокие папки доступны увеличением. Стоимость хранения — оценка, а не счёт провайдера. Технические ошибки ОС и вывод системных ACL могут оставаться на исходном языке.
+Импорт снимков JSON/CSV ограничен 256 МиБ. Все узлы сканирования и поисковый индекс хранятся в памяти. Неразличимо мелкие объекты карты объединяются в пропорциональные области, раскрывающие детали при приближении; глубина flame подбирается под читаемую высоту полос (до 64 уровней), sunburst в GUI показывает до 12. Более глубокие папки доступны увеличением. Стоимость хранения — оценка, а не счёт провайдера. Технические ошибки ОС и вывод системных ACL могут оставаться на исходном языке.
 
 ### Проверки и сведения о проекте
 
@@ -236,7 +236,7 @@ cargo test --no-default-features --locked
 
 В [CI](.github/workflows/ci.yml) настроены проверки и упаковка macOS arm64/x86_64, Windows x86_64 и Linux x86_64. Тег `v<версия-пакета>` запускает сборку всех пяти установочных файлов; GitHub Release публикуется только после успешных заданий и проверки файлов. Релизы пока не опубликованы. Проверка обновлений в программе намеренно отключена до публикации и не обращается к сети. Подпись macOS локальная ad hoc, установщик Windows не подписан. Живой GUI проверяется на текущем macOS-хосте; запуск Windows/Linux и облачный GitHub Actions ещё не проверены. Переводы: [руководство по локализации](docs/localization.md).
 
-Лицензия: **GPL-3.0-or-later**.
+Лицензия: **GPL-3.0-or-later**. Встроенный шрифт Ubuntu распространяется по своей [Ubuntu Font Licence](assets/fonts/Ubuntu-LICENSE.txt).
 
 ### Поддержать разработку
 

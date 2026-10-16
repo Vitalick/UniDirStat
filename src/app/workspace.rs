@@ -105,7 +105,7 @@ pub(super) fn parent_share(snapshot: &Snapshot, index: usize, allocated: bool) -
 }
 
 fn take_tree_keys(context: &egui::Context) -> (bool, bool, bool, bool, bool, bool, bool) {
-    context.input_mut(|input| {
+    let keys = context.input_mut(|input| {
         let modifiers = input
             .events
             .iter()
@@ -134,39 +134,133 @@ fn take_tree_keys(context: &egui::Context) -> (bool, bool, bool, bool, bool, boo
             input.consume_key(modifiers, egui::Key::End),
             modifiers.shift,
         )
-    })
+    });
+    if keys.0 || keys.1 || keys.2 || keys.3 || keys.4 || keys.5 {
+        context.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
+    keys
+}
+
+fn tree_panel_heights(available: f32) -> (f32, f32, f32) {
+    let available = available.max(1.0);
+    let minimum = (CONTROL_HEIGHT + ROW_HEIGHT * 3.0 + 18.0).min(available * 0.6);
+    let maximum = (available - 180.0).max(minimum);
+    (minimum, maximum, (available * 0.5).clamp(minimum, maximum))
+}
+
+fn focus_outline(ui: &egui::Ui, response: &egui::Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            3.0,
+            Stroke::new(2.0, ui.visuals().text_color()),
+            StrokeKind::Inside,
+        );
+    }
 }
 
 impl UniDirStatApp {
     pub(super) fn workspace(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
         self.map_worker
             .request_summary(self.scope, Arc::clone(snapshot), ui.ctx());
-        egui::SidePanel::right("workspace-summary")
-            .resizable(true)
-            .default_width(280.0)
-            .width_range(220.0..=420.0)
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 0)))
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("workspace-summary-scroll")
-                    .show(ui, |ui| {
-                        self.scope_summary(ui, snapshot);
-                        if let Some(index) = self.selected {
-                            ui.add_space(12.0);
-                            ui.separator();
-                            self.inspector_contents(ui, snapshot, index);
-                        }
+        let narrow = ui.available_width() < 900.0;
+        let very_short = ui.available_height() < 360.0;
+        if !narrow {
+            egui::SidePanel::right("workspace-summary")
+                .resizable(true)
+                .default_width(280.0)
+                .width_range(220.0..=420.0)
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 0)))
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("workspace-summary-scroll")
+                        .show(ui, |ui| self.workspace_summary(ui, snapshot));
+                });
+        } else if !very_short && ui.button(tr("Statistics and details")).clicked() {
+            self.summary_open = true;
+        }
+        let compact = ui.available_height() < 600.0;
+        if very_short {
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("workspace-content-view")
+                    .width(112.0)
+                    .selected_text(if self.compact_map {
+                        tr("Storage map")
+                    } else {
+                        tr("All files")
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.compact_map, false, tr("All files"));
+                        ui.selectable_value(&mut self.compact_map, true, tr("Storage map"));
+                    })
+                    .response
+                    .widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::ComboBox,
+                            true,
+                            tr("Content view"),
+                        )
                     });
+                if narrow && ui.button(tr("Summary")).clicked() {
+                    self.summary_open = true;
+                }
+                if !self.compact_map {
+                    self.file_controls(ui);
+                }
             });
-        let maximum = (ui.available_height() - 180.0).max(140.0);
-        egui::TopBottomPanel::top("workspace-tree")
-            .resizable(true)
-            .default_height((ui.available_height() * 0.48).clamp(220.0, 420.0))
-            .height_range(140.0..=maximum)
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 8)))
-            .show_inside(ui, |ui| self.files(ui, snapshot));
-        ui.add_space(8.0);
-        self.map(ui, snapshot, ui.available_height());
+            if self.compact_map {
+                self.map(ui, snapshot, ui.available_height());
+            } else {
+                self.file_table(ui, snapshot);
+            }
+        } else if compact {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.compact_map, false, tr("All files"));
+                ui.selectable_value(&mut self.compact_map, true, tr("Storage map"));
+            });
+        }
+        if !very_short {
+            if compact && self.compact_map {
+                self.map(ui, snapshot, ui.available_height());
+            } else {
+                self.file_controls(ui);
+                if compact {
+                    self.file_table(ui, snapshot);
+                } else {
+                    let (minimum, maximum, height) = tree_panel_heights(ui.available_height());
+                    egui::TopBottomPanel::top("workspace-tree")
+                        .resizable(true)
+                        .default_height(height)
+                        .height_range(minimum..=maximum)
+                        .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 8)))
+                        .show_inside(ui, |ui| self.file_table(ui, snapshot));
+                    ui.add_space(8.0);
+                    self.map(ui, snapshot, ui.available_height());
+                }
+            }
+        }
+        if self.summary_open {
+            let context = ui.ctx().clone();
+            let mut open = self.summary_open;
+            egui::Window::new(RichText::new(tr("Statistics and details")).size(BODY_SIZE))
+                .id(egui::Id::new("workspace-summary-window"))
+                .open(&mut open)
+                .constrain_to(context.content_rect())
+                .max_size(context.content_rect().size() - Vec2::new(24.0, 80.0))
+                .default_size([340.0, 440.0])
+                .vscroll(true)
+                .show(&context, |ui| self.workspace_summary(ui, snapshot));
+            self.summary_open = open;
+        }
+    }
+
+    fn workspace_summary(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
+        self.scope_summary(ui, snapshot);
+        if let Some(index) = self.selected {
+            ui.add_space(12.0);
+            ui.separator();
+            self.inspector_contents(ui, snapshot, index);
+        }
     }
 
     fn scope_summary(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
@@ -175,9 +269,14 @@ impl UniDirStatApp {
             || snapshot.total_size(self.settings.allocated),
             |index| snapshot.nodes[index].size(self.settings.allocated),
         );
-        ui.label(RichText::new(format_bytes(size)).size(25.0).strong());
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].name())).truncate());
+        ui.label(
+            RichText::new(format_bytes(size))
+                .monospace()
+                .size(25.0)
+                .strong(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).wrap());
             info_button(ui, tr("Logical size can exceed disk capacity (sparse files, hard links). Allocated blocks may be shared; snapshots and filesystem metadata are not included."));
         });
         if !self.analysis_complete {
@@ -187,15 +286,18 @@ impl UniDirStatApp {
         }
         if self.map_worker.summary_pending() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                if !self.settings.reduced_motion {
+                    ui.spinner();
+                }
                 ui.label(tr("Calculating statistics"));
             });
         }
         if let Some(error) = self.map_worker.summary_error() {
             ui.colored_label(
-                PALETTE[5],
+                ui.visuals().error_fg_color,
                 trf("Error: {details}", &[("details", error.to_owned())]),
             );
+            ui.label(tr("Refresh to retry statistics."));
         }
         let Some(summary) = self.map_worker.summary().map(Arc::clone) else {
             return;
@@ -214,10 +316,12 @@ impl UniDirStatApp {
                     self.search_query.extension = Some(stats.extension.clone());
                     self.search_query.scope = self.scope;
                     self.page = Page::Files;
+                    self.compact_map = false;
+                    self.summary_open = false;
                     self.rebuild = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(format_bytes(stats.bytes));
+                    ui.monospace(format_bytes(stats.bytes));
                 });
             });
             ui.add(
@@ -249,49 +353,118 @@ impl UniDirStatApp {
                             .truncate()
                             .sense(Sense::hover()),
                     );
-                    ui.label(format_bytes(node.size(self.settings.allocated)));
+                    ui.monospace(format_bytes(node.size(self.settings.allocated)));
                 })
                 .response;
-            self.item_response(
-                clickable_row(response),
-                index,
-                snapshot,
-                SelectionView::Overview,
-            );
+            let response = clickable_row(response);
+            focus_outline(ui, &response);
+            self.item_response(response, index, snapshot, SelectionView::Overview);
         }
     }
 
-    pub(super) fn file_table(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        self.filters(ui);
+    pub(super) fn file_controls(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_height() < 360.0;
+        if compact {
+            let response = ui
+                .menu_button(
+                    if self.filter_error.is_some() {
+                        tr("Search error")
+                    } else {
+                        tr("Search")
+                    },
+                    |ui| {
+                        let viewport = ui.ctx().content_rect().size();
+                        ui.set_width((viewport.x - 40.0).clamp(160.0, 480.0));
+                        egui::ScrollArea::vertical()
+                            .max_height((viewport.y - 80.0).max(40.0))
+                            .show(ui, |ui| {
+                                self.filters(ui);
+                                ui.label(trf(
+                                    "{count} visible entries",
+                                    &[("count", self.rows.len().to_string())],
+                                ));
+                                if self.search_receiver.is_some() {
+                                    show_work_progress(ui, &self.search_control);
+                                }
+                            });
+                    },
+                )
+                .response;
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    true,
+                    if self.filter_error.is_some() {
+                        tr("Search error")
+                    } else {
+                        tr("Search and filters")
+                    },
+                )
+            });
+        } else {
+            self.filters(ui);
+        }
         self.rebuild_rows(ui.ctx());
         if self.search_receiver.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(tr("Searching..."));
+            let cancelled = self.search_control.is_cancelled();
+            let paused = self.search_control.is_paused();
+            ui.horizontal_wrapped(|ui| {
+                if !cancelled && !paused && !self.settings.reduced_motion {
+                    ui.spinner();
+                }
+                ui.label(if cancelled {
+                    tr("Cancelling...")
+                } else if paused {
+                    tr("Search paused")
+                } else {
+                    tr("Searching...")
+                });
                 if ui
-                    .button(if self.search_control.is_paused() {
-                        tr("Resume")
-                    } else {
-                        tr("Pause")
-                    })
+                    .add_enabled(
+                        !cancelled,
+                        egui::Button::new(if paused { tr("Resume") } else { tr("Pause") }),
+                    )
                     .clicked()
                 {
-                    if self.search_control.is_paused() {
+                    if paused {
                         self.search_control.resume();
                     } else {
                         self.search_control.pause();
                     }
                 }
-                if ui.button(tr("Cancel")).clicked() {
+                if ui
+                    .add_enabled(!cancelled, egui::Button::new(tr("Cancel")))
+                    .clicked()
+                {
                     self.search_control.cancel();
                 }
             });
-            show_work_progress(ui, &self.search_control);
+            if !compact {
+                show_work_progress(ui, &self.search_control);
+            }
         }
-        ui.label(trf(
-            "{count} visible entries",
-            &[("count", self.rows.len().to_string())],
-        ));
+        if !compact {
+            ui.label(trf(
+                "{count} visible entries",
+                &[("count", self.rows.len().to_string())],
+            ));
+        }
+        if self.search_receiver.is_none() && self.rows.is_empty() && self.filter_error.is_none() {
+            if has_filters(&self.search_query) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(tr("No entries match these filters."));
+                    if ui.button(tr("Clear filters")).clicked() {
+                        self.search_query = SearchQuery::default();
+                        self.rebuild = true;
+                    }
+                });
+            } else {
+                ui.label(tr("This location has no entries to display."));
+            }
+        }
+    }
+
+    pub(super) fn file_table(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let visible = [
             true,
             true,
@@ -377,11 +550,23 @@ impl UniDirStatApp {
                     let response = ui.interact(
                         rect.shrink2(Vec2::new(4.0, 0.0)),
                         ui.id().with(("column", column)),
-                        Sense::click(),
+                        if sort.is_some() {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        },
                     );
-                    response.widget_info(|| {
-                        egui::WidgetInfo::selected(egui::WidgetType::Button, true, sorted, label)
-                    });
+                    if sort.is_some() {
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                true,
+                                sorted,
+                                label,
+                            )
+                        });
+                        focus_outline(ui, &response);
+                    }
                     if response.clicked()
                         && let Some(sort) = sort
                     {
@@ -401,13 +586,56 @@ impl UniDirStatApp {
                         .interact(
                             handle,
                             ui.id().with(("column-resize", column)),
-                            Sense::drag(),
+                            Sense::click_and_drag(),
                         )
                         .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-                    if resize.dragged() {
-                        self.column_widths[column] = (widths[column] + resize.drag_delta().x)
-                            .clamp(if column == 0 { 160.0 } else { 72.0 }, 1600.0);
+                    let width_label = trf("{column} column width", &[("column", label.to_owned())]);
+                    resize.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &width_label)
+                    });
+                    focus_outline(ui, &resize);
+                    let keyboard_step = if resize.has_focus() {
+                        ui.input_mut(|input| {
+                            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                                -12.0
+                            } else if input
+                                .consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                            {
+                                12.0
+                            } else {
+                                0.0
+                            }
+                        })
+                    } else {
+                        0.0
+                    };
+                    let minimum = if column == 0 { 160.0 } else { 72.0 };
+                    if resize.dragged() || keyboard_step != 0.0 {
+                        if keyboard_step != 0.0 {
+                            ui.ctx()
+                                .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                        }
+                        self.column_widths[column] =
+                            (widths[column] + resize.drag_delta().x + keyboard_step)
+                                .clamp(minimum, 1600.0);
                     }
+                    response.union(resize).context_menu(|ui| {
+                        let mut width = widths[column];
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut width, minimum..=1600.0)
+                                    .text(&width_label)
+                                    .integer(),
+                            )
+                            .changed()
+                        {
+                            self.column_widths[column] = width;
+                        }
+                        if ui.button(tr("Reset columns")).clicked() {
+                            self.column_widths = DEFAULT_COLUMN_WIDTHS;
+                            ui.close();
+                        }
+                    });
                     ui.painter().vline(
                         rect.right(),
                         rect.y_range(),
@@ -453,14 +681,7 @@ impl UniDirStatApp {
                             ui.painter()
                                 .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                         }
-                        if response.has_focus() {
-                            ui.painter().rect_stroke(
-                                rect.shrink(1.0),
-                                3.0,
-                                Stroke::new(1.0, ui.visuals().selection.stroke.color),
-                                StrokeKind::Inside,
-                            );
-                        }
+                        focus_outline(ui, &response);
                         let name_rect =
                             egui::Rect::from_min_size(rect.min, Vec2::new(name_width, ROW_HEIGHT));
                         let painter = ui
@@ -481,8 +702,8 @@ impl UniDirStatApp {
                             }
                         }
                         let disclosure = egui::Rect::from_min_size(
-                            rect.min + Vec2::new(indent + 5.0, 7.0),
-                            Vec2::splat(20.0),
+                            rect.min + Vec2::new(indent + 3.0, (ROW_HEIGHT - 24.0) / 2.0),
+                            Vec2::splat(24.0),
                         );
                         if node.kind == EntryKind::Directory && !node.children.is_empty() {
                             let expanded = self.expanded.contains(&index);
@@ -491,6 +712,7 @@ impl UniDirStatApp {
                                 ui.id().with(("disclosure", index)),
                                 Sense::click(),
                             );
+                            focus_outline(ui, &arrow);
                             triangle(
                                 &painter,
                                 disclosure.center(),
@@ -551,7 +773,7 @@ impl UniDirStatApp {
                                         cell.right_center() - Vec2::new(12.0, 0.0),
                                         egui::Align2::RIGHT_CENTER,
                                         format_bytes(node.size(self.settings.allocated)),
-                                        FontId::proportional(BODY_SIZE),
+                                        FontId::monospace(BODY_SIZE),
                                         ui.visuals().text_color(),
                                     );
                                 }
@@ -588,7 +810,7 @@ impl UniDirStatApp {
                                         cell.right_center() - Vec2::new(8.0, 0.0),
                                         egui::Align2::RIGHT_CENTER,
                                         format!("{:.1}%", share * 100.0),
-                                        FontId::proportional(HELP_SIZE),
+                                        FontId::monospace(HELP_SIZE),
                                         muted(ui),
                                     );
                                 }
@@ -696,6 +918,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tree_panel_leaves_map_space_in_a_short_workspace() {
+        let (minimum, maximum, height) = tree_panel_heights(120.0);
+        assert!(minimum <= height && height <= maximum && maximum < 120.0);
+    }
+
+    #[test]
+    fn tree_panel_fits_three_rows_below_its_header() {
+        let (minimum, _, height) = tree_panel_heights(600.0);
+        assert!(minimum >= CONTROL_HEIGHT + ROW_HEIGHT * 3.0 && height >= minimum);
+    }
+
+    #[test]
     fn range_navigation_keeps_shift_if_released_in_the_same_frame() {
         let context = egui::Context::default();
         let mut range = false;
@@ -738,6 +972,50 @@ mod tests {
             },
         );
         assert_eq!(moved, [true, false]);
+    }
+
+    #[test]
+    fn consumed_tree_arrows_do_not_move_focus_to_a_neighbor() {
+        let context = egui::Context::default();
+        let mut consumed = 0;
+        for pressed in [false, true, true] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: pressed
+                        .then_some(egui::Event::Key {
+                            key: egui::Key::ArrowRight,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let response = ui.interact(
+                            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::splat(100.0)),
+                            ui.id().with("tree-control"),
+                            Sense::click(),
+                        );
+                        if !pressed {
+                            response.request_focus();
+                        }
+                        ui.interact(
+                            egui::Rect::from_min_size(egui::pos2(150.0, 20.0), Vec2::splat(100.0)),
+                            ui.id().with("neighbor"),
+                            Sense::click(),
+                        );
+                        if response.has_focus() && take_tree_keys(context).3 {
+                            consumed += 1;
+                        }
+                    });
+                },
+            );
+        }
+        assert_eq!(consumed, 2);
     }
 
     #[test]

@@ -1,6 +1,35 @@
 use super::workspace::{info_button, paint_label};
 use super::*;
 
+const MAP_LABEL_SIZE: f32 = 14.0;
+const MAP_LABEL_HEIGHT: f32 = MAP_LABEL_SIZE * 1.5;
+
+fn tile_shape(rect: egui::Rect, gap: f32) -> (egui::Rect, f32) {
+    let detail = ((rect.width().min(rect.height()) - 12.0) / 20.0).clamp(0.0, 1.0);
+    (rect.shrink(gap / 2.0 * detail), 3.0 * detail)
+}
+
+fn paint_map_label(ui: &egui::Ui, rect: egui::Rect, text: &str, color: Color32) {
+    if rect.width() >= MAP_LABEL_SIZE * 3.0 && rect.height() >= MAP_LABEL_HEIGHT {
+        paint_label(ui, rect, text, color, MAP_LABEL_SIZE);
+    }
+}
+
+fn paint_map_focus(ui: &egui::Ui, rect: egui::Rect) {
+    ui.painter().rect_stroke(
+        rect.shrink(1.0),
+        0.0,
+        Stroke::new(4.0, Color32::WHITE),
+        StrokeKind::Inside,
+    );
+    ui.painter().rect_stroke(
+        rect.shrink(2.0),
+        0.0,
+        Stroke::new(2.0, Color32::BLACK),
+        StrokeKind::Inside,
+    );
+}
+
 fn base_rect(rect: unidirstat::layout::Rect, data: &MapData, size: Vec2) -> egui::Rect {
     let ratio = size / Vec2::new(data.width.max(1) as f32, data.height.max(1) as f32);
     egui::Rect::from_min_size(
@@ -29,25 +58,100 @@ fn map_resolution(view: MapView, size: Vec2, detail: u32) -> (u32, u32) {
     )
 }
 
+fn sunburst_keyboard_target(
+    response: &egui::Response,
+    sectors: &[unidirstat::layout::Sector],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Option<(usize, bool)> {
+    if !response.has_focus() || sectors.is_empty() {
+        return None;
+    }
+    let cursor_id = response.id.with("sector-cursor");
+    let saved = response
+        .ctx
+        .data_mut(|data| data.get_temp::<(usize, bool)>(cursor_id));
+    let current = if response.gained_focus() {
+        selected
+    } else {
+        saved.map(|(index, _)| index).or(selected)
+    };
+    let mut position = sectors
+        .iter()
+        .position(|sector| Some(sector.node) == current)
+        .or_else(|| {
+            sectors
+                .iter()
+                .position(|sector| Some(sector.node) == selected)
+        })
+        .unwrap_or(0);
+    let (previous, next) = response.ctx.input_mut(|input| {
+        (
+            input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+        )
+    });
+    if previous || next {
+        response
+            .ctx
+            .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
+    let keyboard_click = response.clicked() && !response.clicked_by(egui::PointerButton::Primary);
+    let mut keyboard = saved.is_none_or(|(_, keyboard)| keyboard)
+        || response.gained_focus()
+        || keyboard_click
+        || previous
+        || next;
+    if previous {
+        position = position.checked_sub(1).unwrap_or(sectors.len() - 1);
+    } else if next {
+        position = (position + 1) % sectors.len();
+    } else if !keyboard_click
+        && (response.clicked_by(egui::PointerButton::Primary)
+            || response.secondary_clicked()
+            || response
+                .ctx
+                .input(|input| input.pointer.delta() != Vec2::ZERO))
+        && let Some(hovered) = hovered
+        && let Some(hovered_position) = sectors.iter().position(|sector| sector.node == hovered)
+    {
+        position = hovered_position;
+        keyboard = false;
+    }
+    let node = sectors[position].node;
+    response
+        .ctx
+        .data_mut(|data| data.insert_temp(cursor_id, (node, keyboard)));
+    Some((node, keyboard))
+}
+
 impl UniDirStatApp {
     pub(super) fn map_canvas(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>, height: f32) {
         let frame = card(ui).inner_margin(12);
         frame.show(ui, |ui| {
             let bottom = ui.cursor().top() + (height - 24.0).max(1.0);
             ui.horizontal_wrapped(|ui| {
-                ui.strong(tr("Storage map"));
-                info_button(ui, tr("Wheel zooms at the pointer; drag to pan. Double-click a folder to focus it. Cmd/Ctrl toggles selection. Use Up or Reset to return."));
+                let heading = ui.strong(tr("Storage map"));
+                let help = tr("Wheel zooms at the pointer; drag to pan. Double-click a folder to focus it. Cmd/Ctrl toggles selection. Use Up or Reset to return.");
+                if self.settings.map_view == MapView::Sunburst {
+                    info_button(ui, &format!("{help}\n{}", tr("Use arrow keys to choose a segment, then Enter or Space to select it.")));
+                } else {
+                    info_button(ui, help);
+                }
                 egui::ComboBox::from_id_salt("map_view").width(130.0).selected_text(match self.settings.map_view { MapView::Treemap => tr("Treemap"), MapView::Flame => tr("Flame graph"), MapView::Sunburst => tr("Sunburst") }).show_ui(ui, |ui| {
                     for (view, label) in [(MapView::Treemap, tr("Treemap")), (MapView::Flame, tr("Flame graph")), (MapView::Sunburst, tr("Sunburst"))] {
                         if ui.selectable_value(&mut self.settings.map_view, view, label).changed() { self.map_viewport = MapViewport::default(); self.map_focus = None; }
                     }
-                });
+                }).response.labelled_by(heading.id);
                 if ui.add_enabled(self.scope.is_some(), egui::Button::new(tr("Zoom out"))).clicked() {
                     self.scope = self.scope.and_then(|index| snapshot.nodes[index].parent);
                     self.map_viewport = MapViewport::default(); self.map_focus = None;
                 }
                 if ui.button(tr("Reset")).clicked() {
                     self.scope = None; self.map_focus = None; self.map_viewport.reset();
+                    self.map_worker.clear();
                 }
                 if ui.add_enabled(self.selection.primary().is_some(), egui::Button::new(tr("Zoom to selection"))).clicked() {
                     self.map_focus = self.selection.primary().and_then(|index| if snapshot.nodes[index].kind == EntryKind::Directory { Some(index) } else { snapshot.nodes[index].parent });
@@ -55,7 +159,11 @@ impl UniDirStatApp {
                 ui.label(format!("{:.0}%", self.map_viewport.scale * 100.0));
             });
             ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).truncate());
-            let (bounds, canvas) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), (bottom - ui.cursor().top()).max(1.0)), Sense::click_and_drag());
+            if let Some(error) = self.map_worker.error() {
+                ui.colored_label(ui.visuals().error_fg_color, trf("Error: {details}", &[("details", error.into())]));
+                ui.label(tr("Reset the map to try again."));
+            }
+            let (bounds, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), (bottom - ui.cursor().top()).max(1.0)), Sense::click_and_drag().difference(Sense::focusable_noninteractive()));
             let input = ui.input(|input| (input.pointer.hover_pos(), input.smooth_scroll_delta.y, input.zoom_delta(), input.pointer.delta(), input.pointer.primary_down() || input.pointer.middle_down(), input.pointer.press_origin(), input.pointer.is_decidedly_dragging(), input.stable_dt));
             if let Some(pointer) = input.0.filter(|pointer| bounds.contains(*pointer)) {
                 let factor = ((input.1 * 0.003).exp() * input.2).clamp(0.5, 2.0);
@@ -88,38 +196,44 @@ impl UniDirStatApp {
             if let Some(data) = data.as_ref() {
                 if self.settings.map_view == MapView::Sunburst { self.sunburst_canvas(ui, snapshot, bounds, data); }
                 else {
+                    let mut focused = None;
                     for tile in &data.frames {
                         let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
                         if !bounds.intersects(rect) { continue; }
                         painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
                         painter.rect_stroke(rect, 2.0, Stroke::new(0.6, muted(ui).gamma_multiply(0.5)), StrokeKind::Inside);
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("directory-region", tile.node)), Sense::click());
-                        self.map_item(ui, response, tile.node, snapshot, base_rect(tile.rect, data, bounds.size()), bounds.size());
+                        focused = self.map_item(ui, response, tile.node, snapshot, base_rect(tile.rect, data, bounds.size()), bounds.size()).or(focused);
                     }
                     for tile in &data.aggregates {
-                        let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
+                        let base = base_rect(tile.rect, data, bounds.size());
+                        let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) { continue; }
-                        painter.rect_filled(rect, 1.0, muted(ui).gamma_multiply(0.4));
-                        if rect.height() >= 18.0 { paint_label(ui, rect.intersect(bounds).shrink(3.0), tr("Small files"), ui.visuals().text_color(), HELP_SIZE); }
+                        painter.rect_filled(rect, 0.0, ui.visuals().widgets.inactive.bg_fill);
+                        if self.settings.labels { paint_map_label(ui, rect.intersect(bounds).shrink(3.0), tr("Small files"), ui.visuals().text_color()); }
+                        let response = ui.interact(rect.intersect(bounds), ui.id().with(("aggregate", tile.node, tile.rect.x.to_bits(), tile.rect.y.to_bits())), Sense::click());
+                        focused = self.map_item(ui, response.clone(), tile.node, snapshot, base, bounds.size()).or(focused);
+                        let description = || trf("Smaller contents of {path}", &[("path", snapshot.nodes[tile.node].path.display().to_string())]);
+                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, response.enabled(), self.selection.contains(tile.node), description()));
+                        response.on_hover_ui(|ui| { ui.label(description()); });
                     }
                     for tile in &data.tiles {
                         let base = base_rect(tile.rect, data, bounds.size());
                         let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) || rect.width() < 0.5 || rect.height() < 0.5 { continue; }
                         let node = &snapshot.nodes[tile.node];
-                        let gap = (self.settings.tile_gap / 2.0).min(rect.width() / 5.0).min(rect.height() / 5.0);
-                        let tile_rect = rect.shrink(gap);
+                        let (tile_rect, radius) = tile_shape(rect, self.settings.tile_gap);
                         let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
                         let color = extension_color(&node.extension());
                         let fill = Color32::from_rgb(color.r(), color.g(), color.b());
-                        painter.rect_filled(tile_rect, 3.0, fill);
-                        if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), 3.0, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside); }
-                        if self.settings.labels && tile_rect.height() >= 17.0 && tile_rect.width() >= 12.0 {
+                        painter.rect_filled(tile_rect, radius, fill);
+                        if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside); }
+                        if self.settings.labels && tile_rect.height() >= MAP_LABEL_HEIGHT + 2.0 && tile_rect.width() >= MAP_LABEL_SIZE * 3.0 + 8.0 {
                             let label = tile_rect.intersect(bounds).shrink2(Vec2::new(4.0, 1.0));
-                            paint_label(ui, egui::Rect::from_min_size(label.min, Vec2::new(label.width(), 18.0)), &node.name(), tile_text_color(fill), HELP_SIZE);
-                            if label.height() >= 37.0 { paint_label(ui, label.translate(Vec2::new(0.0, 19.0)).with_max_y(label.bottom()), &format_bytes(node.size(self.settings.allocated)), tile_text_color(fill), HELP_SIZE); }
+                            paint_map_label(ui, egui::Rect::from_min_size(label.min, Vec2::new(label.width(), MAP_LABEL_HEIGHT)), &node.name(), tile_text_color(fill));
+                            if label.height() >= MAP_LABEL_HEIGHT * 2.0 + 1.0 { paint_map_label(ui, label.translate(Vec2::new(0.0, MAP_LABEL_HEIGHT + 1.0)).with_max_y(label.bottom()), &format_bytes(node.size(self.settings.allocated)), tile_text_color(fill)); }
                         }
-                        self.map_item(ui, response, tile.node, snapshot, base, bounds.size());
+                        focused = self.map_item(ui, response, tile.node, snapshot, base, bounds.size()).or(focused);
                     }
                     for index in self.selection.indices() {
                         if let Some(tile) = data.frame(index) {
@@ -127,6 +241,7 @@ impl UniDirStatApp {
                             painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
                         }
                     }
+                    if let Some(rect) = focused { paint_map_focus(ui, rect); }
                 }
             }
             if self.map_worker.pending() {
@@ -135,7 +250,6 @@ impl UniDirStatApp {
                 painter.text(bounds.left_top() + Vec2::splat(8.0), egui::Align2::LEFT_TOP, trf("Preparing map: {done} / {total}", &[("done", done.to_string()), ("total", total.to_string())]), FontId::proportional(HELP_SIZE), ui.visuals().text_color());
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
-            if let Some(error) = self.map_worker.error() { canvas.on_hover_text(trf("Error: {details}", &[("details", error.into())])); }
             if !moving && data.is_some() && let Some(index) = self.map_focus.take() {
                 self.scope = Some(index); self.map_viewport = MapViewport::default(); ui.ctx().request_repaint();
             }
@@ -150,7 +264,7 @@ impl UniDirStatApp {
         snapshot: &Snapshot,
         base: egui::Rect,
         size: Vec2,
-    ) {
+    ) -> Option<egui::Rect> {
         self.item_response(response.clone(), index, snapshot, SelectionView::Single);
         if response.double_clicked() {
             self.map_viewport.zoom_to(base, size);
@@ -159,12 +273,14 @@ impl UniDirStatApp {
             }
             ui.ctx().request_repaint();
         }
+        let focused = response.has_focus().then_some(response.rect);
         response.on_hover_ui(|ui| {
             ui.label(snapshot.nodes[index].path.display().to_string());
             ui.label(format_bytes(
                 snapshot.nodes[index].size(self.settings.allocated),
             ));
         });
+        focused
     }
 
     fn sunburst_canvas(
@@ -226,16 +342,15 @@ impl UniDirStatApp {
                 bounds.min + self.map_viewport.offset + point.to_vec2() * self.map_viewport.scale;
             if self.settings.labels
                 && span * inner * self.map_viewport.scale > 50.0
-                && band * self.map_viewport.scale > 19.0
+                && band * self.map_viewport.scale >= MAP_LABEL_HEIGHT
             {
                 let width = (span * inner * self.map_viewport.scale * 0.7).min(140.0);
-                paint_label(
+                paint_map_label(
                     ui,
-                    egui::Rect::from_center_size(label_center, Vec2::new(width, 18.0))
+                    egui::Rect::from_center_size(label_center, Vec2::new(width, MAP_LABEL_HEIGHT))
                         .intersect(bounds),
                     &snapshot.nodes[sector.node].name(),
                     tile_text_color(fill),
-                    HELP_SIZE,
                 );
             }
             if selected_region(&self.selection, snapshot, sector.node) {
@@ -260,15 +375,57 @@ impl UniDirStatApp {
                 }
             }
         }
-        let response = ui.interact(bounds, ui.id().with("sunburst-hit"), Sense::click());
+        let sense = if data.sectors.is_empty() {
+            Sense::hover()
+        } else {
+            Sense::click()
+        };
+        let response = ui.interact(bounds, ui.id().with("sunburst-hit"), sense);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                response.enabled(),
+                tr("Storage map"),
+            )
+        });
+        let keyboard = sunburst_keyboard_target(
+            &response,
+            &data.sectors,
+            self.selection.primary(),
+            hovered.map(|(index, _)| index),
+        );
+        let keyboard_target = keyboard.and_then(|(index, _)| {
+            data.sectors
+                .iter()
+                .find(|sector| sector.node == index)
+                .map(|sector| {
+                    let middle = (sector.start + sector.end) / 2.0 - std::f32::consts::FRAC_PI_2;
+                    (
+                        index,
+                        center + Vec2::angled(middle) * (band * (sector.depth as f32 + 1.5) - 0.5),
+                    )
+                })
+        });
+        if let Some((_, point)) =
+            keyboard_target.filter(|_| keyboard.is_some_and(|(_, active)| active))
+        {
+            let point =
+                bounds.min + self.map_viewport.offset + point.to_vec2() * self.map_viewport.scale;
+            painter.circle_stroke(point, 6.0, Stroke::new(4.0, Color32::WHITE));
+            painter.circle_stroke(point, 6.0, Stroke::new(2.0, Color32::BLACK));
+        }
         let target = if response.context_menu_opened() {
             self.selection.primary().map(|index| (index, center))
+        } else if keyboard.is_some_and(|(_, active)| active) {
+            keyboard_target
         } else {
-            hovered
+            hovered.or(keyboard_target)
         };
         if let Some((index, point)) = target {
             let focus = egui::Rect::from_center_size(point, size / 2.0);
-            self.map_item(ui, response, index, snapshot, focus, size);
+            if let Some(rect) = self.map_item(ui, response, index, snapshot, focus, size) {
+                paint_map_focus(ui, rect);
+            }
         }
     }
 }
@@ -276,6 +433,181 @@ impl UniDirStatApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sunburst_keyboard_roves_visible_sectors_and_activates_the_focused_name() {
+        let context = egui::Context::default();
+        let sectors: Vec<_> = [3, 7, 9]
+            .into_iter()
+            .map(|node| unidirstat::layout::Sector {
+                node,
+                start: 0.0,
+                end: 1.0,
+                depth: 0,
+            })
+            .collect();
+        let mut target = None;
+        let mut activated = None;
+        for (key, expected) in [
+            (None, 7),
+            (Some(egui::Key::ArrowRight), 9),
+            (Some(egui::Key::ArrowRight), 3),
+            (Some(egui::Key::ArrowLeft), 9),
+            (Some(egui::Key::ArrowUp), 7),
+            (Some(egui::Key::ArrowDown), 9),
+            (Some(egui::Key::Enter), 9),
+            (Some(egui::Key::Space), 9),
+        ] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: key
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let response = ui.interact(
+                            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::splat(100.0)),
+                            ui.id().with("sunburst"),
+                            Sense::click(),
+                        );
+                        if key.is_none() {
+                            response.request_focus();
+                        }
+                        ui.interact(
+                            egui::Rect::from_min_size(egui::pos2(150.0, 20.0), Vec2::splat(100.0)),
+                            ui.id().with("neighbor"),
+                            Sense::click(),
+                        );
+                        target = sunburst_keyboard_target(&response, &sectors, Some(7), None)
+                            .map(|(index, _)| index);
+                        if response.clicked() {
+                            activated = target;
+                        }
+                    });
+                },
+            );
+            assert_eq!(target, Some(expected));
+        }
+        assert_eq!(activated, Some(9));
+    }
+
+    #[test]
+    fn sunburst_keyboard_falls_back_to_the_first_visible_sector() {
+        let context = egui::Context::default();
+        let sectors = [unidirstat::layout::Sector {
+            node: 4,
+            start: 0.0,
+            end: 1.0,
+            depth: 0,
+        }];
+        let mut target = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let response = ui.interact(
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::splat(100.0)),
+                    ui.id().with("sunburst"),
+                    Sense::click(),
+                );
+                response.request_focus();
+                target = sunburst_keyboard_target(&response, &sectors, Some(99), None)
+                    .map(|(index, _)| index);
+            });
+        });
+        assert_eq!(target, Some(4));
+    }
+
+    #[test]
+    fn small_map_tiles_keep_their_area_instead_of_becoming_gapped_dots() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(8.0, 6.0));
+        let (painted, radius) = tile_shape(rect, 6.0);
+
+        assert_eq!(painted, rect);
+        assert_eq!(radius, 0.0);
+        let (large, radius) = tile_shape(
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(80.0, 60.0)),
+            4.0,
+        );
+        assert_eq!(large.min, egui::pos2(12.0, 22.0));
+        assert_eq!(large.size(), Vec2::new(76.0, 56.0));
+        assert_eq!(radius, 3.0);
+    }
+
+    #[test]
+    fn map_labels_skip_boxes_that_only_fit_an_ellipsis() {
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_map_label(
+                    ui,
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(14.0, 22.0)),
+                    "Very long file name.txt",
+                    Color32::BLACK,
+                );
+            });
+        });
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .all(|shape| { !matches!(shape.shape, egui::Shape::Text(_)) })
+        );
+    }
+
+    #[test]
+    fn map_labels_keep_readable_text_size_when_the_name_is_truncated() {
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_map_label(
+                    ui,
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(90.0, 24.0)),
+                    "Very long file name.txt",
+                    Color32::BLACK,
+                );
+            });
+        });
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(labels.len(), 1);
+        assert!(
+            labels[0]
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|section| section.format.font_id.size >= 14.0)
+        );
+        assert!(
+            labels[0]
+                .galley
+                .rows
+                .iter()
+                .flat_map(|row| &row.glyphs)
+                .filter(|glyph| glyph.chr != '…')
+                .count()
+                >= 2
+        );
+    }
 
     #[test]
     fn flame_refinement_never_changes_vertical_geometry() {

@@ -1,6 +1,6 @@
 # Contributing translations
 
-UniDirStat bundles UTF-8 JSON catalogs in `locales/en.json` and `locales/ru.json`. English text is the stable lookup key; each catalog must contain the same keys. Translations are compiled into the executable and never downloaded. On first launch the GUI checks preferred system locales in order, selecting the first supported base language (`ru-KZ` → Russian, `en-GB` → English), with English as the fallback. The persisted choice takes priority. Language and theme controls are visible in the left sidebar above Settings.
+UniDirStat bundles UTF-8 JSON catalogs in `locales/en.json` and `locales/ru.json`. English text is the stable lookup key; each catalog must contain the same keys. Translations are compiled into the executable and never downloaded. On first launch the GUI checks preferred system locales in order, selecting the first supported base language (`ru-KZ` → Russian, `en-GB` → English), with English as the fallback. The persisted choice takes priority. Language and theme controls are visible in the sidebar above Settings or in the compact top navigation.
 
 Use `crate::i18n::tr("A static caption")` for GUI text. Add the caption to both catalogs. For a sentence containing values, use named placeholders:
 

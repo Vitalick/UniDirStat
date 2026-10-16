@@ -29,6 +29,7 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 [Files]
 Source: "{#BinaryPath}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ProjectRoot}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "{#ProjectRoot}\assets\fonts\Ubuntu-LICENSE.txt"; DestDir: "{app}"; DestName: "Ubuntu-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\UniDirStat"; Filename: "{app}\unidirstat.exe"

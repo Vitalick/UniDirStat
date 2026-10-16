@@ -30,6 +30,7 @@ cp "$binary" "$bundle/Contents/MacOS/unidirstat"
 cp packaging/macos/Info.plist "$bundle/Contents/Info.plist"
 cp assets/unidirstat.icns "$bundle/Contents/Resources/unidirstat.icns"
 cp LICENSE "$bundle/Contents/Resources/LICENSE.txt"
+cp assets/fonts/Ubuntu-LICENSE.txt "$bundle/Contents/Resources/Ubuntu-LICENSE.txt"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $numeric_version" "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $numeric_version" "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist"
@@ -57,6 +58,7 @@ test "$(readlink "$staging/mount/Applications")" = /Applications
 cmp assets/unidirstat.icns "$staging/mount/.VolumeIcon.icns"
 cmp assets/unidirstat.icns "$staging/mount/UniDirStat.app/Contents/Resources/unidirstat.icns"
 cmp LICENSE "$staging/mount/UniDirStat.app/Contents/Resources/LICENSE.txt"
+cmp assets/fonts/Ubuntu-LICENSE.txt "$staging/mount/UniDirStat.app/Contents/Resources/Ubuntu-LICENSE.txt"
 codesign --verify --deep --strict "$staging/mount/UniDirStat.app"
 "$staging/mount/UniDirStat.app/Contents/MacOS/unidirstat" --help >/dev/null
 hdiutil detach "$staging/mount" >/dev/null
