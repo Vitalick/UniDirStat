@@ -2,7 +2,7 @@
 name = "unidirstat"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "A modern cross-platform disk usage analyzer"
 license = "GPL-3.0-or-later"
 exclude = ["docs/private/**", ".agents/**", ".codex/**", "skills-lock.json"]

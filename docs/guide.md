@@ -15,7 +15,7 @@
 
 ## Build and run
 
-Requires **Rust 1.88 or newer**.
+Requires **Rust 1.96 or newer**. CI uses Rust 1.96.0.
 
 ```sh
 cargo run --release --locked
