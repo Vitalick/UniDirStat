@@ -38,6 +38,12 @@ struct CsvNode {
     scan_metadata: Option<String>,
     #[serde(default)]
     scan_duration_ns: u64,
+    #[serde(default)]
+    depth_limited: bool,
+    #[serde(default)]
+    scan_failed: bool,
+    #[serde(default)]
+    scan_warning: bool,
 }
 
 fn read_snapshot_bytes(path: &Path) -> Result<Vec<u8>, String> {
@@ -154,6 +160,9 @@ pub fn load_csv(path: &Path) -> Result<Snapshot, String> {
             owner: row.unix_owner,
             file_id: row.file_identity,
             error: row.error,
+            scan_failed: row.scan_failed,
+            scan_warning: row.scan_warning,
+            depth_limited: row.depth_limited,
             scan_duration_ns: row.scan_duration_ns,
         });
     }
@@ -217,6 +226,9 @@ pub fn export_csv(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                     error: None,
                     file_identity: None,
                     scan_metadata: Some(metadata.clone()),
+                    scan_failed: false,
+                    scan_warning: false,
+                    depth_limited: false,
                     scan_duration_ns: 0,
                 })
                 .map_err(|error| error.to_string())?;
@@ -247,6 +259,9 @@ pub fn export_csv(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                     error: node.error.clone(),
                     file_identity: node.file_id.clone(),
                     scan_metadata: (index == 0).then(|| metadata.clone()),
+                    scan_failed: node.scan_failed,
+                    scan_warning: node.scan_warning,
+                    depth_limited: node.depth_limited,
                     scan_duration_ns: node.scan_duration_ns,
                 })
                 .map_err(|error| error.to_string())?;
@@ -421,6 +436,7 @@ mod tests {
         .unwrap();
         snapshot.nodes[0].scan_duration_ns = 1_250_000_000;
         snapshot.nodes[1].scan_duration_ns = 250_000;
+        snapshot.nodes[0].scan_warning = true;
         for extension in ["json", "csv"] {
             let output = fixture.path().join(format!("scan.{extension}"));
             if extension == "csv" {
@@ -431,7 +447,41 @@ mod tests {
             let restored = load_snapshot(&output).unwrap();
             assert_eq!(restored.nodes[0].scan_duration_ns, 1_250_000_000);
             assert_eq!(restored.nodes[1].scan_duration_ns, 250_000);
+            assert!(restored.nodes[0].scan_warning);
         }
+    }
+
+    #[test]
+    fn depth_cutoffs_roundtrip_and_old_snapshots_default_to_unlimited() {
+        let fixture = tempfile::tempdir().unwrap();
+        let snapshot = scan(
+            &[fixture.path().into()],
+            &ScanOptions {
+                max_depth: Some(0),
+                ..ScanOptions::default()
+            },
+            &ScanControl::default(),
+        )
+        .unwrap();
+        for extension in ["json", "csv"] {
+            let output = fixture.path().join(format!("limited.{extension}"));
+            if extension == "csv" {
+                export_csv(&output, &snapshot).unwrap();
+            } else {
+                save_snapshot(&output, &snapshot).unwrap();
+            }
+            assert!(load_snapshot(&output).unwrap().nodes[0].depth_limited);
+        }
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        for key in ["depth_limited", "scan_failed", "scan_warning"] {
+            legacy["nodes"][0].as_object_mut().unwrap().remove(key);
+        }
+        let restored: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(
+            !restored.nodes[0].depth_limited
+                && !restored.nodes[0].scan_warning
+                && !restored.nodes[0].scan_failed
+        );
     }
 
     #[test]

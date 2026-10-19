@@ -42,16 +42,17 @@ impl FileColors {
             indices: ranked
                 .into_iter()
                 .enumerate()
-                .map(|(rank, stats)| (stats.extension.clone(), rank.min(FILE_PALETTE.len() - 1)))
+                .map(|(rank, stats)| (stats.extension.clone(), rank % (FILE_PALETTE.len() - 1)))
                 .collect(),
         }
     }
 
     pub(crate) fn index(&self, extension: &str) -> usize {
-        self.indices
-            .get(extension)
-            .copied()
-            .unwrap_or(FILE_PALETTE.len() - 1)
+        self.indices.get(extension).copied().unwrap_or_else(|| {
+            extension.bytes().fold(0_usize, |hash, byte| {
+                hash.wrapping_mul(31).wrapping_add(usize::from(byte))
+            }) % (FILE_PALETTE.len() - 1)
+        })
     }
 
     pub(crate) fn color(&self, extension: &str) -> Color32 {
@@ -89,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_ranks_after_seventeen_share_gray_instead_of_cycling() {
+    fn extension_ranks_after_seventeen_reuse_the_colored_palette() {
         let extensions: Vec<_> = (0..40)
             .map(|rank| ExtensionStats {
                 extension: format!("type{rank:02}"),
@@ -99,13 +100,21 @@ mod tests {
             .collect();
         let colors = FileColors::from_extensions(&extensions);
         assert_eq!(colors.index("type16"), 16);
-        assert_eq!(colors.index("type17"), 17);
-        assert_eq!(colors.index("type18"), 17);
-        assert_eq!(colors.index("type39"), 17);
-        assert_eq!(
-            colors.color("not-in-this-scan"),
-            Color32::from_rgb(153, 153, 153)
-        );
+        assert_eq!(colors.index("type17"), 0);
+        assert_eq!(colors.index("type18"), 1);
+        assert_eq!(colors.index("type39"), 5);
+        assert!(extensions.iter().all(|stats| {
+            let color = colors.color(&stats.extension);
+            color.r() != color.g() || color.g() != color.b()
+        }));
+    }
+
+    #[test]
+    fn missing_extension_statistics_keep_distinct_stable_colors() {
+        let colors = FileColors::default();
+        assert_eq!(colors.index("a"), 12);
+        assert_eq!(colors.index("b"), 13);
+        assert_eq!(colors.color("a"), FileColors::default().color("a"));
     }
 
     #[test]

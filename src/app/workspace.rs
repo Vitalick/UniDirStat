@@ -573,6 +573,15 @@ impl UniDirStatApp {
     }
 
     pub(super) fn file_table(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        if self.job_kind == Some(JobKind::Scan) {
+            self.live_files(ui);
+            return;
+        }
+        self.file_table_contents(ui, Some(snapshot));
+    }
+
+    pub(super) fn file_table_contents(&mut self, ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
+        ui.scope_builder(egui::UiBuilder::new().id("file-browser-table"), |ui| {
         let visible = [
             true,
             true,
@@ -694,7 +703,8 @@ impl UniDirStatApp {
                             self.sort_by = sort;
                             self.descending = sort != SortBy::Name;
                         }
-                        self.rebuild = true;
+                        if snapshot.is_some() { self.rebuild = true; }
+                        else { self.live_expansion_changed(); }
                     }
                     let handle = egui::Rect::from_center_size(
                         rect.right_center(),
@@ -776,9 +786,25 @@ impl UniDirStatApp {
                     }
                 }
                 scroll.show_rows(ui, ROW_HEIGHT, self.rows.len(), |ui, range| {
-                    for row in range {
-                        let (index, depth) = self.rows[row];
-                        let node = &snapshot.nodes[index];
+                    let allocated = self.settings.allocated;
+                    let rows = if let Some(snapshot) = snapshot {
+                        range.clone().map(|row| {
+                            let (index, depth) = self.rows[row];
+                            live_scan::FileRow::new(snapshot, index, depth, allocated, None)
+                        }).collect::<Vec<_>>()
+                    } else {
+                        self.control.with_live_view(|view| {
+                            range.clone().filter_map(|row| {
+                                let &(index, depth) = self.rows.get(row)?;
+                                view.snapshot.nodes.get(index)?;
+                                Some(live_scan::FileRow::new(view.snapshot, index, depth, allocated, Some(&view)))
+                            }).collect::<Vec<_>>()
+                        }).unwrap_or_else(|| std::mem::take(&mut self.live_tree.visible))
+                    };
+                    for (position, node) in rows.iter().enumerate() {
+                        let index = node.index;
+                        let depth = node.depth;
+                        let row = range.start + position;
                         let row_id = ui.id().with(("tree-row", index));
                         let (rect, _) = ui.allocate_exact_size(
                             Vec2::new(table_width, ROW_HEIGHT),
@@ -823,7 +849,7 @@ impl UniDirStatApp {
                             rect.min + Vec2::new(indent + 3.0, (ROW_HEIGHT - 24.0) / 2.0),
                             Vec2::splat(24.0),
                         );
-                        if node.kind == EntryKind::Directory && !node.children.is_empty() {
+                        if node.directory && node.expandable {
                             let expanded = self.expanded.contains(&index);
                             let arrow = ui.interact(
                                 disclosure,
@@ -852,18 +878,27 @@ impl UniDirStatApp {
                                 if !self.expanded.remove(&index) {
                                     self.expanded.insert(index);
                                 }
-                                self.rebuild = true;
+                                if snapshot.is_some() { self.rebuild = true; }
+                                else { self.live_expansion_changed(); }
                             }
                         }
+                        let status_rect = egui::Rect::from_min_size(disclosure.right_top() + Vec2::new(2.0, 3.0), Vec2::splat(18.0));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(status_rect), |ui| {
+                            if node.limited {
+                                live_scan::paint_scan_status(ui, unidirstat::scanner::DirectoryScanStatus::Cancelled, false, true);
+                            } else {
+                                live_scan::paint_scan_status(ui, node.status, snapshot.is_none() && self.control.is_paused(), self.settings.reduced_motion);
+                            }
+                        });
                         let icon = egui::Rect::from_min_size(
-                            disclosure.right_top() + Vec2::new(3.0, 2.0),
+                            disclosure.right_top() + Vec2::new(23.0, 2.0),
                             Vec2::splat(16.0),
                         );
                         file_icon(
                             &painter,
                             icon,
-                            node.kind == EntryKind::Directory,
-                            self.file_colors.color(&node.extension()),
+                            node.directory,
+                            self.file_colors.color(&node.extension),
                         );
                         let label_rect = egui::Rect::from_min_max(
                             egui::pos2(icon.right() + 7.0, rect.top()),
@@ -871,11 +906,11 @@ impl UniDirStatApp {
                         );
                         let label = if self.page == Page::Largest || has_filters(&self.search_query)
                         {
-                            display_path(&node.path)
+                            &node.path
                         } else {
-                            node.name()
+                            &node.name
                         };
-                        paint_label(ui, label_rect, &label, ui.visuals().text_color(), BODY_SIZE);
+                        paint_label(ui, label_rect, label, ui.visuals().text_color(), BODY_SIZE);
                         let mut left = rect.left() + name_width;
                         for column in 1..widths.len() {
                             if !visible[column] {
@@ -890,7 +925,7 @@ impl UniDirStatApp {
                                     ui.painter().text(
                                         cell.right_center() - Vec2::new(12.0, 0.0),
                                         egui::Align2::RIGHT_CENTER,
-                                        format_bytes(node.size(self.settings.allocated)),
+                                        format_bytes(node.size),
                                         FontId::monospace(BODY_SIZE),
                                         ui.visuals().text_color(),
                                     );
@@ -905,8 +940,7 @@ impl UniDirStatApp {
                                     );
                                 }
                                 3 => {
-                                    let share =
-                                        parent_share(snapshot, index, self.settings.allocated);
+                                    let share = node.share;
                                     let bar = egui::Rect::from_min_max(
                                         cell.left_center() + Vec2::new(8.0, -3.0),
                                         cell.right_center() - Vec2::new(62.0, -3.0),
@@ -933,10 +967,7 @@ impl UniDirStatApp {
                                     );
                                 }
                                 _ => {
-                                    let duration = live_scan::duration_label(
-                                        (node.scan_duration_ns > 0)
-                                            .then(|| Duration::from_nanos(node.scan_duration_ns)),
-                                    );
+                                    let duration = live_scan::duration_label(node.duration);
                                     ui.put(
                                         cell.shrink2(Vec2::new(8.0, 0.0)),
                                         egui::Label::new(
@@ -954,48 +985,38 @@ impl UniDirStatApp {
                             }
                             left += widths[column];
                         }
-                        self.tree_key(&response, index, snapshot, ui.id());
-                        self.item_response(response.clone(), index, snapshot, SelectionView::Files);
+                        self.tree_key(&response, node, snapshot.is_none(), ui.id());
+                        if let Some(snapshot) = snapshot {
+                            self.item_response(response.clone(), index, snapshot, SelectionView::Files);
+                        } else if response.clicked() {
+                            response.request_focus();
+                            let modifiers = ui.input(|input| input.modifiers);
+                            self.selection.click(index, &self.rows, modifiers.command || modifiers.ctrl, modifiers.shift);
+                            self.selected = self.selection.primary();
+                        }
                         response.on_hover_ui(|ui| {
-                            ui.label(display_path(&node.path));
-                            ui.label(trf(
-                                "{parent}% of parent | {total}% of scan",
-                                &[
-                                    (
-                                        "parent",
-                                        format!(
-                                            "{:.1}",
-                                            parent_share(snapshot, index, self.settings.allocated)
-                                                * 100.0
-                                        ),
-                                    ),
-                                    (
-                                        "total",
-                                        format!(
-                                            "{:.1}",
-                                            node.size(self.settings.allocated) as f64
-                                                / snapshot
-                                                    .total_size(self.settings.allocated)
-                                                    .max(1)
-                                                    as f64
-                                                * 100.0
-                                        ),
-                                    ),
-                                ],
-                            ));
+                            ui.label(&node.path);
+                            if node.limited { ui.label(tr("Depth limit reached. Contents were not scanned; sizes are incomplete.")); }
+                            ui.label(trf("{parent}% of parent | {total}% of scan", &[
+                                ("parent", format!("{:.1}", node.share * 100.0)),
+                                ("total", format!("{:.1}", node.total_share * 100.0)),
+                            ]));
                         });
                     }
+                    if snapshot.is_none() { self.live_tree.visible = rows; }
                 });
             });
+        });
     }
 
     fn tree_key(
         &mut self,
         response: &egui::Response,
-        index: usize,
-        snapshot: &Snapshot,
+        node: &live_scan::FileRow,
+        live: bool,
         parent_id: egui::Id,
     ) {
+        let index = node.index;
         if response.clicked() {
             response.request_focus();
         }
@@ -1006,7 +1027,6 @@ impl UniDirStatApp {
         if !(input.0 || input.1 || input.2 || input.3 || input.4 || input.5) {
             return;
         }
-        let node = &snapshot.nodes[index];
         let position = self
             .rows
             .iter()
@@ -1022,18 +1042,29 @@ impl UniDirStatApp {
             self.rows.last().map(|row| row.0)
         } else if input.2 {
             if self.expanded.remove(&index) {
-                self.rebuild = true;
+                if live {
+                    self.live_expansion_changed();
+                } else {
+                    self.rebuild = true;
+                }
                 None
             } else {
                 node.parent
             }
         } else if input.3 {
-            if node.kind == EntryKind::Directory && !self.expanded.contains(&index) {
+            if node.directory && !self.expanded.contains(&index) {
                 self.expanded.insert(index);
-                self.rebuild = true;
+                if live {
+                    self.live_expansion_changed();
+                } else {
+                    self.rebuild = true;
+                }
                 None
             } else {
-                node.children.first().copied()
+                self.rows
+                    .get(position + 1)
+                    .filter(|row| row.1 == node.depth + 1)
+                    .map(|row| row.0)
             }
         } else {
             None
@@ -1110,6 +1141,59 @@ mod tests {
         assert!(app.map_worker.summary().is_some());
         context.set_zoom_factor(1.0);
         (fixture, app, snapshot)
+    }
+
+    #[test]
+    fn scanning_table_never_interprets_new_rows_against_an_old_snapshot() {
+        let context = egui::Context::default();
+        let (fixture, mut app, old_snapshot) = summary_fixture(&context);
+        for index in 0..20 {
+            std::fs::write(fixture.path().join(format!("new-{index}")), b"new").unwrap();
+        }
+        app.control.enable_live_view();
+        let new_snapshot = Arc::new(
+            scanner::scan(
+                &[fixture.path().into()],
+                &ScanOptions::default(),
+                &app.control,
+            )
+            .unwrap(),
+        );
+        app.rows = vec![(new_snapshot.nodes.len() - 1, 1)];
+        app.control.set_completed_live_snapshot(new_snapshot);
+        app.job_kind = Some(JobKind::Scan);
+        let _ = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.file_table(ui, &old_snapshot));
+        });
+    }
+
+    #[test]
+    fn live_tree_uses_the_completed_table_columns() {
+        let context = egui::Context::default();
+        let (fixture, mut app, _) = summary_fixture(&context);
+        app.control.enable_live_view();
+        let snapshot = scanner::scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &app.control,
+        )
+        .unwrap();
+        app.control.set_completed_live_snapshot(Arc::new(snapshot));
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1400.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.live_files(ui));
+            },
+        );
+        for label in ["Name", "Size", "Modified", "Share", "Scan time"] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == tr(label))), "missing {label}");
+        }
     }
 
     #[test]

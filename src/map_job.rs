@@ -29,6 +29,7 @@ pub struct MapKey {
     pub width: u32,
     pub height: u32,
     pub kind: MapKind,
+    pub depth_limit: usize,
 }
 
 #[derive(Default)]
@@ -260,7 +261,10 @@ impl MapWorker {
         }
         self.requested = Some(key);
         if !self.ready_key.is_some_and(|ready| {
-            ready.scope == key.scope && ready.allocated == key.allocated && ready.kind == key.kind
+            ready.scope == key.scope
+                && ready.allocated == key.allocated
+                && ready.kind == key.kind
+                && ready.depth_limit == key.depth_limit
         }) {
             self.ready = None;
             self.ready_key = None;
@@ -665,12 +669,13 @@ fn compute(
     };
     match key.kind {
         MapKind::Treemap => {
-            let geometry = layout::treemap_hierarchy_with_colors(
+            let geometry = layout::treemap_hierarchy_with_depth(
                 snapshot,
                 roots,
                 key.allocated,
                 bounds,
                 control,
+                key.depth_limit,
                 |extension| colors.index(extension),
             )?;
             data.tiles = geometry.tiles;
@@ -693,11 +698,24 @@ fn compute(
             }
         }
         MapKind::Flame => {
-            data.tiles = layout::flame_visible(snapshot, roots, key.allocated, bounds, control)?;
+            data.tiles = layout::flame_visible_with_depth(
+                snapshot,
+                roots,
+                key.allocated,
+                bounds,
+                control,
+                key.depth_limit,
+            )?;
         }
         MapKind::Sunburst => {
-            data.sectors =
-                layout::sunburst_visible(snapshot, roots, key.allocated, bounds, control)?;
+            data.sectors = layout::sunburst_visible_with_depth(
+                snapshot,
+                roots,
+                key.allocated,
+                bounds,
+                control,
+                key.depth_limit,
+            )?;
         }
     }
     Some(data)
@@ -988,6 +1006,152 @@ mod tests {
     }
 
     #[test]
+    fn lower_ranked_extensions_keep_color_in_a_scoped_gapless_map() {
+        let mut snapshot = snapshot();
+        let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
+        nodes[1].path = PathBuf::from("root/a.type17");
+        nodes[2].path = PathBuf::from("root/b.type18");
+        let colors = FileColors::from_extensions(
+            &(0..19)
+                .map(|rank| ExtensionStats {
+                    extension: format!("type{rank:02}"),
+                    bytes: 100 - rank,
+                    files: 1,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let data = compute(&snapshot, key(), &LayoutControl::default(), &colors).unwrap();
+        let image = render_raster(
+            &data,
+            &snapshot,
+            &colors,
+            RasterView {
+                size: egui::vec2(100.0, 50.0),
+                scale: 1.0,
+                offset: egui::Vec2::ZERO,
+                pixels_per_point: 1.0,
+                max_texture_side: 2048,
+            },
+            &LayoutControl::default(),
+        )
+        .unwrap()
+        .image;
+        assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+        assert!(
+            image
+                .pixels
+                .contains(&egui::Color32::from_rgb(101, 101, 255))
+        );
+        assert!(
+            image
+                .pixels
+                .contains(&egui::Color32::from_rgb(255, 101, 101))
+        );
+    }
+
+    #[test]
+    fn treemap_depth_limit_keeps_a_colored_folder_region_and_can_reveal_its_files() {
+        let mut snapshot = snapshot();
+        let template = snapshot.nodes[1].clone();
+        Arc::make_mut(&mut snapshot).nodes = (0_usize..10)
+            .map(|index| Node {
+                path: PathBuf::from(format!("root/{index}.txt")),
+                parent: index.checked_sub(1),
+                children: if index < 9 { vec![index + 1] } else { vec![] },
+                kind: if index < 9 {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                },
+                ..template.clone()
+            })
+            .collect();
+        let colors = FileColors::from_extensions(&[ExtensionStats {
+            extension: "txt".into(),
+            bytes: 100,
+            files: 1,
+        }]);
+        let data = compute(&snapshot, key(), &LayoutControl::default(), &colors).unwrap();
+        assert!(data.tiles.is_empty());
+        assert!(data.frame(6).is_none());
+        assert_eq!(data.aggregates.len(), 1);
+        let folder = &data.aggregates[0];
+        assert_eq!((folder.owner, folder.color, folder.count), (Some(5), 0, 1));
+        assert_eq!(folder.rect, data.frame(5).unwrap().rect);
+        let image = render_raster(
+            &data,
+            &snapshot,
+            &colors,
+            RasterView {
+                size: egui::vec2(120.0, 80.0),
+                scale: 1.0,
+                offset: egui::Vec2::ZERO,
+                pixels_per_point: 1.0,
+                max_texture_side: 2048,
+            },
+            &LayoutControl::default(),
+        )
+        .unwrap()
+        .image;
+        assert!(image.pixels.iter().all(|pixel| *pixel == FILE_PALETTE[0]));
+        let detail = compute(
+            &snapshot,
+            MapKey {
+                scope: Some(5),
+                ..key()
+            },
+            &LayoutControl::default(),
+            &colors,
+        )
+        .unwrap();
+        assert_eq!(detail.tiles.len(), 1);
+        assert_eq!(detail.tiles[0].node, 9);
+        for kind in [MapKind::Flame, MapKind::Sunburst] {
+            let data = compute(
+                &snapshot,
+                MapKey {
+                    width: 1000,
+                    height: 1000,
+                    kind,
+                    ..key()
+                },
+                &LayoutControl::default(),
+                &colors,
+            )
+            .unwrap();
+            let nodes: Vec<_> = data
+                .tiles
+                .iter()
+                .map(|tile| tile.node)
+                .chain(data.sectors.iter().map(|sector| sector.node))
+                .collect();
+            assert_eq!(nodes, [0, 1, 2, 3, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn changing_depth_hides_the_previous_map_and_rebuilds_its_geometry() {
+        let context = egui::Context::default();
+        let snapshot = snapshot();
+        let mut worker = MapWorker::default();
+        worker.request(key(), Arc::clone(&snapshot), &context);
+        finish(&mut worker);
+        assert_eq!(worker.data().unwrap().tiles.len(), 2);
+        worker.request(
+            MapKey {
+                depth_limit: 1,
+                ..key()
+            },
+            snapshot,
+            &context,
+        );
+        assert!(worker.data().is_none());
+        finish(&mut worker);
+        assert_eq!(worker.data().unwrap().aggregates.len(), 1);
+        assert!(worker.data().unwrap().tiles.is_empty());
+    }
+
+    #[test]
     fn unchanged_view_reuses_one_cached_texture_and_clear_releases_it() {
         let snapshot = snapshot();
         let data = Arc::new(
@@ -1046,6 +1210,9 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    scan_failed: false,
+                    scan_warning: false,
+                    depth_limited: false,
                     scan_duration_ns: 0,
                 })
                 .collect(),
@@ -1063,6 +1230,7 @@ mod tests {
             width: 120,
             height: 80,
             kind: MapKind::Treemap,
+            depth_limit: 6,
         }
     }
 

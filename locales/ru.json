@@ -312,5 +312,14 @@
   "Folder time includes its descendants. Parallel times are not added together.": "Время папки включает вложенные файлы и папки. Время параллельных операций не суммируется.",
   "Complete": "Завершено",
   "Paused": "Приостановлено",
-  "Waiting for an available worker": "Ожидает свободного потока"
+  "Waiting for an available worker": "Ожидает свободного потока",
+  "Maximum scan depth": "Максимальная глубина обхода",
+  "0 means unlimited; the selected folder is level 0.": "0 - без ограничения; выбранная папка - уровень 0.",
+  "Folders at the limit are not opened. Their contents are excluded from totals.": "Папки на предельном уровне не открываются. Их содержимое не входит в итоговые размеры.",
+  "Map depth": "Глубина карты",
+  "Depth limit reached. Contents were not scanned; sizes are incomplete.": "Достигнут предел глубины. Содержимое не просканировано; размеры неполные.",
+  "Completed with some scan errors": "Завершено с отдельными ошибками сканирования",
+  "No entries could be read": "Не удалось прочитать ни одного элемента",
+  "Available when the scan finishes.": "Будет доступно после завершения сканирования.",
+  "Choose drives": "Выбрать диски"
 }

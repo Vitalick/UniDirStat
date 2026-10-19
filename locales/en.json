@@ -312,5 +312,14 @@
   "Folder time includes its descendants. Parallel times are not added together.": "Folder time includes its descendants. Parallel times are not added together.",
   "Complete": "Complete",
   "Paused": "Paused",
-  "Waiting for an available worker": "Waiting for an available worker"
+  "Waiting for an available worker": "Waiting for an available worker",
+  "Maximum scan depth": "Maximum scan depth",
+  "0 means unlimited; the selected folder is level 0.": "0 means unlimited; the selected folder is level 0.",
+  "Folders at the limit are not opened. Their contents are excluded from totals.": "Folders at the limit are not opened. Their contents are excluded from totals.",
+  "Map depth": "Map depth",
+  "Depth limit reached. Contents were not scanned; sizes are incomplete.": "Depth limit reached. Contents were not scanned; sizes are incomplete.",
+  "Completed with some scan errors": "Completed with some scan errors",
+  "No entries could be read": "No entries could be read",
+  "Available when the scan finishes.": "Available when the scan finishes.",
+  "Choose drives": "Choose drives"
 }

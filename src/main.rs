@@ -45,6 +45,7 @@ Usage: unidirstat [FOLDER ...] [OPTIONS]
   --permissions FILE     Save permission metadata JSON/CSV and exit
   --hash sha256|sha512    Duplicate hash algorithm (default sha256)
   --threads NUMBER       Worker count, 0 = automatic (maximum 64)
+  --max-depth NUMBER     Scan depth, root = 0 (default 256; 0 = unlimited)
   --exclude REGEX        Exclude matching paths (repeatable)
   --one-file-system      Stay on the root filesystem (Unix)
   --search TEXT          Search scanned paths and print matches; implies headless
@@ -125,7 +126,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Argu
             "--scan" | "--load" | "--export" | "--duplicates" | "--permissions" | "--exclude"
             | "--threads" | "--search" | "--min-size" | "--max-size" | "--min-age"
             | "--max-age" | "--kind" | "--extension" | "--owner" | "--sort" | "--hash"
-            | "--settings" => {
+            | "--settings" | "--max-depth" => {
                 let next = arguments
                     .next()
                     .ok_or_else(|| format!("{value} requires a value"))?;
@@ -154,6 +155,17 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Argu
                         }
                         parsed.options.threads = threads;
                         parsed.duplicate_options.threads = threads;
+                    }
+                    "--max-depth" => {
+                        let depth: usize = next
+                            .to_str()
+                            .ok_or("Depth must be an integer between 0 and 65535")?
+                            .parse()
+                            .map_err(|_| "Depth must be an integer between 0 and 65535")?;
+                        if depth > 65_535 {
+                            return Err("Depth must be an integer between 0 and 65535".into());
+                        }
+                        parsed.options.max_depth = (depth > 0).then_some(depth);
                     }
                     "--hash" => {
                         parsed.duplicate_options.algorithm = match next.to_str() {
@@ -312,6 +324,11 @@ fn run() -> Result<(), String> {
         if let Some(path) = &arguments.permissions {
             report::export_permissions(path, &snapshot)?;
         }
+        if snapshot.nodes.iter().any(|node| node.depth_limited) {
+            eprintln!(
+                "Depth limit reached: some folder contents were not scanned; totals are incomplete."
+            );
+        }
         if arguments.search_requested {
             let snapshot = std::sync::Arc::new(snapshot);
             let index = SearchIndex::with_threads(
@@ -380,6 +397,22 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Result<Arguments, String> {
         parse_arguments(values.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn scan_depth_defaults_and_overrides_are_validated() {
+        assert_eq!(arguments(&[]).unwrap().options.max_depth, Some(256));
+        assert_eq!(
+            arguments(&["--max-depth", "64"]).unwrap().options.max_depth,
+            Some(64)
+        );
+        assert_eq!(
+            arguments(&["--max-depth", "0"]).unwrap().options.max_depth,
+            None
+        );
+        for value in ["-1", "65536", "abc"] {
+            assert!(arguments(&["--max-depth", value]).is_err());
+        }
     }
 
     #[test]

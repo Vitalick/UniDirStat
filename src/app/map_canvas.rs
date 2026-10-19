@@ -189,7 +189,7 @@ impl UniDirStatApp {
             }
             let detail = self.map_viewport.detail();
             let (width, height) = map_resolution(self.settings.map_view, bounds.size(), detail);
-            let key = MapKey { scope: self.scope, allocated: self.settings.allocated, width, height, kind: match self.settings.map_view { MapView::Treemap => MapKind::Treemap, MapView::Flame => MapKind::Flame, MapView::Sunburst => MapKind::Sunburst } };
+            let key = MapKey { scope: self.scope, allocated: self.settings.allocated, width, height, depth_limit: self.settings.map_depth, kind: match self.settings.map_view { MapView::Treemap => MapKind::Treemap, MapView::Flame => MapKind::Flame, MapView::Sunburst => MapKind::Sunburst } };
             self.map_worker.request(key, Arc::clone(snapshot), ui.ctx());
             let data = self.map_worker.data().map(Arc::clone);
             if let (Some(index), Some(data)) = (self.map_focus, data.as_ref()) {
@@ -384,7 +384,10 @@ impl UniDirStatApp {
         let Some(summary) = self.map_worker.summary() else {
             return;
         };
-        let depth = summary.depth.min(11);
+        let depth = summary
+            .depth
+            .min(11)
+            .min(self.settings.map_depth.saturating_sub(1));
         let band = radius / (depth + 2) as f32;
         let pointer = ui.input(|input| input.pointer.hover_pos());
         let painter = ui
@@ -602,6 +605,7 @@ mod tests {
                 width: 1000,
                 height: 500,
                 kind: MapKind::Treemap,
+                depth_limit: 6,
             },
             Arc::clone(&snapshot),
             &context,

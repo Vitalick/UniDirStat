@@ -44,6 +44,15 @@ pub struct Node {
     /// Metadata time for files; subtree wall time for folders. Zero means unavailable.
     #[serde(default)]
     pub scan_duration_ns: u64,
+    /// This directory's contents were not enumerated because of the scan depth limit.
+    #[serde(default)]
+    pub depth_limited: bool,
+    /// Directory scan completed with errors and no successfully scanned descendants.
+    #[serde(default)]
+    pub scan_failed: bool,
+    /// Directory scan completed with both errors and successfully scanned descendants.
+    #[serde(default)]
+    pub scan_warning: bool,
 }
 
 impl Node {
@@ -313,6 +322,9 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    depth_limited: false,
+                    scan_failed: false,
+                    scan_warning: false,
                     scan_duration_ns: 0,
                 },
                 Node {
@@ -330,6 +342,9 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    depth_limited: false,
+                    scan_failed: false,
+                    scan_warning: false,
                     scan_duration_ns: 0,
                 },
             ],

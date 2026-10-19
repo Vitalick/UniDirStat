@@ -8,6 +8,7 @@ pub enum DirectoryScanStatus {
     Queued,
     Scanning,
     Complete,
+    Warning,
     Failed,
     Cancelled,
 }
@@ -27,10 +28,16 @@ impl ScanView<'_> {
         if self.snapshot.nodes.get(index)?.kind != EntryKind::Directory {
             return None;
         }
-        Some(if self.directory_failed(index) {
-            DirectoryScanStatus::Failed
-        } else if self.directory_finished(index) {
-            DirectoryScanStatus::Complete
+        Some(if self.progress.work_finished(index) {
+            if self.directory_failed(index) {
+                if self.progress.successes[index] {
+                    DirectoryScanStatus::Warning
+                } else {
+                    DirectoryScanStatus::Failed
+                }
+            } else {
+                DirectoryScanStatus::Complete
+            }
         } else if self.cancelled {
             DirectoryScanStatus::Cancelled
         } else if self.progress.active.as_ref().is_some_and(|active| {
@@ -149,12 +156,19 @@ impl ScanControl {
 pub(super) struct DirectoryProgress {
     // One listing marker plus unfinished direct subdirectories; the high bit retains failures.
     pending: Vec<u32>,
+    successes: Vec<bool>,
     started: HashMap<usize, Instant>,
     active: Option<HashSet<usize>>,
     pub revision: u64,
 }
 
 impl DirectoryProgress {
+    fn work_finished(&self, index: usize) -> bool {
+        self.pending
+            .get(index)
+            .is_some_and(|pending| pending & !FAILED == 0)
+    }
+
     pub fn finished(&self, index: usize) -> bool {
         self.pending.get(index) == Some(&0)
     }
@@ -166,6 +180,7 @@ impl DirectoryProgress {
                 .iter()
                 .map(|node| u32::from(node.kind == EntryKind::Directory))
                 .collect(),
+            successes: vec![false; snapshot.nodes.len()],
             started: HashMap::new(),
             active: live.then(HashSet::new),
             revision: 1,
@@ -195,12 +210,15 @@ impl DirectoryProgress {
     pub fn insert(&mut self, node: &Node, parent: usize) {
         let directory = node.kind == EntryKind::Directory;
         self.pending.push(u32::from(directory));
+        self.successes.push(false);
         if directory {
             // Overflow conservatively retains the failure bit, never a false completion.
             self.pending[parent] = self.pending[parent].saturating_add(1);
         }
         if node.error.is_some() {
             self.fail(parent);
+        } else if !directory {
+            self.successes[parent] = true;
         }
     }
 
@@ -220,15 +238,22 @@ impl DirectoryProgress {
                 break;
             }
             let failed = *pending & FAILED;
-            if let Some(started) = self.started.remove(&index)
-                && failed == 0
+            if failed == 0
+                && snapshot.nodes[index].children.is_empty()
+                && !snapshot.nodes[index].depth_limited
             {
+                self.successes[index] = true;
+            }
+            snapshot.nodes[index].scan_failed = failed != 0 && !self.successes[index];
+            snapshot.nodes[index].scan_warning = failed != 0 && self.successes[index];
+            if let Some(started) = self.started.remove(&index) {
                 snapshot.nodes[index].scan_duration_ns = duration_ns(started.elapsed());
             }
             let Some(parent) = snapshot.nodes[index].parent else {
                 break;
             };
             self.pending[parent] |= failed;
+            self.successes[parent] |= self.successes[index];
             index = parent;
         }
         self.revision += 1;
@@ -287,5 +312,122 @@ impl LiveTotals {
             };
             index = parent;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_status_distinguishes_all_failed_from_mixed_nested_descendants() {
+        for successful_file in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temporary.path().join("child/blocked")).unwrap();
+            if successful_file {
+                fs::write(temporary.path().join("child/data"), b"data").unwrap();
+            }
+            let mut snapshot = scan(
+                &[temporary.path().into()],
+                &ScanOptions::default(),
+                &ScanControl::default(),
+            )
+            .unwrap();
+            let mut root_only = snapshot.clone();
+            root_only.nodes.truncate(1);
+            let mut progress = DirectoryProgress::new(&root_only, true);
+            for node in &snapshot.nodes[1..] {
+                progress.insert(node, node.parent.unwrap());
+            }
+            let child = snapshot
+                .nodes
+                .iter()
+                .position(|node| node.name() == "child")
+                .unwrap();
+            let blocked = snapshot
+                .nodes
+                .iter()
+                .position(|node| node.name() == "blocked")
+                .unwrap();
+            snapshot.nodes[blocked].scan_duration_ns = 0;
+            progress.start(blocked);
+            progress.fail(blocked);
+            for index in [blocked, child, 0] {
+                progress.finish(&mut snapshot, index);
+            }
+            let view = ScanView {
+                snapshot: &snapshot,
+                revision: progress.revision,
+                progress: &progress,
+                finalized: true,
+                cancelled: false,
+            };
+            let expected = if successful_file {
+                DirectoryScanStatus::Warning
+            } else {
+                DirectoryScanStatus::Failed
+            };
+            for index in [child, 0] {
+                assert_eq!(view.directory_status(index), Some(expected));
+                assert_eq!(snapshot.nodes[index].scan_warning, successful_file);
+                assert_eq!(snapshot.nodes[index].scan_failed, !successful_file);
+                assert!(!view.directory_finished(index));
+            }
+            assert_eq!(
+                view.directory_status(blocked),
+                Some(DirectoryScanStatus::Failed)
+            );
+            assert!(snapshot.nodes[blocked].scan_failed);
+            assert!(snapshot.nodes[blocked].scan_duration_ns > 0);
+        }
+    }
+
+    #[test]
+    fn directory_errors_do_not_hide_pending_or_active_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("child")).unwrap();
+        let mut snapshot = scan(
+            &[temporary.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let mut progress = DirectoryProgress::new(&snapshot, true);
+        progress.pending[0] = 2;
+        progress.fail(0);
+        let status = |snapshot: &Snapshot, progress: &DirectoryProgress, cancelled| {
+            ScanView {
+                snapshot,
+                revision: progress.revision,
+                progress,
+                finalized: false,
+                cancelled,
+            }
+            .directory_status(0)
+        };
+        assert_eq!(
+            status(&snapshot, &progress, false),
+            Some(DirectoryScanStatus::Queued)
+        );
+        progress.start(1);
+        assert_eq!(
+            status(&snapshot, &progress, false),
+            Some(DirectoryScanStatus::Scanning)
+        );
+        assert_eq!(
+            status(&snapshot, &progress, true),
+            Some(DirectoryScanStatus::Cancelled)
+        );
+        progress.finish_listing(1);
+        progress.finish(&mut snapshot, 1);
+        assert_eq!(
+            status(&snapshot, &progress, false),
+            Some(DirectoryScanStatus::Queued)
+        );
+        progress.finish(&mut snapshot, 0);
+        assert_eq!(
+            status(&snapshot, &progress, false),
+            Some(DirectoryScanStatus::Warning)
+        );
     }
 }

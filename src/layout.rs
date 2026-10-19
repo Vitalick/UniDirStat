@@ -361,6 +361,27 @@ pub fn treemap_hierarchy_with_colors(
     control: &LayoutControl,
     color_key: impl Fn(&str) -> usize,
 ) -> Option<TreemapLayout> {
+    treemap_hierarchy_with_depth(
+        snapshot,
+        roots,
+        allocated,
+        bounds,
+        control,
+        usize::MAX,
+        color_key,
+    )
+}
+
+/// Stops at the requested number of levels, retaining deeper folders as colored regions.
+pub fn treemap_hierarchy_with_depth(
+    snapshot: &Snapshot,
+    roots: &[usize],
+    allocated: bool,
+    bounds: Rect,
+    control: &LayoutControl,
+    depth_limit: usize,
+    color_key: impl Fn(&str) -> usize,
+) -> Option<TreemapLayout> {
     if control.is_cancelled() {
         return None;
     }
@@ -369,8 +390,8 @@ pub fn treemap_hierarchy_with_colors(
         return Some(result);
     }
     let mut visited = HashSet::new();
-    let mut groups = vec![(roots, bounds, None)];
-    while let Some((indices, bounds, owner)) = groups.pop() {
+    let mut groups = vec![(roots, bounds, None, 0_usize)];
+    while let Some((indices, bounds, owner, depth)) = groups.pop() {
         let mut weights = Vec::with_capacity(indices.len());
         control.add_work(indices.len());
         for &index in indices {
@@ -438,11 +459,18 @@ pub fn treemap_hierarchy_with_colors(
                 }
                 if snapshot.nodes[tile.node].kind == EntryKind::Directory {
                     result.frames.push(tile);
-                    groups.push((
-                        snapshot.nodes[tile.node].children.as_slice(),
-                        tile.rect,
-                        Some(tile.node),
-                    ));
+                    if depth.saturating_add(1) >= depth_limit.max(1) {
+                        result.aggregates.push(aggregate_directory(
+                            snapshot, tile, allocated, control, &color_key,
+                        )?);
+                    } else {
+                        groups.push((
+                            snapshot.nodes[tile.node].children.as_slice(),
+                            tile.rect,
+                            Some(tile.node),
+                            depth + 1,
+                        ));
+                    }
                 } else {
                     result.tiles.push(tile);
                 }
@@ -473,6 +501,47 @@ pub fn treemap_hierarchy_with_colors(
         }
     }
     Some(result)
+}
+
+fn aggregate_directory(
+    snapshot: &Snapshot,
+    tile: Tile,
+    allocated: bool,
+    control: &LayoutControl,
+    color_key: &impl Fn(&str) -> usize,
+) -> Option<Aggregate> {
+    let mut extensions = BTreeMap::<String, u128>::new();
+    let mut count = 0;
+    let mut pending = vec![tile.node];
+    let mut visited = HashSet::new();
+    while let Some(index) = pending.pop() {
+        control.add_work(1);
+        control.advance()?;
+        let Some(node) = snapshot.nodes.get(index) else {
+            continue;
+        };
+        if !visited.insert(index) {
+            continue;
+        }
+        if node.kind == EntryKind::File {
+            *extensions.entry(node.extension()).or_default() += u128::from(node.size(allocated));
+            count += 1;
+        } else if node.kind == EntryKind::Directory {
+            pending.extend(&node.children);
+        }
+    }
+    let extension = extensions
+        .iter()
+        .max_by_key(|(_, bytes)| *bytes)
+        .map_or("(no extension)", |(extension, _)| extension.as_str());
+    Some(Aggregate {
+        owner: Some(tile.node),
+        rect: tile.rect,
+        color: color_key(extension),
+        bytes: u128::from(snapshot.nodes[tile.node].size(allocated)),
+        count,
+        extensions: extensions.into_keys().collect(),
+    })
 }
 
 fn sort_weights(
@@ -627,13 +696,25 @@ pub fn flame_visible(
     bounds: Rect,
     control: &LayoutControl,
 ) -> Option<Vec<Tile>> {
+    flame_visible_with_depth(snapshot, roots, allocated, bounds, control, usize::MAX)
+}
+
+/// Builds flame geometry with an additional level limit relative to its roots.
+pub fn flame_visible_with_depth(
+    snapshot: &Snapshot,
+    roots: &[usize],
+    allocated: bool,
+    bounds: Rect,
+    control: &LayoutControl,
+    depth_limit: usize,
+) -> Option<Vec<Tile>> {
     if control.is_cancelled() {
         return None;
     }
     if !valid_bounds(bounds) {
         return Some(Vec::new());
     }
-    let bands = (bounds.height / 24.0).floor().max(1.0) as usize;
+    let bands = ((bounds.height / 24.0).floor().max(1.0) as usize).min(depth_limit.max(1));
     let (sectors, _) = hierarchy_visible(
         snapshot,
         roots,
@@ -671,6 +752,18 @@ pub fn sunburst_visible(
     bounds: Rect,
     control: &LayoutControl,
 ) -> Option<Vec<Sector>> {
+    sunburst_visible_with_depth(snapshot, roots, allocated, bounds, control, usize::MAX)
+}
+
+/// Builds visible sunburst rings with an additional level limit relative to its roots.
+pub fn sunburst_visible_with_depth(
+    snapshot: &Snapshot,
+    roots: &[usize],
+    allocated: bool,
+    bounds: Rect,
+    control: &LayoutControl,
+    depth_limit: usize,
+) -> Option<Vec<Sector>> {
     if control.is_cancelled() {
         return None;
     }
@@ -681,7 +774,10 @@ pub fn sunburst_visible(
     if radius <= 2.0 {
         return Some(Vec::new());
     }
-    let depth_limit = (radius as usize / 3).saturating_sub(1).clamp(1, 12);
+    let depth_limit = (radius as usize / 3)
+        .saturating_sub(1)
+        .clamp(1, 12)
+        .min(depth_limit.max(1));
     let (sectors, max_depth) = hierarchy_visible(
         snapshot,
         roots,
@@ -747,6 +843,9 @@ mod tests {
                 owner: None,
                 file_id: None,
                 error: None,
+                scan_failed: false,
+                scan_warning: false,
+                depth_limited: false,
                 scan_duration_ns: 0,
             },
         )

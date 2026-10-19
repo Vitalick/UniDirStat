@@ -14,11 +14,26 @@ mod progress;
 use progress::{DirectoryProgress, LiveScan, LiveTotals, duration_ns};
 pub use progress::{DirectoryScanStatus, ScanView};
 
-#[derive(Default, Clone, Debug)]
+pub const DEFAULT_MAX_DEPTH: usize = 256;
+
+#[derive(Clone, Debug)]
 pub struct ScanOptions {
     pub exclude: Vec<String>,
     pub one_file_system: bool,
     pub threads: usize,
+    /// Maximum entry depth relative to each root (zero); None scans every level.
+    pub max_depth: Option<usize>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            exclude: Vec::new(),
+            one_file_system: false,
+            threads: 0,
+            max_depth: Some(DEFAULT_MAX_DEPTH),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,6 +62,8 @@ pub struct ScanControl {
     pub bytes: AtomicU64,
     pub allocated_bytes: AtomicU64,
     pub unknown_allocations: AtomicU64,
+    /// Directory listings intentionally skipped at the configured depth limit.
+    pub depth_limited: AtomicU64,
     pub phase: AtomicU8,
     pub work_done: AtomicU64,
     pub work_total: AtomicU64,
@@ -212,6 +229,7 @@ fn scan_with_directories(
     control.bytes.store(0, Ordering::Relaxed);
     control.allocated_bytes.store(0, Ordering::Relaxed);
     control.unknown_allocations.store(0, Ordering::Relaxed);
+    control.depth_limited.store(0, Ordering::Relaxed);
     let current = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut candidates = Vec::new();
     for root in roots {
@@ -329,7 +347,7 @@ fn scan_with_directories(
         rayon::scope(|scope| {
             for (index, device) in pending {
                 let traversal = &traversal;
-                scope.spawn(move |scope| traversal.directory(scope, index, device));
+                scope.spawn(move |scope| traversal.directory(scope, index, device, 0));
             }
         })
     });
@@ -367,7 +385,7 @@ fn scan_with_directories(
         .phase
         .store(ScanPhase::Finalizing as u8, Ordering::Release);
     snapshot.nodes.shrink_to_fit();
-    finalize(&mut snapshot, control);
+    finalize(&mut snapshot, control, false);
     snapshot.cancelled = control.is_cancelled();
     snapshot.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     control
@@ -417,9 +435,17 @@ pub fn refresh_subtree(
         retained.push(previous);
         pending.extend(node.children.iter().rev().copied());
     }
+    let mut subtree_options = options.clone();
+    if let Some(limit) = &mut subtree_options.max_depth {
+        let mut ancestor = selected.parent;
+        while let Some(index) = ancestor {
+            *limit = limit.saturating_sub(1);
+            ancestor = snapshot.nodes[index].parent;
+        }
+    }
     let fresh = scan_with_directories(
         std::slice::from_ref(&selected.path),
-        options,
+        &subtree_options,
         control,
         directories,
     )?;
@@ -521,7 +547,7 @@ pub fn refresh_subtree(
             merged.nodes[owner].allocated_size = allocated;
         }
     }
-    finalize(&mut merged, control);
+    finalize(&mut merged, control, true);
     refresh_checkpoint(control)?;
     merged.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     control
@@ -571,11 +597,23 @@ impl Traversal<'_> {
         scope: &rayon::Scope<'scope>,
         index: usize,
         device: Option<u64>,
+        depth: usize,
     ) {
         const BATCH: usize = 256;
         #[cfg(test)]
         tests::directory_gate(self.control, index);
         if !self.control.checkpoint() {
+            return;
+        }
+        if self.options.max_depth.is_some_and(|limit| depth >= limit) {
+            self.control.depth_limited.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot
+                .nodes[index]
+                .depth_limited = true;
+            self.finish_directory(index);
             return;
         }
         let (path, identity) = {
@@ -633,12 +671,13 @@ impl Traversal<'_> {
                     scope,
                     index,
                     device,
+                    depth,
                     std::mem::replace(&mut paths, Vec::with_capacity(BATCH)),
                 );
             }
         }
         if !paths.is_empty() {
-            self.batch(scope, index, device, paths);
+            self.batch(scope, index, device, depth, paths);
         }
         self.finish_directory(index);
     }
@@ -648,6 +687,7 @@ impl Traversal<'_> {
         scope: &rayon::Scope<'scope>,
         parent: usize,
         device: Option<u64>,
+        depth: usize,
         paths: Vec<(PathBuf, fs::DirEntry)>,
     ) {
         let nodes: Vec<_> = paths
@@ -700,6 +740,9 @@ impl Traversal<'_> {
                             file_id: None,
                             error,
                             scan_duration_ns: 0,
+                            depth_limited: false,
+                            scan_failed: false,
+                            scan_warning: false,
                         })
                     }
                 }
@@ -769,7 +812,7 @@ impl Traversal<'_> {
             }
         }
         for index in directories {
-            scope.spawn(move |scope| self.directory(scope, index, device));
+            scope.spawn(move |scope| self.directory(scope, index, device, depth + 1));
         }
     }
 
@@ -854,8 +897,13 @@ fn insert_node(
     Some(index)
 }
 
-fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
+fn finalize(snapshot: &mut Snapshot, control: &ScanControl, refresh_statuses: bool) {
     let nodes = snapshot.nodes.len();
+    let mut successes = if refresh_statuses {
+        vec![false; nodes]
+    } else {
+        Vec::new()
+    };
     control.start_work(
         nodes as u64
             + snapshot
@@ -870,6 +918,9 @@ fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
             control.checkpoint();
         }
         if snapshot.nodes[index].kind != EntryKind::Directory {
+            if refresh_statuses {
+                successes[index] = snapshot.nodes[index].error.is_none();
+            }
             if (position + 1) % 256 == 0 || position + 1 == nodes {
                 control.advance_work(((position % 256) + 1) as u64);
             }
@@ -879,6 +930,10 @@ fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
         let mut allocated = empty_allocation();
         let mut files = 0_u64;
         let mut directories = 0_u64;
+        let mut failed = snapshot.nodes[index].error.is_some();
+        let mut succeeded = !failed
+            && snapshot.nodes[index].children.is_empty()
+            && !snapshot.nodes[index].depth_limited;
         for chunk in snapshot.nodes[index].children.chunks(256) {
             control.checkpoint();
             for &child in chunk {
@@ -891,6 +946,10 @@ fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
                 directories = directories
                     .saturating_add(node.directories)
                     .saturating_add(u64::from(node.kind == EntryKind::Directory));
+                if refresh_statuses {
+                    failed |= node.error.is_some() || node.scan_failed || node.scan_warning;
+                    succeeded |= successes[child];
+                }
             }
             control.advance_work(chunk.len() as u64);
         }
@@ -899,6 +958,11 @@ fn finalize(snapshot: &mut Snapshot, control: &ScanControl) {
         node.allocated_size = allocated;
         node.files = files;
         node.directories = directories;
+        if refresh_statuses {
+            successes[index] = succeeded;
+            node.scan_failed = failed && !succeeded;
+            node.scan_warning = failed && succeeded;
+        }
         if (position + 1) % 256 == 0 || position + 1 == nodes {
             control.advance_work(((position % 256) + 1) as u64);
         }
@@ -1050,6 +1114,9 @@ fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata)
         file_id,
         error: None,
         scan_duration_ns: 0,
+        depth_limited: false,
+        scan_failed: false,
+        scan_warning: false,
     }
 }
 
@@ -1239,6 +1306,138 @@ pub(crate) mod tests {
     use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 
     use super::*;
+
+    #[test]
+    fn scan_depth_limit_stops_before_listing_boundary_directories_without_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temporary.path().join("child/grandchild")).unwrap();
+        fs::write(temporary.path().join("root-file"), [7; 3]).unwrap();
+        fs::write(temporary.path().join("child/child-file"), [7; 5]).unwrap();
+        fs::write(temporary.path().join("child/grandchild/deep-file"), [7; 11]).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        for (max_depth, bytes, entries, limited) in [
+            (Some(0), 0, 1, 1),
+            (Some(1), 3, 3, 1),
+            (Some(2), 8, 5, 1),
+            (None, 19, 6, 0),
+        ] {
+            let snapshot = Arc::new(
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        max_depth,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap(),
+            );
+            assert_eq!(snapshot.total_size(false), bytes);
+            assert_eq!(snapshot.nodes.len(), entries);
+            assert_eq!(control.depth_limited.load(Ordering::Relaxed), limited);
+            assert_eq!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .filter(|node| node.depth_limited)
+                    .count() as u64,
+                limited
+            );
+            assert!(snapshot.errors.is_empty());
+            assert!(!snapshot.cancelled);
+            assert!(snapshot.validate().is_ok());
+            control.set_completed_live_snapshot(snapshot);
+            assert_eq!(
+                control.with_live_view(|view| view.directory_status(0)),
+                Some(Some(DirectoryScanStatus::Complete))
+            );
+        }
+    }
+
+    #[test]
+    fn scan_depth_limit_is_relative_to_each_root_and_keeps_file_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("directory");
+        let file = temporary.path().join("file");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("hidden-file"), [7; 9]).unwrap();
+        fs::write(&file, [7; 3]).unwrap();
+        let snapshot = scan(
+            &[directory, file],
+            &ScanOptions {
+                max_depth: Some(0),
+                ..ScanOptions::default()
+            },
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.roots.len(), 2);
+        assert_eq!(snapshot.total_size(false), 3);
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn subtree_refresh_keeps_depth_limit_relative_to_the_original_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("child");
+        fs::create_dir_all(selected.join("grandchild")).unwrap();
+        fs::write(selected.join("data"), [7; 5]).unwrap();
+        fs::write(selected.join("grandchild/deep-data"), [7; 11]).unwrap();
+        let options = ScanOptions {
+            max_depth: Some(2),
+            ..ScanOptions::default()
+        };
+        let original = scan(
+            &[temporary.path().into()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let selected = original.nodes[original.roots[0]].children[0];
+        let refreshed =
+            refresh_subtree(&original, selected, &options, &ScanControl::default()).unwrap();
+        let entries = |snapshot: &Snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| (node.path.clone(), node.logical_size, node.depth_limited))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(entries(&refreshed), entries(&original));
+        assert_eq!(refreshed.total_size(false), 5);
+        assert!(refreshed.validate().is_ok());
+    }
+
+    #[test]
+    fn subtree_refresh_clears_ancestor_warning_after_the_failed_subtree_recovers() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("child")).unwrap();
+        fs::write(temporary.path().join("child/data"), b"data").unwrap();
+        let options = ScanOptions::default();
+        let mut original = scan(
+            &[temporary.path().into()],
+            &options,
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let child = original.nodes[0].children[0];
+        let error = format!("{}: listing failed", original.nodes[child].path.display());
+        original.nodes[child].error = Some(error.clone());
+        original.nodes[child].scan_warning = true;
+        original.nodes[0].scan_warning = true;
+        original.errors.push(error);
+        let refreshed =
+            refresh_subtree(&original, child, &options, &ScanControl::default()).unwrap();
+        assert!(refreshed.errors.is_empty());
+        assert!(
+            refreshed
+                .nodes
+                .iter()
+                .all(|node| !node.scan_failed && !node.scan_warning)
+        );
+    }
 
     #[test]
     fn completed_scan_releases_unused_node_capacity() {

@@ -294,6 +294,7 @@ impl SearchIndex {
                         && (!query.empty_directories
                             || (node.kind == EntryKind::Directory
                                 && node.children.is_empty()
+                                && !node.depth_limited
                                 && node.error.is_none()))
                         && query.owner.is_none_or(|owner| node.owner == Some(owner))
                         && extension.as_ref().is_none_or(|extension| {
@@ -494,6 +495,40 @@ mod tests {
 
     use super::*;
     use crate::scanner::{ScanOptions, scan};
+
+    #[test]
+    fn unscanned_depth_cutoffs_are_not_reported_as_empty_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(fixture.path().join("child/data.txt"), b"data").unwrap();
+        let snapshot = Arc::new(
+            scan(
+                &[fixture.path().into()],
+                &ScanOptions {
+                    max_depth: Some(1),
+                    ..ScanOptions::default()
+                },
+                &ScanControl::default(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| node.depth_limited && node.children.is_empty())
+        );
+        let found = SearchIndex::new(snapshot)
+            .search(
+                &SearchQuery {
+                    empty_directories: true,
+                    ..SearchQuery::default()
+                },
+                &ScanControl::default(),
+            )
+            .unwrap();
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn search_cache_retains_the_filename_without_its_directory_prefix() {

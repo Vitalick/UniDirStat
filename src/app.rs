@@ -111,6 +111,8 @@ struct Settings {
     show_modified: bool,
     show_share: bool,
     threads: usize,
+    max_depth: usize,
+    map_depth: usize,
     allocated: bool,
     labels: bool,
     map_view: MapView,
@@ -132,6 +134,8 @@ impl Default for Settings {
             show_modified: true,
             show_share: true,
             threads: 0,
+            max_depth: scanner::DEFAULT_MAX_DEPTH,
+            map_depth: 6,
             allocated: false,
             labels: true,
             map_view: MapView::Treemap,
@@ -146,6 +150,7 @@ impl Default for Settings {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
+    Locations,
     Overview,
     Files,
     Largest,
@@ -159,6 +164,7 @@ enum Page {
 impl Page {
     fn title(self) -> &'static str {
         match self {
+            Self::Locations => tr("Choose drives"),
             Self::Overview => tr("Overview"),
             Self::Files => tr("All files"),
             Self::Largest => tr("Largest files"),
@@ -171,6 +177,7 @@ impl Page {
     }
     fn subtitle(self) -> &'static str {
         match self {
+            Self::Locations => tr("Choose a folder or drive. See every file in a whole new light."),
             Self::Overview => tr("A little perspective on what takes up space."),
             Self::Files => tr("Explore your folders, one level at a time."),
             Self::Largest => tr("The biggest opportunities to reclaim space."),
@@ -203,6 +210,7 @@ struct PreparedSnapshot {
     largest: Vec<usize>,
     age: ([u64; 4], [u64; 4]),
     analysis_complete: bool,
+    depth_limited: bool,
     error: Option<String>,
     refresh_view: Option<Box<RefreshView>>,
 }
@@ -631,6 +639,7 @@ fn prepare_snapshot(
 ) -> PreparedSnapshot {
     snapshot.cancelled |= control.is_cancelled();
     let mut prepared = PreparedSnapshot {
+        depth_limited: snapshot.nodes.iter().any(|node| node.depth_limited),
         snapshot: Arc::new(snapshot),
         index: None,
         extensions: [Vec::new(), Vec::new()],
@@ -755,6 +764,7 @@ pub struct UniDirStatApp {
     reveal_row: Option<usize>,
     column_widths: [f32; 5],
     live_tree: live_scan::LiveTree,
+    scan_depth_limited: bool,
     summary_open: bool,
     compact_map: bool,
     permission_details: Option<(PathBuf, String)>,
@@ -805,6 +815,11 @@ impl UniDirStatApp {
             settings.threads = options.threads;
         }
         settings.threads = settings.threads.min(64);
+        settings.map_depth = settings.map_depth.clamp(1, 64);
+        if options.max_depth != ScanOptions::default().max_depth {
+            settings.max_depth = options.max_depth.unwrap_or(0);
+        }
+        settings.max_depth = settings.max_depth.min(65_535);
         settings.font_scale = settings.font_scale.clamp(0.75, 2.0);
         context.egui_ctx.set_fonts(interface_fonts());
         context.egui_ctx.set_zoom_factor(settings.font_scale);
@@ -874,6 +889,7 @@ impl UniDirStatApp {
             reveal_row: None,
             column_widths: DEFAULT_COLUMN_WIDTHS,
             live_tree: live_scan::LiveTree::default(),
+            scan_depth_limited: false,
             summary_open: false,
             compact_map: false,
             permission_details: None,
@@ -1064,6 +1080,7 @@ impl UniDirStatApp {
             self.scan_after_access = true;
             return;
         }
+        self.page = Page::Overview;
         self.cleanup = None;
         self.refresh_after_cleanup = false;
         self.last_refreshed = None;
@@ -1072,6 +1089,10 @@ impl UniDirStatApp {
         self.control = Arc::default();
         self.control.enable_live_view();
         self.live_tree = live_scan::LiveTree::default();
+        self.rows.clear();
+        self.expanded.clear();
+        self.selection.clear();
+        self.selected = None;
         let roots = self.roots.clone();
         let control = Arc::clone(&self.control);
         let options = self.scan_options();
@@ -1094,7 +1115,23 @@ impl UniDirStatApp {
                 .collect(),
             one_file_system: cfg!(unix) && self.settings.one_file_system,
             threads: self.settings.threads,
+            max_depth: (self.settings.max_depth > 0).then_some(self.settings.max_depth),
         }
+    }
+
+    fn restore_rows_after_scan_failure(&mut self) {
+        self.control.clear_live_view();
+        self.live_tree = live_scan::LiveTree::default();
+        self.rows.clear();
+        self.selection.clear();
+        self.selected = None;
+        self.expanded = self
+            .snapshot
+            .as_ref()
+            .map_or_else(HashSet::new, |snapshot| {
+                snapshot.roots.iter().copied().collect()
+            });
+        self.rebuild = true;
     }
 
     fn recalculation_target(&self) -> Option<usize> {
@@ -1256,25 +1293,24 @@ impl UniDirStatApp {
                                 self.status.push_str(" | ");
                                 self.status.push_str(tr("Read-only snapshot"));
                             }
-                            self.expanded = if job_kind == Some(JobKind::Scan)
-                                && !self.live_tree.expanded.is_empty()
-                            {
-                                std::mem::take(&mut self.live_tree.expanded)
-                            } else {
-                                snapshot.roots.iter().copied().collect()
-                            };
+                            if job_kind != Some(JobKind::Scan) || !self.live_tree.initialized() {
+                                self.expanded = snapshot.roots.iter().copied().collect();
+                            }
                             self.live_tree = live_scan::LiveTree::default();
                             self.extensions = prepared.extensions;
                             self.largest = prepared.largest;
                             self.analysis_complete = prepared.analysis_complete;
+                            self.scan_depth_limited = prepared.depth_limited;
                             if let Some(error) = prepared.error {
                                 self.error = Some(error);
                             }
                             let timestamp = now();
                             (self.age_sizes, self.age_files) = prepared.age;
                             self.age_day = timestamp / 86_400;
-                            self.selected = None;
-                            self.selection.clear();
+                            if job_kind != Some(JobKind::Scan) {
+                                self.selected = None;
+                                self.selection.clear();
+                            }
                             self.scope = None;
                             self.map_viewport = MapViewport::default();
                             self.map_focus = None;
@@ -1323,6 +1359,9 @@ impl UniDirStatApp {
                         }
                         Err(error) => {
                             self.live_tree = live_scan::LiveTree::default();
+                            if job_kind == Some(JobKind::Scan) {
+                                self.restore_rows_after_scan_failure();
+                            }
                             self.rebuild |= job_kind == Some(JobKind::Refresh);
                             if self.refresh_after_cleanup {
                                 self.status =
@@ -1381,7 +1420,11 @@ impl UniDirStatApp {
             }
         } else if let Some(Err(mpsc::TryRecvError::Disconnected)) = result {
             self.receiver = None;
-            self.rebuild |= self.job_kind.take() == Some(JobKind::Refresh);
+            let kind = self.job_kind.take();
+            if kind == Some(JobKind::Scan) {
+                self.restore_rows_after_scan_failure();
+            }
+            self.rebuild |= kind == Some(JobKind::Refresh);
             if self.refresh_after_cleanup {
                 self.status = tr("Item moved to trash. Scan results are outdated.").into();
                 self.error = Some(tr("Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.").into());
@@ -1555,6 +1598,7 @@ impl UniDirStatApp {
                             .width(150.0)
                             .show_ui(ui, |ui| {
                                 for page in [
+                                    Page::Locations,
                                     Page::Overview,
                                     Page::Files,
                                     Page::Largest,
@@ -1605,6 +1649,7 @@ impl UniDirStatApp {
                         .strong(),
                 );
                 for page in [
+                    Page::Locations,
                     Page::Overview,
                     Page::Files,
                     Page::Largest,
@@ -1732,12 +1777,16 @@ impl UniDirStatApp {
                 .set_title(tr("Choose folders to scan"))
                 .pick_folders()
         {
-            self.roots.extend(paths);
+            if self.page == Page::Locations {
+                self.roots = paths;
+            } else {
+                self.roots.extend(paths);
+            }
             self.start_scan(ui.ctx());
         }
         if ui
             .add_enabled(
-                self.receiver.is_none() && self.snapshot.is_some(),
+                self.receiver.is_none() && self.snapshot.is_some() && self.page != Page::Locations,
                 egui::Button::new(tr("Refresh")),
             )
             .clicked()
@@ -2077,17 +2126,20 @@ impl UniDirStatApp {
                     )
                     .labelled_by(path_label.id);
                 let explore = ui
-                    .add_sized(
-                        [160.0, CONTROL_HEIGHT],
-                        egui::Button::new(
-                            RichText::new(tr("Explore folder")).color(Color32::WHITE),
+                    .add_enabled_ui(self.receiver.is_none(), |ui| {
+                        ui.add_sized(
+                            [160.0, CONTROL_HEIGHT],
+                            egui::Button::new(
+                                RichText::new(tr("Explore folder")).color(Color32::WHITE),
+                            )
+                            .fill(PRIMARY_BUTTON),
                         )
-                        .fill(PRIMARY_BUTTON),
-                    )
+                    })
+                    .inner
                     .clicked()
                     || (response.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                if explore && !self.path_input.trim().is_empty() {
+                if explore && self.receiver.is_none() && !self.path_input.trim().is_empty() {
                     self.roots = vec![PathBuf::from(self.path_input.trim())];
                     self.start_scan(ui.ctx());
                 }
@@ -2756,6 +2808,16 @@ impl UniDirStatApp {
             ui.set_min_width(ui.available_width());
             ui.strong(tr("Scanning")); ui.label(RichText::new(tr("Applied on the next scan. Symlinks and Windows reparse points are never followed.")).color(muted(ui)));
             ui.horizontal_wrapped(|ui| { ui.label(tr("Scan workers")); ui.add(egui::DragValue::new(&mut self.settings.threads).range(0..=64)); ui.label(tr("0 uses available CPU threads")); });
+            ui.horizontal_wrapped(|ui| {
+                let label = ui.label(tr("Maximum scan depth"));
+                ui.add(egui::DragValue::new(&mut self.settings.max_depth).range(0..=65_535)).labelled_by(label.id);
+                ui.label(tr("0 means unlimited; the selected folder is level 0."));
+            });
+            ui.label(RichText::new(tr("Folders at the limit are not opened. Their contents are excluded from totals.")).small().color(muted(ui)));
+            ui.horizontal_wrapped(|ui| {
+                let label = ui.label(tr("Map depth"));
+                ui.add(egui::DragValue::new(&mut self.settings.map_depth).range(1..=64)).labelled_by(label.id);
+            });
             ui.add_enabled(cfg!(unix),egui::Checkbox::new(&mut self.settings.one_file_system,tr("Stay on the same filesystem (Unix)")));
             ui.label(tr("Exclude paths matching these regular expressions (one per line)"));
             ui.add(egui::TextEdit::multiline(&mut self.settings.exclude).margin(INPUT_MARGIN).hint_text("(^|/)(node_modules|target|\\.git)(/|$)").desired_width(f32::INFINITY).desired_rows(4));
@@ -2945,6 +3007,7 @@ impl UniDirStatApp {
         }
         if node.kind == EntryKind::Directory
             && node.children.is_empty()
+            && !node.depth_limited
             && node.error.is_none()
             && ui
                 .add_enabled(
@@ -3284,7 +3347,12 @@ impl eframe::App for UniDirStatApp {
             }
             self.selected = self.selection.primary();
         }
-        if !matches!(self.page, Page::Overview | Page::Files | Page::Settings) {
+        if self.job_kind != Some(JobKind::Scan)
+            && !matches!(
+                self.page,
+                Page::Locations | Page::Overview | Page::Files | Page::Settings
+            )
+        {
             self.inspector(context);
         }
         egui::TopBottomPanel::bottom("status")
@@ -3311,7 +3379,15 @@ impl eframe::App for UniDirStatApp {
             ui.set_opacity(context.animate_value_with_time(egui::Id::new("page-opacity"),1.0,if self.settings.reduced_motion {0.0} else {0.16}));
             self.header(ui);
             if self.page==Page::Settings { egui::ScrollArea::vertical().show(ui,|ui|self.settings_page(ui)); return; }
-            if self.job_kind == Some(JobKind::Scan) && matches!(self.page, Page::Overview | Page::Files) { self.live_files(ui); return; }
+            if self.page==Page::Locations { egui::ScrollArea::vertical().show(ui,|ui|self.welcome(ui)); return; }
+            if self.scan_depth_limited && self.job_kind != Some(JobKind::Scan) {
+                ui.label(RichText::new(tr("Depth limit reached. Contents were not scanned; sizes are incomplete.")).color(ui.visuals().warn_fg_color));
+            }
+            if self.job_kind == Some(JobKind::Scan) {
+                if matches!(self.page, Page::Overview | Page::Files | Page::Largest) { self.live_files(ui); }
+                else { ui.label(tr("Available when the scan finishes.")); }
+                return;
+            }
             let Some(snapshot)=self.snapshot.as_ref().map(Arc::clone) else { egui::ScrollArea::vertical().show(ui,|ui|self.welcome(ui)); return; };
             if matches!(self.page, Page::Overview | Page::Files | Page::Types | Page::Largest) { self.map_worker.request_summary(self.scope, Arc::clone(&snapshot), ui.ctx()); }
             if self.settings.allocated && snapshot.roots.iter().any(|&index|snapshot.nodes[index].allocated_size.is_none()) { self.settings.allocated=false; self.rebuild=true;  }
@@ -3322,7 +3398,7 @@ impl eframe::App for UniDirStatApp {
                 Page::Duplicates=>self.duplicates_page(ui,&snapshot),
                 Page::Storage=>{ egui::ScrollArea::vertical().show(ui,|ui|self.storage(ui,&snapshot)); },
                 Page::Issues=>{ ui.label(trf("{count} scan issues. Inaccessible paths are never silently treated as empty.",&[("count",snapshot.errors.len().to_string())])); egui::ScrollArea::vertical().show(ui,|ui| { for error in &snapshot.errors { ui.label(error); ui.separator(); } }); },
-                Page::Settings=>{},
+                Page::Locations|Page::Settings=>{},
             }
         });
         self.access_dialog(context);
@@ -3416,6 +3492,71 @@ mod tests {
         app.receiver = Some(receiver);
         app.job_kind = Some(kind);
         assert!(sender.send(result).is_ok());
+    }
+
+    #[test]
+    fn drive_selection_stays_accessible_after_a_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1380.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| app.sidebar(context),
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == tr("Choose drives"))));
+    }
+
+    #[test]
+    fn choosing_a_new_drive_preserves_results_until_the_scan_starts() {
+        let previous = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        std::fs::write(next.path().join("new.txt"), b"new").unwrap();
+        let (mut app, context) = refresh_test_app(previous.path());
+        let retained = Arc::clone(app.snapshot.as_ref().unwrap());
+        app.page = Page::Locations;
+        app.roots = vec![next.path().into()];
+        app.settings.mac_access_reviewed = true;
+        app.start_scan(&context);
+        assert!(app.page == Page::Overview);
+        assert!(Arc::ptr_eq(app.snapshot.as_ref().unwrap(), &retained));
+        finish_refresh_jobs(&mut app, &context);
+        assert_eq!(app.roots, [std::fs::canonicalize(next.path()).unwrap()]);
+    }
+
+    #[test]
+    fn failed_or_disconnected_scan_rebuilds_retained_snapshot_rows() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("retained.txt"), b"data").unwrap();
+        for disconnected in [false, true] {
+            let (mut app, context) = refresh_test_app(fixture.path());
+            app.rows = vec![(usize::MAX, 0)];
+            app.expanded.clear();
+            app.rebuild = false;
+            if disconnected {
+                let (sender, receiver) = mpsc::channel();
+                app.receiver = Some(receiver);
+                app.job_kind = Some(JobKind::Scan);
+                drop(sender);
+            } else {
+                queue_refresh_result(
+                    &mut app,
+                    JobKind::Scan,
+                    JobResult::Scan(Err("invalid exclusion".into())),
+                );
+            }
+            app.poll(&context);
+            assert!(app.rebuild);
+            assert!(app.rows.is_empty());
+            assert!(
+                app.expanded
+                    .contains(&app.snapshot.as_ref().unwrap().roots[0])
+            );
+        }
     }
 
     fn finish_refresh_jobs(app: &mut UniDirStatApp, context: &egui::Context) {
@@ -4233,6 +4374,19 @@ mod tests {
         assert_eq!(settings.language, Language::System);
         assert!(settings.show_modified && settings.show_share);
         assert_eq!((settings.font_scale, settings.threads), (0.8, 0));
+        assert_eq!((settings.max_depth, settings.map_depth), (256, 6));
+    }
+
+    #[test]
+    fn scan_and_map_depth_preferences_are_persisted_independently() {
+        let settings = Settings {
+            max_depth: 64,
+            map_depth: 4,
+            ..Default::default()
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!((restored.max_depth, restored.map_depth), (64, 4));
     }
 
     #[test]
