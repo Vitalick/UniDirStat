@@ -12,7 +12,7 @@ Read `docs/private/AGENTS.md` when present. Keep internal plans, reference resea
 
 ## Public README
 
-Keep `README.md` complete in English first, then Russian, with matching current information and initial `English | Русский` section links.
+Keep `README.md` in English and the complete matching Russian translation in `README.ru.md`, with initial `English | Русский` file links in both.
 
 Include short `Support development` / `Поддержать разработку` sections in both versions with https://app.lava.top/4026101527. Support can be any amount, is voluntary, is not required to use the project and does not promise paid services.
 
