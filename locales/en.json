@@ -303,6 +303,14 @@
   "File types: {extensions}": "File types: {extensions}",
   "Containing folder: {path}": "Containing folder: {path}",
   "Select containing folder": "Select containing folder",
-  "Zoom into folder": "Zoom into folder",
-  "{extensions}, and {count} more": "{extensions}, and {count} more"
+  "{extensions}, and {count} more": "{extensions}, and {count} more",
+  "Scan results update as folders are discovered.": "Scan results update as folders are discovered.",
+  "Scan time": "Scan time",
+  "Discovering folders": "Discovering folders",
+  "<1 ms": "<1 ms",
+  "ms": "ms",
+  "Folder time includes its descendants. Parallel times are not added together.": "Folder time includes its descendants. Parallel times are not added together.",
+  "Complete": "Complete",
+  "Paused": "Paused",
+  "Waiting for an available worker": "Waiting for an available worker"
 }

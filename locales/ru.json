@@ -178,7 +178,7 @@
   "Symlink": "Символическая ссылка",
   "Other": "Другой",
   "{files} files | {folders} folders": "Файлы: {files} | папки: {folders}",
-  "Zoom into folder": "Открыть папку на карте",
+  "Zoom into folder": "Приблизить папку",
   "Open": "Открыть",
   "Move...": "Переместить...",
   "Choose destination folder": "Выберите папку назначения",
@@ -303,6 +303,14 @@
   "File types: {extensions}": "Типы файлов: {extensions}",
   "Containing folder: {path}": "Родительская папка: {path}",
   "Select containing folder": "Выделить родительскую папку",
-  "Zoom into folder": "Приблизить папку",
-  "{extensions}, and {count} more": "{extensions}; ещё типов: {count}"
+  "{extensions}, and {count} more": "{extensions}; ещё типов: {count}",
+  "Scan results update as folders are discovered.": "Результаты сканирования обновляются по мере обнаружения папок.",
+  "Scan time": "Время скана",
+  "Discovering folders": "Поиск папок",
+  "<1 ms": "<1 мс",
+  "ms": "мс",
+  "Folder time includes its descendants. Parallel times are not added together.": "Время папки включает вложенные файлы и папки. Время параллельных операций не суммируется.",
+  "Complete": "Завершено",
+  "Paused": "Приостановлено",
+  "Waiting for an available worker": "Ожидает свободного потока"
 }

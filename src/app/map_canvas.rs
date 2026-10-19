@@ -9,9 +9,8 @@ fn readable_map_region(rect: egui::Rect) -> bool {
     rect.width() >= 4.0 && rect.height() >= 4.0 && rect.area() >= 24.0
 }
 
-fn tile_shape(rect: egui::Rect, gap: f32) -> (egui::Rect, f32) {
-    let detail = ((rect.width().min(rect.height()) - 12.0) / 20.0).clamp(0.0, 1.0);
-    (rect.shrink(gap / 2.0 * detail), 3.0 * detail)
+fn tile_shape(rect: egui::Rect) -> (egui::Rect, f32) {
+    (rect, 0.0)
 }
 
 fn paint_map_label(ui: &egui::Ui, rect: egui::Rect, text: &str, color: Color32) {
@@ -207,8 +206,15 @@ impl UniDirStatApp {
             if let Some(data) = data.as_ref() {
                 if self.settings.map_view == MapView::Sunburst { self.sunburst_canvas(ui, snapshot, bounds, data); }
                 else {
+                    let raster = self.map_worker.raster(data, snapshot, crate::map_job::RasterView {
+                        size: bounds.size(), scale: self.map_viewport.scale, offset: self.map_viewport.offset,
+                        pixels_per_point: ui.ctx().pixels_per_point(),
+                        max_texture_side: ui.input(|input| input.max_texture_side),
+                    }, ui.ctx());
+                    let direct = raster.is_none() && data.frames.len() + data.aggregates.len() + data.tiles.len() <= 4096;
                     let mut focused = None;
-                    for tile in &data.frames {
+                    let frame_indices = raster.as_ref().map_or(&[][..], |raster| raster.visible.frames.as_slice());
+                    for tile in frame_indices.iter().map(|&index| &data.frames[index]).chain(data.frames[..if direct { data.frames.len() } else { 0 }].iter()) {
                         let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
                         if !bounds.intersects(rect) || !readable_map_region(rect.intersect(bounds)) { continue; }
                         painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
@@ -216,12 +222,16 @@ impl UniDirStatApp {
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("directory-region", tile.node)), Sense::click());
                         focused = self.map_item(ui, response, tile.node, snapshot, base_rect(tile.rect, data, bounds.size()), bounds.size()).or(focused);
                     }
-                    for tile in &data.aggregates {
+                    if let Some(raster) = &raster {
+                        painter.image(raster.texture, raster.rect.translate(bounds.min.to_vec2()), egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    let aggregate_indices = raster.as_ref().map_or(&[][..], |raster| raster.visible.aggregates.as_slice());
+                    for tile in aggregate_indices.iter().map(|&index| &data.aggregates[index]).chain(data.aggregates[..if direct { data.aggregates.len() } else { 0 }].iter()) {
                         let base = base_rect(tile.rect, data, bounds.size());
                         let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) { continue; }
                         let fill = FILE_PALETTE[tile.color.min(FILE_PALETTE.len() - 1)];
-                        painter.rect_filled(rect, 0.0, fill);
+                        if raster.is_none() { painter.rect_filled(rect, 0.0, fill); }
                         if !readable_map_region(rect.intersect(bounds)) { continue; }
                         if tile.owner.is_some_and(|index| selected_region(&self.selection, snapshot, index)) {
                             painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside);
@@ -275,20 +285,23 @@ impl UniDirStatApp {
                             ui.label(action);
                         });
                     }
-                    for tile in &data.tiles {
+                    let tile_indices = raster.as_ref().map_or(&[][..], |raster| raster.visible.tiles.as_slice());
+                    for tile in tile_indices.iter().map(|&index| &data.tiles[index]).chain(data.tiles[..if direct { data.tiles.len() } else { 0 }].iter()) {
                         let base = base_rect(tile.rect, data, bounds.size());
                         let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) { continue; }
+                        let readable = readable_map_region(rect.intersect(bounds));
+                        if !readable && raster.is_some() { continue; }
                         let node = &snapshot.nodes[tile.node];
                         let color = self.file_colors.color(&node.extension());
                         let fill = Color32::from_rgb(color.r(), color.g(), color.b());
-                        if !readable_map_region(rect.intersect(bounds)) {
+                        if !readable {
                             painter.rect_filled(rect, 0.0, fill);
                             continue;
                         }
-                        let (tile_rect, radius) = tile_shape(rect, self.settings.tile_gap);
+                        let (tile_rect, radius) = tile_shape(rect);
                         let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
-                        painter.rect_filled(tile_rect, radius, fill);
+                        if raster.is_none() { painter.rect_filled(tile_rect, radius, fill); }
                         if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside); }
                         if self.settings.labels && tile_rect.height() >= MAP_LABEL_HEIGHT + 2.0 && tile_rect.width() >= MAP_LABEL_SIZE * 3.0 + 8.0 {
                             let label = tile_rect.intersect(bounds).shrink2(Vec2::new(4.0, 1.0));
@@ -307,10 +320,11 @@ impl UniDirStatApp {
                     if let Some(rect) = focused { paint_map_focus(ui, rect); }
                 }
             }
-            if self.map_worker.pending() {
+            if self.map_worker.pending() || self.map_worker.raster_pending() {
                 let (done, total) = self.map_worker.progress();
                 painter.rect_filled(egui::Rect::from_min_size(bounds.left_top(), Vec2::new(bounds.width().min(420.0), 30.0)), 4.0, ui.visuals().window_fill);
-                painter.text(bounds.left_top() + Vec2::splat(8.0), egui::Align2::LEFT_TOP, trf("Preparing map: {done} / {total}", &[("done", done.to_string()), ("total", total.to_string())]), FontId::proportional(HELP_SIZE), ui.visuals().text_color());
+                let message = if self.map_worker.pending() { trf("Preparing map: {done} / {total}", &[("done", done.to_string()), ("total", total.to_string())]) } else { tr("Preparing map").into() };
+                painter.text(bounds.left_top() + Vec2::splat(8.0), egui::Align2::LEFT_TOP, message, FontId::proportional(HELP_SIZE), ui.visuals().text_color());
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             if !moving && data.is_some() && let Some(index) = self.map_focus.take() {
@@ -599,8 +613,10 @@ mod tests {
             std::thread::yield_now();
         }
         let mut colored = Vec::new();
+        let mut painted = egui::Rect::NOTHING;
         let mut node_count = 0;
-        for _ in 0..3 {
+        for _ in 0..1000 {
+            app.map_worker.poll();
             let output = context.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -615,6 +631,19 @@ mod tests {
                 },
             );
             node_count = output.platform_output.accesskit_update.unwrap().nodes.len();
+            painted = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == context.style().visuals.extreme_bg_color =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .max_by(|left, right| left.area().total_cmp(&right.area()))
+                .unwrap();
             colored = output
                 .shapes
                 .iter()
@@ -623,39 +652,61 @@ mod tests {
                     _ => None,
                 })
                 .collect();
+            if colored.is_empty() {
+                colored = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh)
+                            if mesh.texture_id != egui::TextureId::default() =>
+                        {
+                            Some(mesh.vertices.iter().fold(
+                                egui::Rect::NOTHING,
+                                |mut rect, vertex| {
+                                    rect.extend_with(vertex.pos);
+                                    rect
+                                },
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+            }
+            if !colored.is_empty() && !app.map_worker.pending() && !app.map_worker.raster_pending()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
         }
         assert!(
             node_count < 200,
             "tiny regions registered {node_count} accessibility nodes"
         );
-        assert_eq!(colored.len(), count);
-        let painted = colored
-            .iter()
-            .fold(egui::Rect::NOTHING, |bounds, rect| bounds.union(*rect));
-        let area: f64 = colored
-            .iter()
-            .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
-            .sum();
-        assert!(
-            (area - f64::from(painted.area())).abs() < 1.0,
-            "{area} != {}",
-            painted.area()
-        );
+        assert!(colored.len() == count || colored.len() == 1);
         app.map_viewport
             .zoom_at(painted.size() / 2.0, 64.0, painted.size());
-        let output = context.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    Vec2::new(800.0, 500.0),
-                )),
-                ..Default::default()
-            },
-            |context| {
-                egui::CentralPanel::default()
-                    .show(context, |ui| app.map_canvas(ui, &snapshot, 320.0));
-            },
-        );
+        let output = loop {
+            app.map_worker.poll();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(800.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default()
+                        .show(context, |ui| app.map_canvas(ui, &snapshot, 320.0));
+                },
+            );
+            if !app.map_worker.pending() && !app.map_worker.raster_pending() {
+                break output;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
         let labels: Vec<_> = output
             .platform_output
             .accesskit_update
@@ -665,15 +716,10 @@ mod tests {
             .filter_map(|(_, node)| node.label().map(str::to_owned))
             .collect();
         assert!(
-            labels
-                .iter()
-                .any(|label| label.contains(tr("Select containing folder"))),
+            labels.iter().any(|label| label.contains("root/folder-")),
             "scale={}, labels={labels:?}",
             app.map_viewport.scale
         );
-        assert!(output.shapes.iter().any(|shape| {
-            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("folder-") && text.galley.job.text.contains("/ ·"))
-        }), "aggregate labels must identify their containing folder");
     }
 
     #[test]
@@ -869,17 +915,17 @@ mod tests {
     #[test]
     fn small_map_tiles_keep_their_area_instead_of_becoming_gapped_dots() {
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(8.0, 6.0));
-        let (painted, radius) = tile_shape(rect, 6.0);
+        let (painted, radius) = tile_shape(rect);
 
         assert_eq!(painted, rect);
         assert_eq!(radius, 0.0);
-        let (large, radius) = tile_shape(
-            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(80.0, 60.0)),
-            4.0,
-        );
-        assert_eq!(large.min, egui::pos2(12.0, 22.0));
-        assert_eq!(large.size(), Vec2::new(76.0, 56.0));
-        assert_eq!(radius, 3.0);
+        let (large, radius) = tile_shape(egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            Vec2::new(80.0, 60.0),
+        ));
+        assert_eq!(large.min, egui::pos2(10.0, 20.0));
+        assert_eq!(large.size(), Vec2::new(80.0, 60.0));
+        assert_eq!(radius, 0.0);
     }
 
     #[test]

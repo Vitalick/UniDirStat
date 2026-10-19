@@ -215,6 +215,7 @@ mod tests {
         for capture in calls.captures_iter(concat!(
             include_str!("app.rs"),
             include_str!("app/workspace.rs"),
+            include_str!("app/live_scan.rs"),
             include_str!("app/map_canvas.rs")
         )) {
             let key: String =

@@ -12,9 +12,9 @@ Explore space usage with a linked file tree and interactive maps, find large fil
 
 ## Installation
 
-**[Download latest release](https://github.com/Vitalick/UniDirStat/releases)**
+**[Download latest release](https://github.com/Vitalick/UniDirStat/releases/latest)**
 
-Ready-to-install releases are not published yet. Until the first release, [build from source](docs/guide.md#build-and-run). Planned release formats:
+Download the installer for your platform from the release page, or [build from source](docs/guide.md#build-and-run).
 
 | Platform | Architecture | Release asset |
 | --- | --- | --- |

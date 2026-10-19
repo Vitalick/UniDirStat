@@ -29,6 +29,8 @@ The default build includes the native GUI. Multiple folders, mounted volumes, an
 - **Windows:** use Rust MSVC, Visual Studio Build Tools and Inno Setup 6. Run `./scripts/package-windows.ps1` from PowerShell to create the x86_64 setup installer in `target/packages/`.
 - **Linux:** on Debian/Ubuntu, install `pkg-config`, `libxkbcommon-dev`, `libwayland-dev`, and `libgl1-mesa-dev`. Native dialogs require `xdg-desktop-portal` and its desktop backend. `sh scripts/package-linux.sh` builds x86_64 AppImage and `.deb` packages; it also needs `desktop-file-utils`, `patchelf`, `dpkg-deb`, and the `LINUXDEPLOY` executable.
 
+Windows installers currently have no trusted code signature, so Windows may show an unknown publisher or a SmartScreen warning. An icon or version resource does not establish publisher identity. Download only from the project release page.
+
 ## Features
 
 - **Parallel scans:** a bounded worker pool, multiple roots with overlapping paths counted once, progress, pause/resume, cancellation, partial results, full refresh, and selected-folder recalculation. After moving an item to the trash, its parent folder is recalculated automatically. Set workers to `0` for automatic selection or `1..64` explicitly.
@@ -37,10 +39,10 @@ The default build includes the native GUI. Multiple folders, mounted volumes, an
 - **Storage maps:** row-packed hierarchical treemap, readable flame graph, and sunburst with clipped/ellipsized labels, same-color tiny-file groups within each folder, pointer-anchored wheel zoom, drag panning and animated double-click focus. Groups show their actual file count and size; zoom reveals individual files. Extension colors follow global logical-size ranking, stay fixed while exploring folders, and share gray after the first 17 categories. Zoom out and Reset remain explicit controls.
 - **Appearance and language:** persistent System/Light/Dark themes and System/English/Russian choices, visible above Settings in the sidebar or compact top navigation. System checks preferred locales in order for supported English/Russian variants, otherwise English. Missing translations fall back to English. Regular-weight text, compact search and summary, default 80% interface scale adjustable from 75% to 200%, reduced motion and configurable Modified/Share columns. Saved scale choices are retained. Short windows switch between tree and map; Summary and Search remain available.
 - **Responsive interaction:** map generation runs in a cancellable background job with a small cache; returning from Overview to the same file view preserves its rows. File rows, overview previews and maps have context menus. Cmd/Ctrl toggles selection, Shift selects row ranges, and Cmd/Ctrl+A selects the current file list; selected paths can be copied together. Cleanup remains per-item with confirmation.
-- **Visible progress:** scanning shows the last directory, logical/allocated bytes and elapsed time; finalization, indexing, sorting, filtering and result assembly show actual stage counters. Map counters show discovered work rather than a guessed overall percentage. A stalled scan suggests checking filesystem operations or a permission dialog.
+- **Visible progress:** the directory tree fills during whole scans, with a spinner for active subtrees, an orange pause icon for folders waiting for a worker, and a green check only after the entire subtree finishes. Errors and cancelled folders remain marked separately. The Scan time column records metadata work for files and subtree wall time for folders; parallel folder times are not additive. Older snapshots show unavailable timing. Scanning shows the last directory, logical/allocated bytes and elapsed time; finalization, indexing, sorting, filtering and result assembly show actual stage counters. Map counters show discovered work rather than a guessed overall percentage. A stalled scan suggests checking filesystem operations or a permission dialog.
 - **Logical and allocated size:** Unix blocks and Windows allocation metadata where available. Logical bytes count each path; allocated bytes count identified hard links once. Unavailable metadata is marked.
 - **Exact duplicates:** bounded parallel SHA-256 or SHA-512 after grouping by size. Larger same-sized candidates first compare small sampled regions to reject obvious differences; a match still requires a full-file hash. Empty files and identified hard links are not counted as reclaimable duplicate copies. Changed, replaced, or inaccessible files are rejected with errors.
-- **Snapshots and reports:** validated JSON and UniDirStat scan CSV import/export, plus JSON/CSV duplicate and permission-metadata reports. CSV import accepts legacy 11-column and current 13-column scan files; the current format preserves file identity and scan metadata. Reports use temporary files and atomic replacement.
+- **Snapshots and reports:** validated JSON and UniDirStat scan CSV import/export, plus JSON/CSV duplicate and permission-metadata reports. CSV import accepts legacy 11- and 13-column scan files and the current 14-column format; the current format also preserves per-entry scan time. Reports use temporary files and atomic replacement.
 - **Permissions and insights:** read-only status, Unix mode/owner UID, file-age buckets, and configurable estimated monthly storage cost. Inspect native ACL output using `/bin/ls -lde` on macOS, optional `getfacl` on Linux, or `icacls` on Windows; ACL editing is not implemented.
 - **Filesystem monitoring:** native change notifications trigger recalculation after a two-second debounce. Known changes inside the most recently recalculated folder refresh that subtree; other or ambiguous events trigger a full rescan. Watcher failures are shown; OS limits apply to large or network filesystems.
 - **File actions:** open, reveal, copy path, confirmed system-trash cleanup, and atomic file/folder moves within one filesystem without overwriting existing destinations. Empty-folder cleanup checks again that the live folder is empty before trashing it.
@@ -122,22 +124,22 @@ cargo test --no-default-features --locked
 
 [GitHub Actions](../.github/workflows/ci.yml) runs formatting, all-feature tests, Clippy, headless tests and native packaging only when a tag matching `v*` is pushed. Branch pushes and pull requests do not start this workflow, and there is no manual Run workflow trigger. Each run saves versioned installers as workflow artifacts before publishing a release.
 
-The version comes from `[package].version` in `Cargo.toml` and is included in installer filenames and application package metadata. A release tag must match it exactly: `v0.1.1` for version `0.1.1`. A mismatch fails the workflow before packaging.
+The version comes from `[package].version` in `Cargo.toml` and is included in installer filenames and application package metadata. A release tag must match it exactly: `v0.1.2` for version `0.1.2`. A mismatch fails the workflow before packaging.
 
 To publish a release after the repository is on GitHub:
 
 1. Set the new package version in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, run the checks above, and commit both version files on `main`.
-2. Tag that commit and push the branch and tag; for the current `0.1.1` version:
+2. Tag that commit and push the branch and tag; for the current `0.1.2` version:
 
    ```sh
-   git tag -a v0.1.1 -m "UniDirStat 0.1.1"
+   git tag -a v0.1.2 -m "UniDirStat 0.1.2"
    git push origin main
-   git push origin v0.1.1
+   git push origin v0.1.2
    ```
 
 3. Actions builds all five assets, verifies their complete set, uploads them to a draft release and downloads them again to verify SHA-256 hashes. Only then is the release published. Stable tags become Latest; tags such as `v0.2.0-beta.1` become prereleases and do not replace Latest. A failed run does not publish a new release; it may leave a draft for inspection or retry.
 
-Publication uses the built-in `GITHUB_TOKEN`; only the release job has `contents: write`. No personal token is required. If a tagged run fails, fix the problem before creating the next version tag, or use **Re-run failed jobs** when no code changes are needed. A successful retry can publish the release for that same tag. After the first stable release, the download link can point to `/releases/latest`.
+Publication uses the built-in `GITHUB_TOKEN`; only the release job has `contents: write`. No personal token is required. If a tagged run fails, fix the problem before creating the next version tag, or use **Re-run failed jobs** when no code changes are needed. A successful retry can publish the release for that same tag. Published installers are available from the [latest release](https://github.com/Vitalick/UniDirStat/releases/latest).
 
 Successful packaging does not replace runtime validation on each supported platform. Translation contributions: [localization guide](localization.md).
 

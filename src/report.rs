@@ -36,6 +36,8 @@ struct CsvNode {
     file_identity: Option<String>,
     #[serde(default)]
     scan_metadata: Option<String>,
+    #[serde(default)]
+    scan_duration_ns: u64,
 }
 
 fn read_snapshot_bytes(path: &Path) -> Result<Vec<u8>, String> {
@@ -152,6 +154,7 @@ pub fn load_csv(path: &Path) -> Result<Snapshot, String> {
             owner: row.unix_owner,
             file_id: row.file_identity,
             error: row.error,
+            scan_duration_ns: row.scan_duration_ns,
         });
     }
     for index in 0..snapshot.nodes.len() {
@@ -214,6 +217,7 @@ pub fn export_csv(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                     error: None,
                     file_identity: None,
                     scan_metadata: Some(metadata.clone()),
+                    scan_duration_ns: 0,
                 })
                 .map_err(|error| error.to_string())?;
         }
@@ -243,6 +247,7 @@ pub fn export_csv(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                     error: node.error.clone(),
                     file_identity: node.file_id.clone(),
                     scan_metadata: (index == 0).then(|| metadata.clone()),
+                    scan_duration_ns: node.scan_duration_ns,
                 })
                 .map_err(|error| error.to_string())?;
         }
@@ -402,6 +407,82 @@ mod tests {
         fs::write(&output, b"original report").unwrap();
         assert!(export_csv(&output, &snapshot).is_err());
         assert_eq!(fs::read(output).unwrap(), b"original report");
+    }
+
+    #[test]
+    fn scan_timings_roundtrip_through_json_and_csv() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::write(fixture.path().join("data"), b"contents").unwrap();
+        let mut snapshot = scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        snapshot.nodes[0].scan_duration_ns = 1_250_000_000;
+        snapshot.nodes[1].scan_duration_ns = 250_000;
+        for extension in ["json", "csv"] {
+            let output = fixture.path().join(format!("scan.{extension}"));
+            if extension == "csv" {
+                export_csv(&output, &snapshot).unwrap();
+            } else {
+                save_snapshot(&output, &snapshot).unwrap();
+            }
+            let restored = load_snapshot(&output).unwrap();
+            assert_eq!(restored.nodes[0].scan_duration_ns, 1_250_000_000);
+            assert_eq!(restored.nodes[1].scan_duration_ns, 250_000);
+        }
+    }
+
+    #[test]
+    fn legacy_json_without_scan_timings_imports_as_unavailable() {
+        let fixture = tempfile::tempdir().unwrap();
+        let snapshot = scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        for node in value["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("scan_duration_ns");
+        }
+        let output = fixture.path().join("legacy.json");
+        fs::write(&output, serde_json::to_vec(&value).unwrap()).unwrap();
+        let restored = load_snapshot(&output).unwrap();
+        assert_eq!(restored.nodes.len(), 1);
+        assert_eq!(restored.nodes[0].scan_duration_ns, 0);
+    }
+
+    #[test]
+    fn legacy_csv_without_scan_timings_preserves_identity_and_scan_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut snapshot = scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        snapshot.started = 17;
+        snapshot.nodes[0].scan_duration_ns = 1_250_000_000;
+        let current = fixture.path().join("current.csv");
+        export_csv(&current, &snapshot).unwrap();
+        let legacy = fixture.path().join("legacy.csv");
+        let mut reader = csv::Reader::from_path(current).unwrap();
+        let mut writer = csv::Writer::from_path(&legacy).unwrap();
+        writer
+            .write_record(reader.headers().unwrap().iter().take(13))
+            .unwrap();
+        for record in reader.records() {
+            writer
+                .write_record(record.unwrap().iter().take(13))
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        let restored = load_snapshot(&legacy).unwrap();
+        assert_eq!(restored.started, 17);
+        assert_eq!(restored.nodes[0].file_id, snapshot.nodes[0].file_id);
+        assert_eq!(restored.nodes[0].scan_duration_ns, 0);
     }
 
     #[test]

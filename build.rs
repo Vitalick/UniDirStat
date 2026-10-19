@@ -7,6 +7,46 @@ fn main() -> Result<(), Box<dyn Error>> {
     if env::var("CARGO_CFG_TARGET_OS")? != "windows" || env::var_os("CARGO_FEATURE_GUI").is_none() {
         return Ok(());
     }
+    let version = env::var("CARGO_PKG_VERSION")?;
+    let numeric = version
+        .split(['-', '+'])
+        .next()
+        .ok_or("Missing package version")?;
+    let resource = PathBuf::from(env::var_os("OUT_DIR").ok_or("Missing Cargo output directory")?)
+        .join("unidirstat.rc");
+    let icon_resource = fs::read_to_string("packaging/windows/unidirstat.rc")?;
+    fs::write(
+        &resource,
+        format!(
+            r#"{icon_resource}
+1 VERSIONINFO
+FILEVERSION {numeric_version},0
+PRODUCTVERSION {numeric_version},0
+FILEFLAGSMASK 0x3fL
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "UniDirStat disk usage explorer\0"
+            VALUE "FileVersion", "{version}\0"
+            VALUE "InternalName", "unidirstat\0"
+            VALUE "OriginalFilename", "unidirstat.exe\0"
+            VALUE "ProductName", "UniDirStat\0"
+            VALUE "ProductVersion", "{version}\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+"#,
+            numeric_version = numeric.replace('.', ",")
+        ),
+    )?;
     let msvc = env::var("CARGO_CFG_TARGET_ENV")? == "msvc";
     let output = PathBuf::from(env::var_os("OUT_DIR").ok_or("Missing Cargo output directory")?)
         .join(if msvc { "icon.res" } else { "icon.o" });
@@ -39,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         command.arg("-O").arg("coff").arg("-o").arg(&output);
     }
-    let status = command.arg("packaging/windows/unidirstat.rc").status()?;
+    let status = command.arg(resource).status()?;
     if !status.success() {
         return Err("Windows icon resource compilation failed".into());
     }

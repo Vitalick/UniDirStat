@@ -31,6 +31,7 @@ use unidirstat::{
 };
 
 const ACCENT: Color32 = Color32::from_rgb(119, 131, 255);
+mod live_scan;
 mod map_canvas;
 mod workspace;
 use workspace::language_icon;
@@ -40,7 +41,7 @@ const HELP_SIZE: f32 = 14.0;
 const CONTROL_HEIGHT: f32 = 40.0;
 const ROW_HEIGHT: f32 = 38.0;
 const WATCH_PATH_LIMIT: usize = 1024;
-const DEFAULT_COLUMN_WIDTHS: [f32; 4] = [0.0, 132.0, 144.0, 176.0];
+const DEFAULT_COLUMN_WIDTHS: [f32; 5] = [0.0, 132.0, 144.0, 176.0, 120.0];
 const CONTROL_BORDER: [Color32; 2] = [
     Color32::from_rgb(112, 126, 147),
     Color32::from_rgb(99, 115, 140),
@@ -111,7 +112,6 @@ struct Settings {
     show_share: bool,
     threads: usize,
     allocated: bool,
-    tile_gap: f32,
     labels: bool,
     map_view: MapView,
     exclude: String,
@@ -133,7 +133,6 @@ impl Default for Settings {
             show_share: true,
             threads: 0,
             allocated: false,
-            tile_gap: 2.0,
             labels: true,
             map_view: MapView::Treemap,
             exclude: String::new(),
@@ -641,6 +640,7 @@ fn prepare_snapshot(
         error: None,
         refresh_view: None,
     };
+    control.set_completed_live_snapshot(Arc::clone(&prepared.snapshot));
     let analysis = (|| {
         prepared.index = Some(Arc::new(SearchIndex::with_control(
             Arc::clone(&prepared.snapshot),
@@ -664,6 +664,7 @@ fn prepare_snapshot(
     }
     if control.is_cancelled() {
         prepared.index = None;
+        control.clear_live_view();
         if let Some(snapshot) = Arc::get_mut(&mut prepared.snapshot) {
             snapshot.cancelled = true;
         }
@@ -752,7 +753,8 @@ pub struct UniDirStatApp {
     map_viewport: MapViewport,
     map_focus: Option<usize>,
     reveal_row: Option<usize>,
-    column_widths: [f32; 4],
+    column_widths: [f32; 5],
+    live_tree: live_scan::LiveTree,
     summary_open: bool,
     compact_map: bool,
     permission_details: Option<(PathBuf, String)>,
@@ -806,7 +808,6 @@ impl UniDirStatApp {
         settings.font_scale = settings.font_scale.clamp(0.75, 2.0);
         context.egui_ctx.set_fonts(interface_fonts());
         context.egui_ctx.set_zoom_factor(settings.font_scale);
-        settings.tile_gap = settings.tile_gap.clamp(1.0, 6.0);
         settings.price_per_gib = settings.price_per_gib.clamp(0.0, 1000.0);
         let access_open =
             cfg!(target_os = "macos") && !settings.mac_access_reviewed && load.is_none();
@@ -872,6 +873,7 @@ impl UniDirStatApp {
             map_focus: None,
             reveal_row: None,
             column_widths: DEFAULT_COLUMN_WIDTHS,
+            live_tree: live_scan::LiveTree::default(),
             summary_open: false,
             compact_map: false,
             permission_details: None,
@@ -1068,6 +1070,8 @@ impl UniDirStatApp {
         self.search_control.cancel();
         self.search_receiver = None;
         self.control = Arc::default();
+        self.control.enable_live_view();
+        self.live_tree = live_scan::LiveTree::default();
         let roots = self.roots.clone();
         let control = Arc::clone(&self.control);
         let options = self.scan_options();
@@ -1204,6 +1208,7 @@ impl UniDirStatApp {
         if let Some(Ok(result)) = result {
             self.receiver = None;
             let job_kind = self.job_kind.take();
+            self.control.clear_live_view();
             match result {
                 JobResult::Scan(result) | JobResult::Load(result) => {
                     let result =
@@ -1251,7 +1256,14 @@ impl UniDirStatApp {
                                 self.status.push_str(" | ");
                                 self.status.push_str(tr("Read-only snapshot"));
                             }
-                            self.expanded = snapshot.roots.iter().copied().collect();
+                            self.expanded = if job_kind == Some(JobKind::Scan)
+                                && !self.live_tree.expanded.is_empty()
+                            {
+                                std::mem::take(&mut self.live_tree.expanded)
+                            } else {
+                                snapshot.roots.iter().copied().collect()
+                            };
+                            self.live_tree = live_scan::LiveTree::default();
                             self.extensions = prepared.extensions;
                             self.largest = prepared.largest;
                             self.analysis_complete = prepared.analysis_complete;
@@ -1310,6 +1322,7 @@ impl UniDirStatApp {
                             }
                         }
                         Err(error) => {
+                            self.live_tree = live_scan::LiveTree::default();
                             self.rebuild |= job_kind == Some(JobKind::Refresh);
                             if self.refresh_after_cleanup {
                                 self.status =
@@ -2710,9 +2723,6 @@ impl UniDirStatApp {
                 &mut self.settings.labels,
                 tr("Show names and sizes on map tiles"),
             );
-            ui.add(
-                egui::Slider::new(&mut self.settings.tile_gap, 1.0..=6.0).text(tr("Tile spacing")),
-            );
             let allocation_available = self.snapshot.as_ref().is_none_or(|snapshot| {
                 snapshot
                     .roots
@@ -2838,6 +2848,13 @@ impl UniDirStatApp {
             ),
             (tr("Kind"), kind_label(node.kind).to_owned()),
             (tr("Modified"), age(node.modified)),
+            (
+                tr("Scan time"),
+                live_scan::duration_label(
+                    (node.scan_duration_ns > 0)
+                        .then(|| Duration::from_nanos(node.scan_duration_ns)),
+                ),
+            ),
             (
                 tr("Read only"),
                 if node.readonly { tr("Yes") } else { tr("No") }.into(),
@@ -3294,6 +3311,7 @@ impl eframe::App for UniDirStatApp {
             ui.set_opacity(context.animate_value_with_time(egui::Id::new("page-opacity"),1.0,if self.settings.reduced_motion {0.0} else {0.16}));
             self.header(ui);
             if self.page==Page::Settings { egui::ScrollArea::vertical().show(ui,|ui|self.settings_page(ui)); return; }
+            if self.job_kind == Some(JobKind::Scan) && matches!(self.page, Page::Overview | Page::Files) { self.live_files(ui); return; }
             let Some(snapshot)=self.snapshot.as_ref().map(Arc::clone) else { egui::ScrollArea::vertical().show(ui,|ui|self.welcome(ui)); return; };
             if matches!(self.page, Page::Overview | Page::Files | Page::Types | Page::Largest) { self.map_worker.request_summary(self.scope, Arc::clone(&snapshot), ui.ctx()); }
             if self.settings.allocated && snapshot.roots.iter().any(|&index|snapshot.nodes[index].allocated_size.is_none()) { self.settings.allocated=false; self.rebuild=true;  }
@@ -4032,6 +4050,35 @@ mod tests {
         assert!(prepared.index.is_none());
         assert!(prepared.extensions.iter().all(Vec::is_empty));
         assert!(prepared.largest.is_empty());
+    }
+
+    #[test]
+    fn cancelling_preparation_after_live_handoff_marks_the_shared_snapshot_cancelled() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("data.txt"), b"contents").unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let snapshot =
+            scanner::scan(&[fixture.path().into()], &ScanOptions::default(), &control).unwrap();
+        control.pause();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| prepare_snapshot(snapshot, 1, &control));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut shared = false;
+            while Instant::now() < deadline {
+                if control.with_live_view(|view| view.is_finalized()) == Some(true) {
+                    shared = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            control.cancel();
+            let prepared = worker.join().unwrap();
+            assert!(shared);
+            assert!(prepared.snapshot.cancelled);
+            assert!(prepared.index.is_none());
+            assert!(!prepared.analysis_complete);
+        });
     }
 
     #[test]

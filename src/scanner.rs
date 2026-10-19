@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use regex::RegexSet;
 
 use crate::model::{EntryKind, Node, Snapshot};
+
+mod progress;
+use progress::{DirectoryProgress, LiveScan, LiveTotals, duration_ns};
+pub use progress::{DirectoryScanStatus, ScanView};
 
 #[derive(Default, Clone, Debug)]
 pub struct ScanOptions {
@@ -48,6 +52,8 @@ pub struct ScanControl {
     pub work_total: AtomicU64,
     current_path: Mutex<Option<PathBuf>>,
     waiting: AtomicU64,
+    live_enabled: AtomicBool,
+    live: Mutex<Option<LiveScan>>,
 }
 
 impl ScanControl {
@@ -140,14 +146,16 @@ pub(crate) fn thread_pool(threads: usize) -> Result<rayon::ThreadPool, String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Debug)]
 struct ScanState {
     snapshot: Snapshot,
     identities: HashMap<String, usize>,
     directories: HashSet<String>,
+    progress: Option<DirectoryProgress>,
 }
 
 struct Traversal<'control> {
-    state: Mutex<ScanState>,
+    state: Arc<Mutex<ScanState>>,
     excluded: &'control RegexSet,
     options: &'control ScanOptions,
     control: &'control ScanControl,
@@ -176,6 +184,10 @@ fn scan_with_directories(
         .map_err(|error| format!("Invalid exclusion expression: {error}"))?;
     let pool = thread_pool(options.threads)?;
     let started = Instant::now();
+    *control
+        .live
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     control.start_work(0);
     *control
         .current_path
@@ -206,6 +218,7 @@ fn scan_with_directories(
         if !control.checkpoint() {
             break;
         }
+        let metadata_started = Instant::now();
         let absolute: PathBuf = current.join(root).components().collect();
         let normalized = match (absolute.parent(), absolute.file_name()) {
             (Some(parent), Some(name)) => fs::canonicalize(parent).map(|parent| parent.join(name)),
@@ -229,14 +242,16 @@ fn scan_with_directories(
                     fs::canonicalize(&path)
                 };
                 match canonical {
-                    Ok(canonical) => candidates.push((canonical, metadata)),
+                    Ok(canonical) => {
+                        candidates.push((canonical, metadata, metadata_started.elapsed()))
+                    }
                     Err(error) => snapshot.errors.push(format!("{}: {error}", path.display())),
                 }
             }
             Err(error) => snapshot.errors.push(format!("{}: {error}", path.display())),
         }
     }
-    candidates.sort_by(|(left, _), (right, _)| {
+    candidates.sort_by(|(left, _, _), (right, _, _)| {
         left.components()
             .count()
             .cmp(&right.components().count())
@@ -245,7 +260,7 @@ fn scan_with_directories(
     let mut accepted: Vec<(PathBuf, bool)> = Vec::new();
     let mut identities = HashMap::new();
     let mut pending = Vec::new();
-    for (path, metadata) in candidates {
+    for (path, metadata, metadata_duration) in candidates {
         if !control.checkpoint() {
             break;
         }
@@ -257,7 +272,12 @@ fn scan_with_directories(
         let directory = metadata.is_dir() && !is_link(&metadata);
         accepted.push((path.clone(), directory));
         let device = metadata_device(&metadata);
-        let node = node_from_metadata(path, None, &metadata);
+        let metadata_started = Instant::now();
+        let mut node = node_from_metadata(path, None, &metadata);
+        if node.kind != EntryKind::Directory {
+            node.scan_duration_ns =
+                duration_ns(metadata_duration.saturating_add(metadata_started.elapsed()));
+        }
         let Some(index) = insert_node(
             &mut snapshot,
             &mut identities,
@@ -282,12 +302,25 @@ fn scan_with_directories(
             snapshot.errors.join("\n")
         });
     }
+    let progress = Some(DirectoryProgress::new(
+        &snapshot,
+        control.live_enabled.load(Ordering::Acquire),
+    ));
+    let state = Arc::new(Mutex::new(ScanState {
+        snapshot,
+        identities,
+        directories,
+        progress,
+    }));
+    if control.live_enabled.load(Ordering::Acquire) {
+        *control
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(LiveScan::Active(Arc::clone(&state)));
+    }
     let traversal = Traversal {
-        state: Mutex::new(ScanState {
-            snapshot,
-            identities,
-            directories,
-        }),
+        state,
         excluded: &excluded,
         options,
         control,
@@ -300,16 +333,40 @@ fn scan_with_directories(
             }
         })
     });
-    let mut snapshot = traversal
+    control.set_phase(ScanPhase::Finalizing);
+    #[cfg(test)]
+    tests::gate(control, ScanPhase::Finalizing);
+    let mut state = traversal
         .state
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .snapshot;
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = std::mem::replace(
+        &mut state.snapshot,
+        Snapshot {
+            version: 1,
+            roots: Vec::new(),
+            nodes: Vec::new(),
+            errors: Vec::new(),
+            started: 0,
+            elapsed_ms: 0,
+            cancelled: false,
+        },
+    );
+    let progress = state.progress.take();
+    drop(state);
+    if let Some(mut progress) = progress.filter(|_| control.live_enabled.load(Ordering::Acquire)) {
+        progress.stop_timers();
+        *control
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(LiveScan::Detached(progress));
+    }
+    drop(traversal);
     control
         .phase
         .store(ScanPhase::Finalizing as u8, Ordering::Release);
-    #[cfg(test)]
-    tests::gate(control, ScanPhase::Finalizing);
+    snapshot.nodes.shrink_to_fit();
     finalize(&mut snapshot, control);
     snapshot.cancelled = control.is_cancelled();
     snapshot.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -516,28 +573,32 @@ impl Traversal<'_> {
         device: Option<u64>,
     ) {
         const BATCH: usize = 256;
+        #[cfg(test)]
+        tests::directory_gate(self.control, index);
         if !self.control.checkpoint() {
             return;
         }
         let (path, identity) = {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(progress) = &mut state.progress {
+                progress.start(index);
+            }
             (
                 state.snapshot.nodes[index].path.clone(),
                 state.snapshot.nodes[index].file_id.clone(),
             )
         };
-        let metadata = fs::symlink_metadata(&path);
-        if !metadata.as_ref().is_ok_and(|metadata| {
-            metadata.is_dir() && !is_link(metadata) && path_identity(&path, metadata) == identity
-        }) {
-            let message = metadata.err().map_or_else(
+        let unchanged = directory_matches(&path, identity.as_deref());
+        if !unchanged.as_ref().is_ok_and(|unchanged| *unchanged) {
+            let message = unchanged.err().map_or_else(
                 || format!("{}: directory changed during scan", path.display()),
                 |error| format!("{}: {error}", path.display()),
             );
             self.record_error(index, message);
+            self.finish_directory(index);
             return;
         }
         *self
@@ -549,6 +610,7 @@ impl Traversal<'_> {
             Ok(entries) => entries,
             Err(error) => {
                 self.record_error(index, format!("{}: {error}", path.display()));
+                self.finish_directory(index);
                 return;
             }
         };
@@ -561,7 +623,7 @@ impl Traversal<'_> {
                 Ok(entry) => {
                     let path = entry.path();
                     if !self.excluded.is_match(&path.to_string_lossy()) {
-                        paths.push(path);
+                        paths.push((path, entry));
                     }
                 }
                 Err(error) => self.record_error(index, format!("{}: {error}", path.display())),
@@ -578,6 +640,7 @@ impl Traversal<'_> {
         if !paths.is_empty() {
             self.batch(scope, index, device, paths);
         }
+        self.finish_directory(index);
     }
 
     fn batch<'scope>(
@@ -585,15 +648,23 @@ impl Traversal<'_> {
         scope: &rayon::Scope<'scope>,
         parent: usize,
         device: Option<u64>,
-        paths: Vec<PathBuf>,
+        paths: Vec<(PathBuf, fs::DirEntry)>,
     ) {
         let nodes: Vec<_> = paths
             .into_par_iter()
-            .filter_map(|path| {
+            .filter_map(|(path, entry)| {
                 if !self.control.checkpoint() {
                     return None;
                 }
-                let metadata = fs::symlink_metadata(&path);
+                let metadata_started = Instant::now();
+                let metadata = entry.metadata().and_then(|metadata| {
+                    // Windows enumeration omits directory lengths needed by live handle validation.
+                    if cfg!(windows) && metadata.is_dir() {
+                        fs::symlink_metadata(&path)
+                    } else {
+                        Ok(metadata)
+                    }
+                });
                 #[cfg(test)]
                 tests::gate(self.control, ScanPhase::Discovering);
                 if !self.control.checkpoint() {
@@ -604,7 +675,11 @@ impl Traversal<'_> {
                         if self.options.one_file_system && metadata_device(&metadata) != device {
                             None
                         } else {
-                            Some(node_from_metadata(path, Some(parent), &metadata))
+                            let mut node = node_from_metadata(path, Some(parent), &metadata);
+                            if node.kind != EntryKind::Directory {
+                                node.scan_duration_ns = duration_ns(metadata_started.elapsed());
+                            }
+                            Some(node)
                         }
                     }
                     Err(error) => {
@@ -624,6 +699,7 @@ impl Traversal<'_> {
                             owner: None,
                             file_id: None,
                             error,
+                            scan_duration_ns: 0,
                         })
                     }
                 }
@@ -640,9 +716,21 @@ impl Traversal<'_> {
                 snapshot,
                 identities,
                 directories: visited_directories,
+                progress,
             } = &mut *state;
+            let first = snapshot.nodes.len();
             for node in nodes {
                 let directory = node.kind == EntryKind::Directory;
+                let previous_owner = (self.control.live_enabled.load(Ordering::Acquire)
+                    && node.kind == EntryKind::File)
+                    .then_some(())
+                    .and_then(|()| {
+                        let previous = *identities.get(node.file_id.as_ref()?)?;
+                        (previous < first && node.path < snapshot.nodes[previous].path).then_some((
+                            snapshot.nodes[previous].parent,
+                            snapshot.nodes[previous].allocated_size,
+                        ))
+                    });
                 let Some(index) = insert_node(
                     snapshot,
                     identities,
@@ -653,9 +741,31 @@ impl Traversal<'_> {
                     continue;
                 };
                 snapshot.nodes[parent].children.push(index);
+                if let Some(progress) = progress.as_mut() {
+                    progress.insert(&snapshot.nodes[index], parent);
+                    if let Some((mut ancestor, Some(allocated))) = previous_owner {
+                        while let Some(index) = ancestor {
+                            let node = &mut snapshot.nodes[index];
+                            node.allocated_size = node
+                                .allocated_size
+                                .map(|size| size.saturating_sub(allocated));
+                            ancestor = node.parent;
+                        }
+                    }
+                }
                 if directory {
                     directories.push(index);
                 }
+            }
+            if self.control.live_enabled.load(Ordering::Acquire)
+                && let Some(progress) = progress.as_mut()
+            {
+                let mut totals = LiveTotals::default();
+                for node in &snapshot.nodes[first..] {
+                    totals.add(node);
+                }
+                totals.apply(snapshot, parent);
+                progress.revision += 1;
             }
         }
         for index in directories {
@@ -670,6 +780,35 @@ impl Traversal<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.snapshot.nodes[index].error = Some(message.clone());
         state.snapshot.errors.push(message);
+        if let Some(progress) = &mut state.progress {
+            progress.fail(index);
+        }
+    }
+
+    fn finish_directory(&self, index: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ScanState {
+            snapshot, progress, ..
+        } = &mut *state;
+        if let Some(progress) = progress {
+            progress.finish_listing(index);
+            if !self.control.is_cancelled() {
+                progress.finish(snapshot, index);
+            }
+        }
+        #[cfg(test)]
+        let completed = progress
+            .as_ref()
+            .is_some_and(|progress| progress.finished(index));
+        #[cfg(test)]
+        drop(state);
+        #[cfg(test)]
+        if completed {
+            tests::gate(self.control, ScanPhase::Mapping);
+        }
     }
 }
 
@@ -910,6 +1049,7 @@ fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata)
         owner,
         file_id,
         error: None,
+        scan_duration_ns: 0,
     }
 }
 
@@ -923,6 +1063,21 @@ pub(crate) fn metadata_identity(metadata: &Metadata) -> Option<String> {
     {
         let _ = metadata;
         None
+    }
+}
+
+fn directory_matches(path: &Path, identity: Option<&str>) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        let (file, metadata) = open_metadata_file(path)?;
+        Ok(metadata.is_dir() && file_identity(&file, &metadata).as_deref() == identity)
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(metadata.is_dir()
+            && !is_link(&metadata)
+            && path_identity(path, &metadata).as_deref() == identity)
     }
 }
 
@@ -1086,6 +1241,341 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn completed_scan_releases_unused_node_capacity() {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..64 {
+            fs::write(temporary.path().join(format!("file-{index}")), [7; 8]).unwrap();
+        }
+        let snapshot = scan(
+            &[temporary.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.nodes.len(), 65);
+        assert_eq!(snapshot.nodes.capacity(), snapshot.nodes.len());
+        assert_eq!(
+            (snapshot.file_count(), snapshot.total_size(false)),
+            (64, 512)
+        );
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn live_view_exposes_root_before_discovery_and_retains_final_snapshot_by_arc() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("data"), [7; 10]).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_gate(&control, ScanPhase::Discovering);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let visible = control.with_live_view(|view| {
+                (
+                    view.snapshot.nodes.len(),
+                    view.directory_finished(view.snapshot.roots[0]),
+                    view.scan_duration(view.snapshot.roots[0]).is_some(),
+                    view.directory_status(view.snapshot.roots[0]),
+                )
+            });
+            gate.release.wait();
+            assert_eq!(
+                visible,
+                Some((1, false, true, Some(DirectoryScanStatus::Scanning)))
+            );
+            let snapshot = Arc::new(worker.join().unwrap());
+            control.set_completed_live_snapshot(Arc::clone(&snapshot));
+            control
+                .with_live_view(|view| {
+                    assert!(std::ptr::eq(view.snapshot, snapshot.as_ref()));
+                    assert!(view.directory_finished(view.snapshot.roots[0]));
+                    assert_eq!(view.snapshot.total_size(false), 10);
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn live_view_cancelled_directory_remains_incomplete_after_handoff() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("data"), [7; 10]).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_gate(&control, ScanPhase::Discovering);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            control.cancel();
+            gate.release.wait();
+            let snapshot = Arc::new(worker.join().unwrap());
+            control.set_completed_live_snapshot(snapshot);
+            assert_eq!(
+                control.with_live_view(|view| view.directory_finished(view.snapshot.roots[0])),
+                Some(false)
+            );
+            assert_eq!(
+                control.with_live_view(|view| view.directory_status(view.snapshot.roots[0])),
+                Some(Some(DirectoryScanStatus::Cancelled))
+            );
+        });
+    }
+
+    #[test]
+    fn live_view_keeps_parent_pending_until_every_descendant_finishes() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("child")).unwrap();
+        fs::write(temporary.path().join("child/data"), [7; 10]).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_directory_gate(&control, 1);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let pending = control.with_live_view(|view| {
+                (
+                    view.snapshot.nodes.len(),
+                    view.directory_finished(0),
+                    view.directory_finished(1),
+                    view.snapshot.nodes[0].directories,
+                    view.directory_status(0),
+                    view.directory_status(1),
+                )
+            });
+            let active = register_gate(&control, ScanPhase::Discovering);
+            gate.release.wait();
+            active.arrived.wait();
+            let scanning =
+                control.with_live_view(|view| (view.directory_status(0), view.directory_status(1)));
+            active.release.wait();
+            assert_eq!(
+                pending,
+                Some((
+                    2,
+                    false,
+                    false,
+                    1,
+                    Some(DirectoryScanStatus::Queued),
+                    Some(DirectoryScanStatus::Queued)
+                ))
+            );
+            assert_eq!(
+                scanning,
+                Some((
+                    Some(DirectoryScanStatus::Scanning),
+                    Some(DirectoryScanStatus::Scanning)
+                ))
+            );
+            let snapshot = Arc::new(worker.join().unwrap());
+            control.set_completed_live_snapshot(snapshot);
+            assert_eq!(control.with_live_view(|view| view.directory_finished(0) && view.directory_finished(1)), Some(true));
+            assert_eq!(
+                control.with_live_view(|view| view.directory_status(0)),
+                Some(Some(DirectoryScanStatus::Complete))
+            );
+        });
+    }
+
+    #[test]
+    fn scan_records_file_metadata_and_completed_subtree_durations_without_live_view() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("child")).unwrap();
+        fs::write(temporary.path().join("child/data"), [7; 10]).unwrap();
+        let snapshot = scan(
+            &[temporary.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert!(snapshot.nodes.iter().all(|node| node.scan_duration_ns > 0));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.scan_duration_ns <= snapshot.nodes[0].scan_duration_ns)
+        );
+    }
+
+    #[test]
+    fn live_view_marks_completed_child_while_parent_and_sibling_are_pending() {
+        let temporary = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::create_dir(temporary.path().join(name)).unwrap();
+            fs::write(temporary.path().join(name).join("data"), [7; 10]).unwrap();
+        }
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_gate(&control, ScanPhase::Mapping);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let visible = control.with_live_view(|view| {
+                (
+                    view.directory_finished(0),
+                    view.snapshot.nodes[0]
+                        .children
+                        .iter()
+                        .filter(|&&child| view.directory_finished(child))
+                        .count(),
+                    view.snapshot.nodes[0].logical_size,
+                    view.directory_status(0),
+                )
+            });
+            gate.release.wait();
+            assert_eq!(
+                visible,
+                Some((false, 1, 10, Some(DirectoryScanStatus::Queued)))
+            );
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn live_view_does_not_complete_ancestors_of_a_failed_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_directory_gate(&control, 1);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let removed = fs::remove_dir(&child);
+            gate.release.wait();
+            removed.unwrap();
+            let snapshot = Arc::new(worker.join().unwrap());
+            assert!(!snapshot.errors.is_empty());
+            control.set_completed_live_snapshot(snapshot);
+            assert_eq!(control.with_live_view(|view| view.directory_finished(0) || view.directory_finished(1)), Some(false));
+            assert_eq!(
+                control.with_live_view(|view| view.directory_failed(0) && view.directory_failed(1)),
+                Some(true)
+            );
+            assert_eq!(
+                control.with_live_view(|view| (view.directory_status(0), view.directory_status(1))),
+                Some((
+                    Some(DirectoryScanStatus::Failed),
+                    Some(DirectoryScanStatus::Failed)
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn live_view_totals_match_final_totals_before_finalization_with_hardlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::create_dir(temporary.path().join(name)).unwrap();
+        }
+        fs::write(temporary.path().join("a/data"), [7; 100]).unwrap();
+        fs::hard_link(
+            temporary.path().join("a/data"),
+            temporary.path().join("c/alias"),
+        )
+        .unwrap();
+        fs::write(temporary.path().join("b/data"), [7; 50]).unwrap();
+        let control = ScanControl::default();
+        control.enable_live_view();
+        let gate = register_gate(&control, ScanPhase::Finalizing);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let completed = control.with_live_view(|view| view.directory_finished(0));
+            let live = control.with_live_view(|view| {
+                view.snapshot
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.logical_size,
+                            node.allocated_size,
+                            node.files,
+                            node.directories,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            gate.release.wait();
+            assert_eq!(completed, Some(true));
+            let snapshot = worker.join().unwrap();
+            let finalized = snapshot
+                .nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.logical_size,
+                        node.allocated_size,
+                        node.files,
+                        node.directories,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(live, Some(finalized));
+        });
+    }
+
+    #[test]
     fn work_progress_advances_monotonically_without_changing_scan_counters() {
         let control = ScanControl::default();
         control.visited.store(17, Ordering::Relaxed);
@@ -1147,6 +1637,43 @@ pub(crate) mod tests {
     }
 
     type GateMap = HashMap<usize, (ScanPhase, Arc<Gate>)>;
+    type DirectoryGateMap = HashMap<usize, (usize, Arc<Gate>)>;
+
+    fn directory_gates() -> &'static Mutex<DirectoryGateMap> {
+        static GATES: OnceLock<Mutex<DirectoryGateMap>> = OnceLock::new();
+        GATES.get_or_init(Mutex::default)
+    }
+
+    fn register_directory_gate(control: &ScanControl, index: usize) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            arrived: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        directory_gates().lock().unwrap().insert(
+            control as *const ScanControl as usize,
+            (index, Arc::clone(&gate)),
+        );
+        gate
+    }
+
+    pub(super) fn directory_gate(control: &ScanControl, index: usize) {
+        let gate = {
+            let mut gates = directory_gates().lock().unwrap();
+            let key = control as *const ScanControl as usize;
+            if gates
+                .get(&key)
+                .is_some_and(|(expected, _)| *expected == index)
+            {
+                gates.remove(&key).map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.arrived.wait();
+            gate.release.wait();
+        }
+    }
 
     fn gates() -> &'static Mutex<GateMap> {
         static GATES: OnceLock<Mutex<GateMap>> = OnceLock::new();
@@ -1593,6 +2120,100 @@ pub(crate) mod tests {
             Some(original_id)
         );
     }
+    #[cfg(windows)]
+    #[test]
+    fn descent_rejects_a_directory_replaced_with_another_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let control = ScanControl::default();
+        let gate = register_directory_gate(&control, 1);
+        let snapshot = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().into()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+                .unwrap()
+            });
+            gate.arrived.wait();
+            let replaced = (|| -> std::io::Result<()> {
+                fs::rename(&selected, temporary.path().join("original"))?;
+                fs::create_dir(&selected)?;
+                fs::write(selected.join("replacement-data"), [7; 8192])
+            })();
+            gate.release.wait();
+            let snapshot = worker.join().unwrap();
+            replaced.unwrap();
+            snapshot
+        });
+        assert_eq!((snapshot.file_count(), snapshot.total_size(false)), (0, 0));
+        assert!(
+            snapshot
+                .errors
+                .iter()
+                .any(|error| error.contains("directory changed during scan"))
+        );
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_reads_windows_directories_with_nonresident_directory_data() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("wide");
+        fs::create_dir(&directory).unwrap();
+        for index in 0..128 {
+            fs::write(directory.join(format!("file-{index:04}")), [7; 8]).unwrap();
+        }
+        let snapshot = scan(
+            &[temporary.path().to_owned()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (snapshot.file_count(), snapshot.total_size(false)),
+            (128, 1024)
+        );
+        assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_rejects_a_directory_replaced_by_a_file_after_enumeration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let control = ScanControl::default();
+        let gate = register_gate(&control, ScanPhase::Discovering);
+        let snapshot = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan(
+                    &[temporary.path().to_owned()],
+                    &ScanOptions {
+                        threads: 1,
+                        ..ScanOptions::default()
+                    },
+                    &control,
+                )
+            });
+            gate.arrived.wait();
+            fs::remove_dir(&selected).unwrap();
+            fs::write(&selected, [7; 8192]).unwrap();
+            gate.release.wait();
+            worker.join().unwrap().unwrap()
+        });
+        assert_eq!((snapshot.file_count(), snapshot.total_size(false)), (0, 0));
+        assert!(!snapshot.errors.is_empty());
+        assert!(snapshot.validate().is_ok());
+    }
+
     #[cfg(windows)]
     #[test]
     fn scan_uses_windows_allocation_and_deduplicates_hardlinks() {

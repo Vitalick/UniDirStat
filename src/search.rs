@@ -77,8 +77,7 @@ pub struct SearchIndex {
 }
 
 struct CachedPath {
-    value: String,
-    name_start: usize,
+    value: Box<str>,
     extension_start: Option<usize>,
 }
 
@@ -91,20 +90,20 @@ impl CachedPath {
             .unwrap_or(node.path.as_os_str())
             .to_string_lossy()
             .to_lowercase();
+        let name_start = value.len() - name.len();
         let extension_start = node
             .path
             .extension()
             .filter(|extension| !extension.is_empty())
-            .map(|extension| value.len() - extension.to_string_lossy().to_lowercase().len());
+            .map(|extension| name.len() - extension.to_string_lossy().to_lowercase().len());
         Self {
-            name_start: value.len() - name.len(),
-            value,
+            value: value[name_start..].into(),
             extension_start,
         }
     }
 
     fn name(&self) -> &str {
-        &self.value[self.name_start..]
+        &self.value
     }
 
     fn extension(&self) -> &str {
@@ -258,21 +257,31 @@ impl SearchIndex {
                     }
                     let node = &self.snapshot.nodes[index];
                     let path = &self.paths[index];
-                    let haystack = match query.target {
-                        SearchTarget::Path => path.value.as_str(),
-                        SearchTarget::Name => path.name(),
-                    };
                     let text_matches = if let Some(regex) = &regex {
                         let original = match query.target {
                             SearchTarget::Path => node.path.to_str(),
                             SearchTarget::Name => {
                                 node.path.file_name().and_then(|name| name.to_str())
                             }
-                        }
-                        .unwrap_or(haystack);
-                        regex.is_match(original)
+                        };
+                        original.map_or_else(
+                            || match query.target {
+                                SearchTarget::Path => {
+                                    regex.is_match(&node.path.to_string_lossy().to_lowercase())
+                                }
+                                SearchTarget::Name => regex.is_match(path.name()),
+                            },
+                            |original| regex.is_match(original),
+                        )
+                    } else if text.is_empty() {
+                        true
                     } else {
-                        haystack.contains(&text)
+                        match query.target {
+                            SearchTarget::Path => {
+                                node.path.to_string_lossy().to_lowercase().contains(&text)
+                            }
+                            SearchTarget::Name => path.name().contains(&text),
+                        }
                     };
                     let size = if query.allocated {
                         node.allocated_size
@@ -329,9 +338,27 @@ impl SearchIndex {
             }
         }
         let pool = self.pool.as_ref().map_err(|error| error.clone())?;
+        // Full paths are temporary sort keys; keeping them in the index duplicates every directory prefix.
+        let path_keys: Result<Vec<_>, String> = pool.install(|| {
+            indices
+                .par_iter()
+                .map(|&index| {
+                    checkpoint(control)?;
+                    Ok(self.snapshot.nodes[index]
+                        .path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .into_boxed_str())
+                })
+                .collect()
+        });
+        let path_keys = path_keys?;
+        let mut positions: Vec<_> = (0..indices.len()).collect();
         let compare = |left: &usize, right: &usize| {
-            let left_node = &self.snapshot.nodes[*left];
-            let right_node = &self.snapshot.nodes[*right];
+            let left_index = indices[*left];
+            let right_index = indices[*right];
+            let left_node = &self.snapshot.nodes[left_index];
+            let right_node = &self.snapshot.nodes[right_index];
             let order = match query.sort {
                 SearchSort::Size => ordered(
                     if query.allocated {
@@ -347,7 +374,9 @@ impl SearchIndex {
                     query.descending,
                 ),
                 SearchSort::Name => {
-                    let order = self.paths[*left].name().cmp(self.paths[*right].name());
+                    let order = self.paths[left_index]
+                        .name()
+                        .cmp(self.paths[right_index].name());
                     if query.descending {
                         order.reverse()
                     } else {
@@ -359,10 +388,15 @@ impl SearchIndex {
                 }
             };
             order
-                .then_with(|| self.paths[*left].value.cmp(&self.paths[*right].value))
-                .then_with(|| left.cmp(right))
+                .then_with(|| path_keys[*left].cmp(&path_keys[*right]))
+                .then_with(|| left_index.cmp(&right_index))
         };
-        sort_cancellable(indices, &compare, pool, control)
+        sort_cancellable(&mut positions, &compare, pool, control)?;
+        *indices = positions
+            .into_iter()
+            .map(|position| indices[position])
+            .collect();
+        Ok(())
     }
 }
 
@@ -460,6 +494,173 @@ mod tests {
 
     use super::*;
     use crate::scanner::{ScanOptions, scan};
+
+    #[test]
+    fn search_cache_retains_the_filename_without_its_directory_prefix() {
+        let (_directory, snapshot) = fixture();
+        let mut node = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.kind == EntryKind::File)
+            .unwrap()
+            .clone();
+        node.path = "C:/Users/vital/Documents/Projects/Training/Batch/images/Документ.İΣ.RS".into();
+        let cached = CachedPath::new(&node);
+        assert_eq!(&*cached.value, "документ.i\u{307}σ.rs");
+        assert_eq!(cached.extension(), "rs");
+        assert!(std::mem::size_of::<CachedPath>() <= 32);
+    }
+
+    #[test]
+    fn temporary_sort_keys_preserve_full_path_ties_and_unicode_name_order() {
+        let (_directory, snapshot) = fixture();
+        let mut snapshot = Arc::try_unwrap(snapshot).unwrap();
+        let template = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.kind == EntryKind::File)
+            .unwrap()
+            .clone();
+        let paths = [
+            "C:/Data/zeta/Документ.İΣ.RS",
+            "C:/Data/alpha/документ.iσ.rs",
+            "C:/Data/ΓΣ/Σ",
+            "C:/Data/ΓΣ/Name.PNG",
+            "C:/Data/Тест",
+            "C:/Data/δ/İΣ.RS",
+            "C:/Data/ALPHA/документ.iσ.rs",
+        ];
+        snapshot.nodes.truncate(1);
+        snapshot.nodes[0].children = (1..=paths.len()).collect();
+        snapshot.nodes.extend(paths.into_iter().map(|path| Node {
+            path: path.into(),
+            parent: Some(0),
+            children: Vec::new(),
+            logical_size: 1,
+            modified: None,
+            ..template.clone()
+        }));
+        let snapshot = Arc::new(snapshot);
+        let index = SearchIndex::new(Arc::clone(&snapshot));
+        let lowercase_paths: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .map(|node| node.path.to_string_lossy().to_lowercase())
+            .collect();
+        for sort in [SearchSort::Size, SearchSort::Name, SearchSort::Modified] {
+            for descending in [false, true] {
+                let query = SearchQuery {
+                    sort,
+                    descending,
+                    ..SearchQuery::default()
+                };
+                let mut actual: Vec<_> = (1..snapshot.nodes.len()).rev().collect();
+                let mut expected = actual.clone();
+                expected.sort_unstable_by(|&left, &right| {
+                    let order = if sort == SearchSort::Name {
+                        let suffix = |node: usize| {
+                            let name_length = snapshot.nodes[node]
+                                .path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .len();
+                            &lowercase_paths[node][lowercase_paths[node].len() - name_length..]
+                        };
+                        let order = suffix(left).cmp(suffix(right));
+                        if descending { order.reverse() } else { order }
+                    } else {
+                        std::cmp::Ordering::Equal
+                    };
+                    order
+                        .then_with(|| lowercase_paths[left].cmp(&lowercase_paths[right]))
+                        .then_with(|| left.cmp(&right))
+                });
+                index
+                    .sort_nodes(&mut actual, &query, &ScanControl::default())
+                    .unwrap();
+                assert_eq!(actual, expected, "{sort:?}, descending={descending}");
+            }
+        }
+        for (text, target) in [
+            ("ΓΣ", SearchTarget::Path),
+            ("İΣ", SearchTarget::Name),
+            ("ДОКУМЕНТ", SearchTarget::Name),
+        ] {
+            let query = SearchQuery {
+                text: text.into(),
+                target,
+                ..SearchQuery::default()
+            };
+            let actual = index.search(&query, &ScanControl::default()).unwrap();
+            let expected: Vec<_> = (0..snapshot.nodes.len())
+                .filter(|&node| {
+                    let haystack = match target {
+                        SearchTarget::Path => lowercase_paths[node].as_str(),
+                        SearchTarget::Name => index.paths[node].name(),
+                    };
+                    haystack.contains(&text.to_lowercase())
+                })
+                .collect();
+            let mut actual = actual;
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{text}, {target:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn regex_search_keeps_lossy_path_and_name_fallbacks() {
+        use std::os::windows::ffi::OsStringExt;
+        let (_directory, snapshot) = fixture();
+        let mut snapshot = Arc::try_unwrap(snapshot).unwrap();
+        let file = snapshot
+            .nodes
+            .iter()
+            .position(|node| node.kind == EntryKind::File)
+            .unwrap();
+        snapshot.nodes[file].path =
+            std::ffi::OsString::from_wide(&[67, 58, 47, 65, 47, 0xD800, 46, 82, 83]).into();
+        let index = SearchIndex::new(Arc::new(snapshot));
+        for target in [SearchTarget::Path, SearchTarget::Name] {
+            let found = index
+                .search(
+                    &SearchQuery {
+                        text: "(?-i:�\\.rs)$".into(),
+                        regex: true,
+                        target,
+                        ..SearchQuery::default()
+                    },
+                    &ScanControl::default(),
+                )
+                .unwrap();
+            assert_eq!(found, [file]);
+        }
+    }
+
+    #[test]
+    fn inline_case_sensitive_regex_flags_match_original_valid_names_and_paths() {
+        let (_directory, snapshot) = fixture();
+        let index = SearchIndex::new(snapshot);
+        for target in [SearchTarget::Path, SearchTarget::Name] {
+            for (text, count) in [(r"(?-i:Документ\.RS)$", 1), (r"(?-i:документ\.rs)$", 0)]
+            {
+                let found = index
+                    .search(
+                        &SearchQuery {
+                            text: text.into(),
+                            regex: true,
+                            target,
+                            ..SearchQuery::default()
+                        },
+                        &ScanControl::default(),
+                    )
+                    .unwrap();
+                assert_eq!(found.len(), count, "{text}, {target:?}");
+            }
+        }
+    }
 
     #[test]
     fn indexing_and_search_report_complete_work_without_resetting_scan_totals() {

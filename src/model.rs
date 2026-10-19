@@ -41,6 +41,9 @@ pub struct Node {
     pub owner: Option<u32>,
     pub file_id: Option<String>,
     pub error: Option<String>,
+    /// Metadata time for files; subtree wall time for folders. Zero means unavailable.
+    #[serde(default)]
+    pub scan_duration_ns: u64,
 }
 
 impl Node {
@@ -310,6 +313,7 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    scan_duration_ns: 0,
                 },
                 Node {
                     path: root.join("photo.JPG"),
@@ -326,6 +330,7 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    scan_duration_ns: 0,
                 },
             ],
             errors: vec![],

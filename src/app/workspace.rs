@@ -60,7 +60,12 @@ pub(super) fn info_button(ui: &mut egui::Ui, text: &str) {
     response.on_hover_text(tr("Information"));
 }
 
-fn triangle(painter: &egui::Painter, center: egui::Pos2, direction: Vec2, color: Color32) {
+pub(super) fn triangle(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    direction: Vec2,
+    color: Color32,
+) {
     let perpendicular = Vec2::new(-direction.y, direction.x);
     let points = vec![
         center - direction * 2.0 + perpendicular * 4.0,
@@ -70,7 +75,12 @@ fn triangle(painter: &egui::Painter, center: egui::Pos2, direction: Vec2, color:
     painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
-fn file_icon(painter: &egui::Painter, rect: egui::Rect, directory: bool, color: Color32) {
+pub(super) fn file_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    directory: bool,
+    color: Color32,
+) {
     if directory {
         painter.rect_filled(
             egui::Rect::from_min_size(rect.min, Vec2::new(8.0, 5.0)),
@@ -148,7 +158,7 @@ fn tree_panel_heights(available: f32) -> (f32, f32, f32) {
     (minimum, maximum, (available * 0.5).clamp(minimum, maximum))
 }
 
-fn focus_outline(ui: &egui::Ui, response: &egui::Response) {
+pub(super) fn focus_outline(ui: &egui::Ui, response: &egui::Response) {
     if response.has_focus() {
         ui.painter().rect_stroke(
             response.rect.shrink(1.0),
@@ -568,6 +578,7 @@ impl UniDirStatApp {
             true,
             self.settings.show_modified,
             self.settings.show_share,
+            true,
         ];
         let remaining: f32 = self
             .column_widths
@@ -587,6 +598,7 @@ impl UniDirStatApp {
             self.column_widths[1],
             self.column_widths[2],
             self.column_widths[3],
+            self.column_widths[4],
         ];
         let table_width = widths
             .iter()
@@ -609,6 +621,7 @@ impl UniDirStatApp {
                     (tr("Size"), Some(SortBy::Size)),
                     (tr("Modified"), Some(SortBy::Modified)),
                     (tr("Share"), None),
+                    (tr("Scan time"), None),
                 ]
                 .into_iter()
                 .enumerate()
@@ -664,6 +677,13 @@ impl UniDirStatApp {
                             )
                         });
                         focus_outline(ui, &response);
+                    } else if column == 4 {
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label)
+                        });
+                        response.clone().on_hover_text(tr(
+                            "Folder time includes its descendants. Parallel times are not added together.",
+                        ));
                     }
                     if response.clicked()
                         && let Some(sort) = sort
@@ -857,7 +877,7 @@ impl UniDirStatApp {
                         };
                         paint_label(ui, label_rect, &label, ui.visuals().text_color(), BODY_SIZE);
                         let mut left = rect.left() + name_width;
-                        for column in 1..4 {
+                        for column in 1..widths.len() {
                             if !visible[column] {
                                 continue;
                             }
@@ -884,7 +904,7 @@ impl UniDirStatApp {
                                         HELP_SIZE,
                                     );
                                 }
-                                _ => {
+                                3 => {
                                     let share =
                                         parent_share(snapshot, index, self.settings.allocated);
                                     let bar = egui::Rect::from_min_max(
@@ -911,6 +931,25 @@ impl UniDirStatApp {
                                         FontId::monospace(HELP_SIZE),
                                         muted(ui),
                                     );
+                                }
+                                _ => {
+                                    let duration = live_scan::duration_label(
+                                        (node.scan_duration_ns > 0)
+                                            .then(|| Duration::from_nanos(node.scan_duration_ns)),
+                                    );
+                                    ui.put(
+                                        cell.shrink2(Vec2::new(8.0, 0.0)),
+                                        egui::Label::new(
+                                            RichText::new(duration)
+                                                .monospace()
+                                                .size(HELP_SIZE)
+                                                .color(muted(ui)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(tr(
+                                        "Folder time includes its descendants. Parallel times are not added together.",
+                                    ));
                                 }
                             }
                             left += widths[column];
@@ -1071,6 +1110,30 @@ mod tests {
         assert!(app.map_worker.summary().is_some());
         context.set_zoom_factor(1.0);
         (fixture, app, snapshot)
+    }
+
+    #[test]
+    fn final_file_table_displays_recorded_scan_time() {
+        let context = egui::Context::default();
+        let (_fixture, mut app, mut snapshot) = summary_fixture(&context);
+        let root = snapshot.roots[0];
+        Arc::make_mut(&mut snapshot).nodes[root].scan_duration_ns = 1_250_000_000;
+        app.rows = vec![(root, 0)];
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1000.0, 350.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.file_table(ui, &snapshot));
+            },
+        );
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "0:01.2")
+        }));
     }
 
     #[test]

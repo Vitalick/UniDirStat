@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::file_colors::FileColors;
+use crate::file_colors::{FILE_PALETTE, FileColors};
 use eframe::egui;
 use unidirstat::{
     analysis::ExtensionStats,
@@ -84,8 +84,52 @@ struct MapTask {
     receiver: Receiver<Option<MapData>>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct RasterView {
+    pub size: egui::Vec2,
+    pub scale: f32,
+    pub offset: egui::Vec2,
+    pub pixels_per_point: f32,
+    pub max_texture_side: usize,
+}
+
+struct Raster {
+    data: Weak<MapData>,
+    view: RasterView,
+    texture: egui::TextureHandle,
+    visible: Arc<VisibleRegions>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct VisibleRegions {
+    pub frames: Vec<usize>,
+    pub aggregates: Vec<usize>,
+    pub tiles: Vec<usize>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct RasterPaint {
+    pub texture: egui::TextureId,
+    pub rect: egui::Rect,
+    pub visible: Arc<VisibleRegions>,
+}
+
+struct RasterPixels {
+    image: egui::ColorImage,
+    visible: VisibleRegions,
+}
+
+struct RasterTask {
+    data: Weak<MapData>,
+    view: RasterView,
+    control: Arc<LayoutControl>,
+    receiver: Receiver<Option<(egui::TextureHandle, Arc<VisibleRegions>)>>,
+}
+
 #[derive(Default)]
 pub struct MapWorker {
+    raster: Option<Raster>,
+    raster_running: Option<RasterTask>,
     colors: Arc<FileColors>,
     snapshot: Option<Weak<Snapshot>>,
     requested: Option<MapKey>,
@@ -104,6 +148,103 @@ pub struct MapWorker {
 }
 
 impl MapWorker {
+    pub(crate) fn raster(
+        &mut self,
+        data: &Arc<MapData>,
+        snapshot: &Arc<Snapshot>,
+        view: RasterView,
+        context: &egui::Context,
+    ) -> Option<RasterPaint> {
+        if let Some(task) = &self.raster_running {
+            let result = task.receiver.try_recv();
+            if !matches!(result, Err(TryRecvError::Empty))
+                && let Some(task) = self.raster_running.take()
+                && !task.control.is_cancelled()
+                && let Ok(Some((texture, visible))) = result
+            {
+                self.raster = Some(Raster {
+                    data: task.data,
+                    view: task.view,
+                    texture,
+                    visible,
+                });
+            }
+        }
+        let identity = Arc::downgrade(data);
+        let ready = self
+            .raster
+            .as_ref()
+            .is_some_and(|raster| raster.data.ptr_eq(&identity) && raster.view == view);
+        if !ready {
+            if let Some(task) = &self.raster_running {
+                if !task.data.ptr_eq(&identity) || task.view != view {
+                    task.control.cancel();
+                }
+            } else {
+                let control = Arc::new(LayoutControl::default());
+                let worker_control = Arc::clone(&control);
+                let worker_data = Arc::clone(data);
+                let snapshot = Arc::clone(snapshot);
+                let colors = Arc::clone(&self.colors);
+                let context = context.clone();
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("map-raster".into())
+                        .spawn(move || {
+                            let texture = render_raster(
+                                &worker_data,
+                                &snapshot,
+                                &colors,
+                                view,
+                                &worker_control,
+                            )
+                            .filter(|_| !worker_control.is_cancelled())
+                            .map(|pixels| {
+                                let texture = context.load_texture(
+                                    "map-raster",
+                                    pixels.image,
+                                    egui::TextureOptions::NEAREST,
+                                );
+                                (texture, Arc::new(pixels.visible))
+                            });
+                            let _ = sender.send(texture);
+                            context.request_repaint();
+                        });
+                match spawned {
+                    Ok(_) => {
+                        self.raster_running = Some(RasterTask {
+                            data: identity.clone(),
+                            view,
+                            control,
+                            receiver,
+                        })
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+        }
+        self.raster
+            .as_ref()
+            .filter(|raster| raster.data.ptr_eq(&identity))
+            .map(|raster| {
+                let ratio = view.size / raster.view.size * (view.scale / raster.view.scale);
+                let rect = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO + view.offset - raster.view.offset * ratio,
+                    raster.view.size * ratio,
+                );
+                RasterPaint {
+                    texture: raster.texture.id(),
+                    rect,
+                    visible: Arc::clone(&raster.visible),
+                }
+            })
+    }
+
+    pub(crate) fn raster_pending(&self) -> bool {
+        self.raster_running.is_some()
+    }
+
     pub(crate) fn set_colors(&mut self, colors: Arc<FileColors>) {
         if Arc::ptr_eq(&self.colors, &colors) {
             return;
@@ -343,6 +484,10 @@ impl MapWorker {
     }
 
     fn clear_geometry(&mut self) {
+        self.raster = None;
+        if let Some(task) = &self.raster_running {
+            task.control.cancel();
+        }
         if let Some(task) = &self.running {
             task.control.cancel();
         }
@@ -370,11 +515,125 @@ impl MapWorker {
 
 impl Drop for MapWorker {
     fn drop(&mut self) {
+        if let Some(task) = &self.raster_running {
+            task.control.cancel();
+        }
         if let Some(task) = &self.running {
             task.control.cancel();
         }
         if let Some(task) = &self.summary_running {
             task.control.cancel();
+        }
+    }
+}
+
+fn render_raster(
+    data: &MapData,
+    snapshot: &Snapshot,
+    colors: &FileColors,
+    view: RasterView,
+    control: &LayoutControl,
+) -> Option<RasterPixels> {
+    // Bound the cache to the viewport, even when geometry is refined for deep zoom.
+    let size = [
+        (view.size.x * view.pixels_per_point)
+            .ceil()
+            .clamp(1.0, view.max_texture_side.clamp(1, 4096) as f32) as usize,
+        (view.size.y * view.pixels_per_point)
+            .ceil()
+            .clamp(1.0, view.max_texture_side.clamp(1, 4096) as f32) as usize,
+    ];
+    let mut image = egui::ColorImage::filled(size, egui::Color32::TRANSPARENT);
+    let mut visible = VisibleRegions::default();
+    let pixels = egui::vec2(size[0] as f32, size[1] as f32) / view.size;
+    let scale = view.size / egui::vec2(data.width.max(1) as f32, data.height.max(1) as f32)
+        * view.scale
+        * pixels;
+    let offset = view.offset * pixels;
+    let readable = |rect: layout::Rect| {
+        let scale = scale / pixels;
+        let rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO + view.offset + egui::vec2(rect.x, rect.y) * scale,
+            egui::vec2(rect.width, rect.height) * scale,
+        )
+        .intersect(egui::Rect::from_min_size(egui::Pos2::ZERO, view.size));
+        rect.width() >= 4.0 && rect.height() >= 4.0 && rect.area() >= 24.0
+    };
+    let bounds = |rect: layout::Rect| {
+        [
+            (rect.x * scale.x + offset.x).round() as i32,
+            (rect.y * scale.y + offset.y).round() as i32,
+            ((rect.x + rect.width) * scale.x + offset.x).round() as i32,
+            ((rect.y + rect.height) * scale.y + offset.y).round() as i32,
+        ]
+    };
+    for (index, tile) in data.frames.iter().enumerate() {
+        if control.is_cancelled() {
+            return None;
+        }
+        if readable(tile.rect) {
+            visible.frames.push(index);
+        }
+    }
+    for (index, tile) in data.aggregates.iter().enumerate() {
+        if control.is_cancelled() {
+            return None;
+        }
+        if readable(tile.rect) {
+            visible.aggregates.push(index);
+        }
+        raster_rect(
+            &mut image,
+            bounds(tile.rect),
+            FILE_PALETTE[tile.color.min(FILE_PALETTE.len() - 1)],
+            false,
+        );
+    }
+    for (index, tile) in data.tiles.iter().enumerate() {
+        if control.is_cancelled() {
+            return None;
+        }
+        let rect = bounds(tile.rect);
+        if rect[2] <= 0 || rect[3] <= 0 || rect[0] >= size[0] as i32 || rect[1] >= size[1] as i32 {
+            continue;
+        }
+        if readable(tile.rect) {
+            visible.tiles.push(index);
+        }
+        let color = colors.color(&snapshot.nodes[tile.node].extension());
+        raster_rect(&mut image, rect, color, true);
+    }
+    Some(RasterPixels { image, visible })
+}
+
+fn raster_rect(image: &mut egui::ColorImage, rect: [i32; 4], fill: egui::Color32, emboss: bool) {
+    let [width, height] = image.size;
+    let [left, top, right, bottom] = rect;
+    let x0 = left.clamp(0, width as i32) as usize;
+    let x1 = right.clamp(0, width as i32) as usize;
+    let y0 = top.clamp(0, height as i32) as usize;
+    let y1 = bottom.clamp(0, height as i32) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let light = fill.lerp_to_gamma(egui::Color32::WHITE, 0.12);
+    let dark = fill.lerp_to_gamma(egui::Color32::BLACK, 0.18);
+    let emboss = emboss && right - left >= 2 && bottom - top >= 2;
+    for y in y0..y1 {
+        let row = &mut image.pixels[y * width + x0..y * width + x1];
+        let color = if emboss && y as i32 == top {
+            light
+        } else if emboss && y as i32 == bottom - 1 {
+            dark
+        } else {
+            fill
+        };
+        row.fill(color);
+        if emboss && left >= 0 {
+            row[0] = light;
+        }
+        if emboss && right <= width as i32 {
+            row[x1 - x0 - 1] = dark;
         }
     }
 }
@@ -551,6 +810,218 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn embossed_neighbors_cover_the_canvas_without_gaps_or_gloss() {
+        let fill = FILE_PALETTE[0];
+        let mut image = egui::ColorImage::filled([8, 4], egui::Color32::TRANSPARENT);
+        raster_rect(&mut image, [0, 0, 4, 4], fill, true);
+        raster_rect(&mut image, [4, 0, 8, 4], fill, true);
+        assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+        assert_eq!(image[(1, 1)], fill);
+        assert_eq!(image[(2, 2)], fill);
+        assert_ne!(image[(3, 1)], image[(4, 1)]);
+        assert_eq!(
+            image[(0, 1)],
+            fill.lerp_to_gamma(egui::Color32::WHITE, 0.12)
+        );
+    }
+
+    #[test]
+    fn clipped_emboss_does_not_add_edges_at_the_viewport_boundary() {
+        let fill = FILE_PALETTE[0];
+        let mut image = egui::ColorImage::filled([3, 3], egui::Color32::TRANSPARENT);
+        raster_rect(&mut image, [-2, -2, 5, 5], fill, true);
+        assert!(image.pixels.iter().all(|pixel| *pixel == fill));
+        raster_rect(&mut image, [1, 1, 2, 2], FILE_PALETTE[1], true);
+        assert_eq!(image[(1, 1)], FILE_PALETTE[1]);
+    }
+
+    #[test]
+    fn raster_stays_viewport_sized_at_deep_zoom() {
+        let data = MapData {
+            width: 64_000,
+            height: 32_000,
+            ..MapData::default()
+        };
+        let image = render_raster(
+            &data,
+            &snapshot(),
+            &FileColors::default(),
+            RasterView {
+                size: egui::vec2(1000.0, 500.0),
+                scale: 64.0,
+                offset: egui::vec2(-2000.0, -1000.0),
+                pixels_per_point: 1.0,
+                max_texture_side: 2048,
+            },
+            &LayoutControl::default(),
+        )
+        .unwrap()
+        .image;
+        assert_eq!(image.size, [1000, 500]);
+        assert_eq!(
+            image.pixels.len() * std::mem::size_of::<egui::Color32>(),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn raster_caches_only_readable_viewport_indices_and_replaces_them_after_pan() {
+        let data = MapData {
+            width: 10_000,
+            height: 1000,
+            tiles: (0..100_000)
+                .map(|index| layout::Tile {
+                    node: 1,
+                    rect: layout::Rect {
+                        x: (index % 1000) as f32 * 10.0,
+                        y: (index / 1000) as f32 * 10.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                })
+                .collect(),
+            ..MapData::default()
+        };
+        let view = RasterView {
+            size: egui::vec2(100.0, 100.0),
+            scale: 64.0,
+            offset: egui::Vec2::ZERO,
+            pixels_per_point: 1.0,
+            max_texture_side: 2048,
+        };
+        let first = render_raster(
+            &data,
+            &snapshot(),
+            &FileColors::default(),
+            view,
+            &LayoutControl::default(),
+        )
+        .unwrap();
+        let panned = render_raster(
+            &data,
+            &snapshot(),
+            &FileColors::default(),
+            RasterView {
+                offset: egui::vec2(-100.0, -100.0),
+                ..view
+            },
+            &LayoutControl::default(),
+        )
+        .unwrap();
+        assert!(!first.visible.tiles.is_empty());
+        assert!(first.visible.tiles.len() < 100);
+        assert!(panned.visible.tiles.len() < 100);
+        assert_ne!(first.visible.tiles, panned.visible.tiles);
+        assert_eq!(first.image.pixels.len(), 10_000);
+        let cancelled = LayoutControl::default();
+        cancelled.cancel();
+        assert!(
+            render_raster(&data, &snapshot(), &FileColors::default(), view, &cancelled).is_none()
+        );
+    }
+
+    #[test]
+    fn dense_same_color_files_render_as_distinct_gapless_blocks() {
+        let mut snapshot = snapshot();
+        let template = snapshot.nodes[1].clone();
+        let count = 35_701;
+        let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
+        *nodes = std::iter::once(Node {
+            kind: EntryKind::Directory,
+            children: (1..=count).collect(),
+            logical_size: count as u64,
+            ..template.clone()
+        })
+        .chain((1..=count).map(|_| Node {
+            parent: Some(0),
+            logical_size: 1,
+            children: Vec::new(),
+            ..template.clone()
+        }))
+        .collect();
+        let start = Instant::now();
+        let data = compute(
+            &snapshot,
+            MapKey {
+                width: 1000,
+                height: 500,
+                ..key()
+            },
+            &LayoutControl::default(),
+            &FileColors::default(),
+        )
+        .unwrap();
+        let layout_time = start.elapsed();
+        let start = Instant::now();
+        let image = render_raster(
+            &data,
+            &snapshot,
+            &FileColors::default(),
+            RasterView {
+                size: egui::vec2(1000.0, 500.0),
+                scale: 1.0,
+                offset: egui::Vec2::ZERO,
+                pixels_per_point: 1.0,
+                max_texture_side: 2048,
+            },
+            &LayoutControl::default(),
+        )
+        .unwrap()
+        .image;
+        eprintln!(
+            "dense map: {} tiles, layout {layout_time:?}, raster {:?}, {} bytes",
+            data.tiles.len(),
+            start.elapsed(),
+            image.pixels.len() * 4
+        );
+        assert_eq!(data.tiles.len(), count);
+        assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+        assert!(
+            image
+                .pixels
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .count()
+                > count
+        );
+    }
+
+    #[test]
+    fn unchanged_view_reuses_one_cached_texture_and_clear_releases_it() {
+        let snapshot = snapshot();
+        let data = Arc::new(
+            compute(
+                &snapshot,
+                key(),
+                &LayoutControl::default(),
+                &FileColors::default(),
+            )
+            .unwrap(),
+        );
+        let context = egui::Context::default();
+        let mut worker = MapWorker::default();
+        let view = RasterView {
+            size: egui::vec2(100.0, 50.0),
+            scale: 1.0,
+            offset: egui::Vec2::ZERO,
+            pixels_per_point: 1.0,
+            max_texture_side: 2048,
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let first = loop {
+            if let Some(paint) = worker.raster(&data, &snapshot, view, &context) {
+                break paint;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(worker.raster(&data, &snapshot, view, &context), Some(first));
+        assert!(worker.raster_running.is_none());
+        worker.clear();
+        assert!(worker.raster.is_none());
+    }
+
     fn snapshot() -> Arc<Snapshot> {
         Arc::new(Snapshot {
             version: 1,
@@ -575,6 +1046,7 @@ mod tests {
                     owner: None,
                     file_id: None,
                     error: None,
+                    scan_duration_ns: 0,
                 })
                 .collect(),
             errors: vec![],
@@ -648,20 +1120,25 @@ mod tests {
                 MapKey {
                     scope,
                     allocated,
-                    width: 8,
-                    height: 3,
+                    width: 1,
+                    height: 1,
                     ..key()
                 },
                 Arc::clone(&snapshot),
                 &context,
             );
             finish(&mut worker);
-            let groups = &worker.data().unwrap().aggregates;
+            let data = worker.data().unwrap();
+            let groups = &data.aggregates;
             for (extension, color) in expected {
                 assert!(
                     groups
                         .iter()
-                        .any(|group| group.extensions == [extension] && group.color == color),
+                        .any(|group| group.extensions == [extension] && group.color == color)
+                        || data.tiles.iter().any(|tile| {
+                            let tile_extension = snapshot.nodes[tile.node].extension();
+                            tile_extension == extension && colors.index(&tile_extension) == color
+                        }),
                     "{extension} should retain color {color}: {groups:?}"
                 );
             }
@@ -681,8 +1158,8 @@ mod tests {
         let mut worker = MapWorker::default();
         worker.request(
             MapKey {
-                width: 8,
-                height: 3,
+                width: 1,
+                height: 1,
                 ..key()
             },
             Arc::clone(&snapshot),
@@ -711,8 +1188,8 @@ mod tests {
         worker.clear();
         worker.request(
             MapKey {
-                width: 8,
-                height: 3,
+                width: 1,
+                height: 1,
                 ..key()
             },
             snapshot,
@@ -760,8 +1237,8 @@ mod tests {
             },
         ]));
         let key = MapKey {
-            width: 8,
-            height: 3,
+            width: 1,
+            height: 1,
             ..key()
         };
         let control = Arc::new(LayoutControl::default());

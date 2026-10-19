@@ -495,7 +495,7 @@ fn sort_weights(
 }
 
 fn readable_tile(rect: Rect) -> bool {
-    rect.width >= 4.0 && rect.height >= 4.0 && rect.width * rect.height >= 24.0
+    rect.width >= 1.0 && rect.height >= 1.0
 }
 
 fn enclosing_rect(first: Rect, second: Rect) -> Rect {
@@ -747,6 +747,7 @@ mod tests {
                 owner: None,
                 file_id: None,
                 error: None,
+                scan_duration_ns: 0,
             },
         )
         .collect();
@@ -1094,6 +1095,47 @@ mod tests {
     }
 
     #[test]
+    fn dense_pixel_sized_files_stay_individual_instead_of_one_color_block() {
+        let mut snapshot = fixture();
+        let template = snapshot.nodes[2].clone();
+        let count = 35_701;
+        snapshot.nodes = std::iter::once(Node {
+            kind: EntryKind::Directory,
+            children: (1..=count).collect(),
+            logical_size: count as u64,
+            ..template.clone()
+        })
+        .chain((1..=count).map(|_| Node {
+            parent: Some(0),
+            logical_size: 1,
+            ..template.clone()
+        }))
+        .collect();
+        let geometry = treemap_hierarchy_with_colors(
+            &snapshot,
+            &[0],
+            false,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 500.0,
+            },
+            &LayoutControl::default(),
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(geometry.tiles.len(), count);
+        assert!(geometry.aggregates.is_empty());
+        let area: f32 = geometry
+            .tiles
+            .iter()
+            .map(|tile| tile.rect.width * tile.rect.height)
+            .sum();
+        assert!((area - 500_000.0).abs() < 300.0, "covered {area}");
+    }
+
+    #[test]
     fn tiny_files_keep_separate_colors_without_one_block_per_row() {
         let mut snapshot = fixture();
         let template = snapshot.nodes[2].clone();
@@ -1209,8 +1251,8 @@ mod tests {
             Rect {
                 x: 0.0,
                 y: 0.0,
-                width: 128.0,
-                height: 64.0,
+                width: 32.0,
+                height: 16.0,
             },
             &LayoutControl::default(),
             |_| 0,
@@ -1258,8 +1300,8 @@ mod tests {
         let bounds = Rect {
             x: 0.0,
             y: 0.0,
-            width: 8.0,
-            height: 4.0,
+            width: 1.0,
+            height: 0.5,
         };
         let geometry = treemap_hierarchy_with_colors(
             &snapshot,
@@ -1310,8 +1352,8 @@ mod tests {
         let bounds = Rect {
             x: 0.0,
             y: 0.0,
-            width: 2.0,
-            height: 1.0,
+            width: 0.5,
+            height: 0.25,
         };
         let geometry =
             treemap_hierarchy(&snapshot, &[0], false, bounds, &LayoutControl::default()).unwrap();
