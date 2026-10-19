@@ -120,7 +120,7 @@ cargo test --no-default-features --locked
 
 ## Releases
 
-[GitHub Actions](../.github/workflows/ci.yml) runs formatting, all-feature tests, Clippy, headless tests and native packaging on pushes to `main` and pull requests targeting `main`. You can also run **Actions → Desktop builds → Run workflow** without publishing a release. Each run saves versioned installers as workflow artifacts; artifacts are temporary downloads, not published releases.
+[GitHub Actions](../.github/workflows/ci.yml) runs formatting, all-feature tests, Clippy, headless tests and native packaging only when a tag matching `v*` is pushed. Branch pushes and pull requests do not start this workflow, and there is no manual Run workflow trigger. Each run saves versioned installers as workflow artifacts before publishing a release.
 
 The version comes from `[package].version` in `Cargo.toml` and is included in installer filenames and application package metadata. A release tag must match it exactly: `v0.1.1` for version `0.1.1`. A mismatch fails the workflow before packaging.
 
@@ -137,9 +137,9 @@ To publish a release after the repository is on GitHub:
 
 3. Actions builds all five assets, verifies their complete set, uploads them to a draft release and downloads them again to verify SHA-256 hashes. Only then is the release published. Stable tags become Latest; tags such as `v0.2.0-beta.1` become prereleases and do not replace Latest. A failed run does not publish a new release; it may leave a draft for inspection or retry.
 
-Publication uses the built-in `GITHUB_TOKEN`; only the release job has `contents: write`. No personal token is required. Creating or rerunning a manual workflow does not publish a release; publication is triggered only by pushing a matching `v*` tag. After the first stable release, the download link can point to `/releases/latest`.
+Publication uses the built-in `GITHUB_TOKEN`; only the release job has `contents: write`. No personal token is required. If a tagged run fails, fix the problem before creating the next version tag, or use **Re-run failed jobs** when no code changes are needed. A successful retry can publish the release for that same tag. After the first stable release, the download link can point to `/releases/latest`.
 
-The hosted workflow and Windows/Linux execution have not yet been verified in this repository. Local macOS packaging has been checked; this is not a claim of runtime validation on every supported platform. Translation contributions: [localization guide](localization.md).
+Successful packaging does not replace runtime validation on each supported platform. Translation contributions: [localization guide](localization.md).
 
 ## License
 
