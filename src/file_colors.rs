@@ -4,23 +4,24 @@ use eframe::egui::Color32;
 use unidirstat::analysis::ExtensionStats;
 
 pub(crate) const FILE_PALETTE: [Color32; 18] = [
-    Color32::from_rgb(101, 101, 255),
-    Color32::from_rgb(255, 101, 101),
-    Color32::from_rgb(101, 255, 101),
-    Color32::from_rgb(229, 229, 0),
-    Color32::from_rgb(0, 229, 229),
-    Color32::from_rgb(229, 0, 229),
-    Color32::from_rgb(255, 193, 10),
-    Color32::from_rgb(44, 158, 255),
-    Color32::from_rgb(255, 44, 158),
-    Color32::from_rgb(158, 255, 44),
-    Color32::from_rgb(193, 10, 255),
-    Color32::from_rgb(44, 255, 158),
-    Color32::from_rgb(255, 10, 193),
-    Color32::from_rgb(10, 193, 255),
-    Color32::from_rgb(255, 158, 44),
-    Color32::from_rgb(10, 255, 193),
-    Color32::from_rgb(158, 44, 255),
+    // Blend the existing hues 60:40 with neutral 128 to soften saturation and glare.
+    Color32::from_rgb(112, 112, 204),
+    Color32::from_rgb(204, 112, 112),
+    Color32::from_rgb(112, 204, 112),
+    Color32::from_rgb(189, 189, 51),
+    Color32::from_rgb(51, 189, 189),
+    Color32::from_rgb(189, 51, 189),
+    Color32::from_rgb(204, 167, 57),
+    Color32::from_rgb(78, 146, 204),
+    Color32::from_rgb(204, 78, 146),
+    Color32::from_rgb(146, 204, 78),
+    Color32::from_rgb(167, 57, 204),
+    Color32::from_rgb(78, 204, 146),
+    Color32::from_rgb(204, 57, 167),
+    Color32::from_rgb(57, 167, 204),
+    Color32::from_rgb(204, 146, 78),
+    Color32::from_rgb(57, 204, 167),
+    Color32::from_rgb(146, 78, 204),
     Color32::from_rgb(153, 153, 153),
 ];
 
@@ -86,7 +87,20 @@ mod tests {
         assert_eq!(colors.index("raw"), 0);
         assert_eq!(colors.index("zip"), 1);
         assert_eq!(colors.index("txt"), 2);
-        assert_eq!(colors.color("raw"), Color32::from_rgb(101, 101, 255));
+        assert_eq!(colors.color("raw"), FILE_PALETTE[0]);
+    }
+
+    #[test]
+    fn palette_remains_colorful_without_full_intensity_channels() {
+        assert!(FILE_PALETTE.iter().all(|color| {
+            color.a() == 255
+                && [color.r(), color.g(), color.b()]
+                    .into_iter()
+                    .all(|channel| (50..=205).contains(&channel))
+        }));
+        assert!(FILE_PALETTE[..17].iter().all(|color| {
+            color.r().max(color.g()).max(color.b()) - color.r().min(color.g()).min(color.b()) >= 90
+        }));
     }
 
     #[test]

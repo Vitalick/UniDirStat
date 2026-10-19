@@ -825,7 +825,7 @@ mod tests {
         .into_iter()
         .map(
             |(path, parent, children, logical_size, allocated_size)| Node {
-                path: PathBuf::from(path),
+                path: PathBuf::from(path).into(),
                 parent,
                 kind: if children.is_empty() {
                     EntryKind::File
@@ -1239,21 +1239,24 @@ mod tests {
         let mut snapshot = fixture();
         let template = snapshot.nodes[2].clone();
         snapshot.nodes = std::iter::once(Node {
-            path: PathBuf::from("root"),
+            path: PathBuf::from("root").into(),
             parent: None,
             children: (1..=20_000).collect(),
             kind: EntryKind::Directory,
             logical_size: 20_000,
             ..template.clone()
         })
-        .chain((1..=20_000).map(|index| Node {
-            path: PathBuf::from(format!(
-                "root/{index}.{}",
-                if index % 2 == 0 { "txt" } else { "bin" }
-            )),
-            parent: Some(0),
-            logical_size: 1,
-            ..template.clone()
+        .chain((1..=20_000).map(|index| {
+            Node {
+                path: PathBuf::from(format!(
+                    "root/{index}.{}",
+                    if index % 2 == 0 { "txt" } else { "bin" }
+                ))
+                .into(),
+                parent: Some(0),
+                logical_size: 1,
+                ..template.clone()
+            }
         }))
         .collect();
         let geometry = treemap_hierarchy(
@@ -1338,7 +1341,7 @@ mod tests {
             },
         ];
         snapshot.nodes.extend((3..515).map(|index| Node {
-            path: PathBuf::from(format!("root/{index}.txt")),
+            path: PathBuf::from(format!("root/{index}.txt")).into(),
             parent: Some(if index < 259 { 1 } else { 2 }),
             logical_size: 1,
             ..template.clone()

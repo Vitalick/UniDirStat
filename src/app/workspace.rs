@@ -350,7 +350,7 @@ impl UniDirStatApp {
         });
         let path = self.scope.map_or_else(
             || tr("All scanned locations").to_owned(),
-            |index| display_path(&snapshot.nodes[index].path),
+            |index| display_path(&snapshot.nodes[index].path.to_path_buf()),
         );
         ui.horizontal(|ui| {
             let response = ui.add_sized(
@@ -464,9 +464,9 @@ impl UniDirStatApp {
             focus_outline(ui, &response);
             self.item_response(response.clone(), index, snapshot, SelectionView::Overview);
             if response.has_focus() {
-                response.show_tooltip_text(display_path(&node.path));
+                response.show_tooltip_text(display_path(&node.path.to_path_buf()));
             }
-            response.on_hover_text(display_path(&node.path));
+            response.on_hover_text(display_path(&node.path.to_path_buf()));
         }
     }
 

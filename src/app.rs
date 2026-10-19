@@ -244,12 +244,7 @@ impl RefreshView {
             .chain(&self.expanded)
             .chain(self.refreshed.iter());
         let paths: HashMap<_, _> = requested
-            .filter_map(|&index| {
-                previous
-                    .nodes
-                    .get(index)
-                    .map(|node| (node.path.as_path(), index))
-            })
+            .filter_map(|&index| previous.nodes.get(index).map(|node| (&node.path, index)))
             .collect();
         let mut mapping = HashMap::with_capacity(paths.len());
         for (index, node) in current.nodes.iter().enumerate() {
@@ -258,7 +253,7 @@ impl RefreshView {
                     tr("Folder recalculation cancelled. Previous results are preserved.").into(),
                 );
             }
-            if let Some(&previous) = paths.get(node.path.as_path()) {
+            if let Some(&previous) = paths.get(&node.path) {
                 mapping.insert(previous, index);
             }
         }
@@ -1273,7 +1268,7 @@ impl UniDirStatApp {
                             self.roots = snapshot
                                 .roots
                                 .iter()
-                                .map(|&index| snapshot.nodes[index].path.clone())
+                                .map(|&index| snapshot.nodes[index].path.to_path_buf())
                                 .collect();
                             self.status = if snapshot.cancelled {
                                 tr("Scan cancelled | partial results").into()
@@ -1349,7 +1344,7 @@ impl UniDirStatApp {
                                         .as_ref()?
                                         .nodes
                                         .get(index)
-                                        .map(|node| (node.path.clone(), index))
+                                        .map(|node| (node.path.to_path_buf(), index))
                                 });
                             }
                             self.rebuild = true;
@@ -2656,7 +2651,7 @@ impl UniDirStatApp {
                                 .on_hover_text(hash);
                             }
                             DuplicateRow::File(index) => {
-                                let path = display_path(&snapshot.nodes[index].path);
+                                let path = display_path(&snapshot.nodes[index].path.to_path_buf());
                                 let response = ui
                                     .add_sized(
                                         [width, 32.0],
@@ -2885,7 +2880,7 @@ impl UniDirStatApp {
                     self.selection
                         .indices()
                         .filter_map(|index| snapshot.nodes.get(index))
-                        .map(|node| display_path(&node.path))
+                        .map(|node| display_path(&node.path.to_path_buf()))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
@@ -2894,7 +2889,7 @@ impl UniDirStatApp {
         ui.label(RichText::new(node.name()).size(18.0).strong());
         ui.add(
             egui::Label::new(
-                RichText::new(display_path(&node.path))
+                RichText::new(display_path(&node.path.to_path_buf()))
                     .small()
                     .color(muted(ui)),
             )
@@ -2961,7 +2956,7 @@ impl UniDirStatApp {
         }
         ui.separator();
         if ui.button(tr("Copy path")).clicked() {
-            context.copy_text(display_path(&node.path));
+            context.copy_text(display_path(&node.path.to_path_buf()));
         }
         if ui.button(tr("Reveal in file manager")).clicked() {
             self.run_open(node, true);
@@ -2976,7 +2971,7 @@ impl UniDirStatApp {
             )
             .clicked()
         {
-            let path = node.path.clone();
+            let path = node.path.to_path_buf();
             self.job(JobKind::FileOperation, &context, move || {
                 JobResult::Permissions(path.clone(), actions::permission_details(&path))
             });
@@ -3091,7 +3086,10 @@ impl UniDirStatApp {
                 trf(
                     "{path} | {bytes} | {share}% of parent",
                     &[
-                        ("path", display_path(&snapshot.nodes[index].path)),
+                        (
+                            "path",
+                            display_path(&snapshot.nodes[index].path.to_path_buf()),
+                        ),
                         (
                             "bytes",
                             format_bytes(snapshot.nodes[index].size(self.settings.allocated)),
@@ -3148,12 +3146,12 @@ impl UniDirStatApp {
                 .clicked()
             {
                 let paths = if self.selection.is_empty() {
-                    display_path(&node.path)
+                    display_path(&node.path.to_path_buf())
                 } else {
                     self.selection
                         .indices()
                         .filter_map(|index| snapshot.nodes.get(index))
-                        .map(|node| display_path(&node.path))
+                        .map(|node| display_path(&node.path.to_path_buf()))
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
@@ -3241,7 +3239,7 @@ impl UniDirStatApp {
     }
 
     fn run_open(&mut self, node: &Node, reveal: bool) {
-        if let Err(error) = actions::open_path(&node.path, reveal) {
+        if let Err(error) = actions::open_path(&node.path.to_path_buf(), reveal) {
             self.error = Some(error);
         }
     }
@@ -3266,7 +3264,7 @@ impl UniDirStatApp {
         egui::Modal::new(egui::Id::new("cleanup-confirmation")).show(context,|ui| {
             ui.set_width(440.0);
             ui.heading(match cleanup { Cleanup::Trash(_) | Cleanup::TrashEmpty(_)=>tr("Move to system trash?"),Cleanup::Move(_,_)=>tr("Move this item?") });
-            ui.label(display_path(&node.path));
+            ui.label(display_path(&node.path.to_path_buf()));
             if let Cleanup::Move(_,destination)=cleanup { ui.label(trf("Destination: {path}",&[("path",display_path(destination))])); ui.label(tr("Existing files will never be overwritten. Atomic moves require the same filesystem; cross-volume moves fail safely.")); }
             else if matches!(cleanup, Cleanup::TrashEmpty(_)) { ui.label(tr("The folder must still be empty when the operation runs.")); }
             else { ui.label(tr("The item and, for a folder, its contents will be sent to your system trash. Recovery depends on your operating system and filesystem.")); }
@@ -3835,7 +3833,7 @@ mod tests {
         let changed = refresh_node(&app, "changed");
         let victim = app.snapshot.as_ref().unwrap().nodes[refresh_node(&app, "victim")]
             .path
-            .clone();
+            .to_path_buf();
         std::fs::write(fixture.path().join("retained/outside"), b"outside refresh").unwrap();
         app.settings.mac_access_reviewed = true;
         app.watching = true;
@@ -3883,10 +3881,11 @@ mod tests {
             std::fs::write(fixture.path().join("retained/outside"), b"outside refresh").unwrap();
             let snapshot = app.snapshot.as_ref().unwrap();
             let event = if parent_event {
-                snapshot.nodes[snapshot.roots[0]].path.clone()
+                snapshot.nodes[snapshot.roots[0]].path.to_path_buf()
             } else {
                 snapshot.nodes[refresh_node(&app, "retained")]
                     .path
+                    .to_path_buf()
                     .join("outside")
             };
             app.watching = true;
@@ -4002,7 +4001,7 @@ mod tests {
         app.watcher = None;
         let root = app.snapshot.as_ref().unwrap().nodes[app.snapshot.as_ref().unwrap().roots[0]]
             .path
-            .clone();
+            .to_path_buf();
         let path = root.join("late");
         std::fs::write(&path, b"new data").unwrap();
         sender.send(path).unwrap();

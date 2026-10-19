@@ -17,9 +17,10 @@ pub fn validate_live_node(node: &Node) -> Result<fs::Metadata, String> {
     if node.file_id.is_none() {
         return Err("File identity is unavailable. Use your file manager for cleanup.".into());
     }
-    let metadata = fs::symlink_metadata(&node.path).map_err(|error| error.to_string())?;
-    let canonical = fs::canonicalize(&node.path).map_err(|error| error.to_string())?;
-    if canonical != node.path
+    let path = node.path.to_path_buf();
+    let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
+    if canonical != path
         || metadata.is_symlink()
         || metadata.is_dir() != (node.kind == EntryKind::Directory)
         || (node.kind == EntryKind::File && !metadata.is_file())
@@ -33,7 +34,7 @@ pub fn validate_live_node(node: &Node) -> Result<fs::Metadata, String> {
         .map(|time| time.as_secs());
     if (node.kind == EntryKind::File && metadata.len() != node.logical_size)
         || modified != node.modified
-        || (node.file_id.is_some() && path_identity(&node.path, &metadata) != node.file_id)
+        || (node.file_id.is_some() && path_identity(&path, &metadata) != node.file_id)
     {
         return Err("The item changed since scanning. Refresh before cleanup.".into());
     }
@@ -42,7 +43,7 @@ pub fn validate_live_node(node: &Node) -> Result<fs::Metadata, String> {
 
 pub fn trash_node(node: &Node) -> Result<(), String> {
     validate_live_node(node)?;
-    trash::delete(&node.path).map_err(|error| error.to_string())
+    trash::delete(node.path.to_path_buf()).map_err(|error| error.to_string())
 }
 
 pub fn validate_empty_folder(node: &Node) -> Result<(), String> {
@@ -50,7 +51,7 @@ pub fn validate_empty_folder(node: &Node) -> Result<(), String> {
     if node.kind != EntryKind::Directory {
         return Err("The item must be an empty folder".into());
     }
-    if fs::read_dir(&node.path)
+    if fs::read_dir(node.path.to_path_buf())
         .map_err(|error| error.to_string())?
         .next()
         .transpose()
@@ -102,7 +103,7 @@ pub fn move_node(node: &Node, destination: &Path) -> Result<(), String> {
     let name = node.path.file_name().ok_or("The file has no name")?;
     let target = destination.join(name);
     validate_live_node(node)?;
-    renamore::rename_exclusive(&node.path, &target).map_err(|error| format!("Move failed: {error}. Atomic moves require the same filesystem and no existing destination. Use your file manager for cross-volume moves."))
+    renamore::rename_exclusive(node.path.to_path_buf(), &target).map_err(|error| format!("Move failed: {error}. Atomic moves require the same filesystem and no existing destination. Use your file manager for cross-volume moves."))
 }
 
 pub fn open_path(path: &Path, reveal: bool) -> Result<(), String> {
@@ -203,6 +204,30 @@ mod tests {
     }
 
     #[test]
+    fn same_filename_under_another_parent_keeps_identity_validation() {
+        let fixture = tempfile::tempdir().unwrap();
+        for parent in ["first", "second"] {
+            fs::create_dir(fixture.path().join(parent)).unwrap();
+            fs::write(fixture.path().join(parent).join("data"), b"same").unwrap();
+        }
+        let snapshot = scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let files: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.kind == EntryKind::File)
+            .collect();
+        assert!(validate_live_node(files[0]).is_ok());
+        let mut changed = files[0].clone();
+        changed.path = files[1].path.clone();
+        assert!(validate_live_node(&changed).is_err());
+    }
+
+    #[test]
     fn move_does_not_overwrite_destination() {
         let fixture = tempfile::tempdir().expect("fixture");
         let destination = tempfile::tempdir().expect("destination");
@@ -224,7 +249,7 @@ mod tests {
             fs::read(destination.path().join("data")).expect("kept"),
             b"keep me"
         );
-        assert!(node.path.exists());
+        assert!(node.path.to_path_buf().exists());
     }
 
     #[test]
@@ -244,7 +269,7 @@ mod tests {
             .find(|node| node.kind == EntryKind::File)
             .expect("node");
         move_node(node, destination.path()).expect("atomic move");
-        assert!(!node.path.exists());
+        assert!(!node.path.to_path_buf().exists());
         assert_eq!(
             fs::read(destination.path().join("data")).expect("moved"),
             b"original contents"
@@ -269,7 +294,7 @@ mod tests {
             .find(|node| node.parent.is_some() && node.kind == EntryKind::Directory)
             .expect("node");
         move_node(node, destination.path()).expect("atomic folder move");
-        assert!(!node.path.exists());
+        assert!(!node.path.to_path_buf().exists());
         assert_eq!(
             fs::read(destination.path().join("folder/data")).expect("moved"),
             b"nested contents"

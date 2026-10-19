@@ -276,10 +276,7 @@ pub fn find_duplicates_with_options(
                 .entry((snapshot.nodes[index].logical_size, hash))
                 .or_default()
                 .push((index, metadata)),
-            Err(error) => errors.push((
-                index,
-                format!("{}: {error}", snapshot.nodes[index].path.display()),
-            )),
+            Err(error) => errors.push((index, format!("{}: {error}", snapshot.nodes[index].path))),
             Ok(None) => {}
         }
     }
@@ -357,10 +354,7 @@ pub fn find_duplicates_with_options(
         }
         match result {
             Ok((hash, metadata)) => finished.push((index, hash, metadata)),
-            Err(error) => errors.push((
-                index,
-                format!("{}: {error}", snapshot.nodes[index].path.display()),
-            )),
+            Err(error) => errors.push((index, format!("{}: {error}", snapshot.nodes[index].path))),
         }
     }
     errors.sort_unstable_by_key(|(index, _)| *index);
@@ -381,16 +375,17 @@ pub fn find_duplicates_with_options(
                     return None;
                 }
                 let node = &snapshot.nodes[index];
-                let result = match fs::symlink_metadata(&node.path) {
+                let path = node.path.to_path_buf();
+                let result = match fs::symlink_metadata(&path) {
                     Ok(current)
                         if metadata_unchanged(&metadata, &current)
                             && node.file_id.is_some()
-                            && path_identity(&node.path, &current) == node.file_id =>
+                            && path_identity(&path, &current) == node.file_id =>
                     {
                         Ok(hash)
                     }
-                    Ok(_) => Err(format!("{}: changed after hashing", node.path.display())),
-                    Err(error) => Err(format!("{}: {error}", node.path.display())),
+                    Ok(_) => Err(format!("{}: changed after hashing", path.display())),
+                    Err(error) => Err(format!("{}: {error}", path.display())),
                 };
                 control.advance_work(1);
                 Some((index, result))
@@ -484,8 +479,8 @@ where
         .file_id
         .as_ref()
         .ok_or("File identity is unavailable; refresh before hashing")?;
-    for parent in node
-        .path
+    let path = node.path.to_path_buf();
+    for parent in path
         .ancestors()
         .skip(1)
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -495,7 +490,7 @@ where
             return Err("a parent directory is a symbolic link".into());
         }
     }
-    let before = fs::symlink_metadata(&node.path).map_err(|error| error.to_string())?;
+    let before = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
     let modified = before
         .modified()
         .ok()
@@ -504,7 +499,7 @@ where
     if !before.is_file()
         || before.len() != node.logical_size
         || modified != node.modified
-        || path_identity(&node.path, &before).as_ref() != Some(identity)
+        || path_identity(&path, &before).as_ref() != Some(identity)
     {
         return Err("changed since scanning or is no longer a regular file".into());
     }
@@ -524,15 +519,13 @@ where
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let mut file = options
-        .open(&node.path)
-        .map_err(|error| error.to_string())?;
+    let mut file = options.open(&path).map_err(|error| error.to_string())?;
     let opened = file.metadata().map_err(|error| error.to_string())?;
-    let current = fs::symlink_metadata(&node.path).map_err(|error| error.to_string())?;
+    let current = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
     if !metadata_unchanged(&before, &opened)
         || !metadata_unchanged(&opened, &current)
         || file_identity(&file, &opened).as_ref() != Some(identity)
-        || path_identity(&node.path, &current).as_ref() != Some(identity)
+        || path_identity(&path, &current).as_ref() != Some(identity)
         || unavailable_content(&opened)
     {
         return Err("file was replaced before hashing".into());
@@ -571,12 +564,12 @@ where
         }
     }
     let after = file.metadata().map_err(|error| error.to_string())?;
-    let current = fs::symlink_metadata(&node.path).map_err(|error| error.to_string())?;
+    let current = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
     if length != sample_offsets.map_or(before.len(), |_| 3 * 4096)
         || !metadata_unchanged(&opened, &after)
         || !metadata_unchanged(&after, &current)
         || file_identity(&file, &after).as_ref() != Some(identity)
-        || path_identity(&node.path, &current).as_ref() != Some(identity)
+        || path_identity(&path, &current).as_ref() != Some(identity)
     {
         return Err("file changed while hashing".into());
     }
@@ -1134,7 +1127,7 @@ mod tests {
         let node = snapshot
             .nodes
             .iter()
-            .find(|node| node.path == canonical)
+            .find(|node| node.path.to_path_buf() == canonical)
             .unwrap();
         let control = ScanControl::default();
         let completed = std::sync::atomic::AtomicBool::new(false);
@@ -1195,7 +1188,7 @@ mod tests {
         let node = snapshot
             .nodes
             .iter()
-            .find(|node| node.path == canonical)
+            .find(|node| node.path.to_path_buf() == canonical)
             .unwrap();
         let control = ScanControl::default();
         let completed = std::sync::atomic::AtomicBool::new(false);

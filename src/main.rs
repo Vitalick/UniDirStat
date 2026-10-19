@@ -337,7 +337,7 @@ fn run() -> Result<(), String> {
             );
             let found = index.search(&arguments.query, &ScanControl::default())?;
             for index in &found {
-                println!("{}", snapshot.nodes[*index].path.display());
+                println!("{}", snapshot.nodes[*index].path);
             }
             eprintln!("{} matches", found.len());
             return Ok(());

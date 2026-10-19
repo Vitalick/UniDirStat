@@ -1,7 +1,12 @@
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+#[cfg(all(test, windows))]
+use std::path::PathBuf;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
+
+mod path;
+pub use path::NodePath;
 
 /// Formats paths for people while retaining the original path for filesystem operations.
 pub fn display_path(path: &Path) -> String {
@@ -27,7 +32,7 @@ pub enum EntryKind {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
-    pub path: PathBuf,
+    pub path: NodePath,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub kind: EntryKind,
@@ -58,7 +63,7 @@ pub struct Node {
 impl Node {
     pub fn name(&self) -> String {
         self.path.file_name().map_or_else(
-            || display_path(&self.path),
+            || display_path(&self.path.to_path_buf()),
             |name| name.to_string_lossy().into_owned(),
         )
     }
@@ -94,6 +99,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Shares equal native directory prefixes after importing independent paths.
+    pub fn compact_paths(&mut self) {
+        let mut prefixes = HashSet::new();
+        for node in &mut self.nodes {
+            node.path.intern_prefix(&mut prefixes);
+        }
+    }
+
     pub fn total_size(&self, allocated: bool) -> u64 {
         self.roots
             .iter()
@@ -145,20 +158,20 @@ impl Snapshot {
                 return Err("Duplicate root or root with a parent".to_owned());
             }
             if node.kind == EntryKind::Directory {
-                root_paths.insert(node.path.as_path());
+                root_paths.insert(node.path.to_path_buf());
             }
         }
         let mut paths = HashSet::new();
         for (index, node) in self.nodes.iter().enumerate() {
-            if node.path.as_os_str().is_empty()
-                || !node.path.is_absolute()
-                || node.path.as_os_str().len() > 32_768
-                || node.path.as_os_str().as_encoded_bytes().contains(&0)
-                || node
-                    .path
+            let path = node.path.to_path_buf();
+            if path.as_os_str().is_empty()
+                || !path.is_absolute()
+                || path.as_os_str().len() > 32_768
+                || path.as_os_str().as_encoded_bytes().contains(&0)
+                || path
                     .components()
                     .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-                || !paths.insert(node.path.as_path())
+                || !paths.insert(&node.path)
                 || node
                     .modified
                     .is_some_and(|modified| modified > LATEST_TIMESTAMP)
@@ -179,7 +192,10 @@ impl Snapshot {
                     let parent_node = self.nodes.get(parent).ok_or("Invalid parent index")?;
                     if parent == index
                         || parent_node.kind != EntryKind::Directory
-                        || node.path.parent() != Some(parent_node.path.as_path())
+                        || node
+                            .path
+                            .parent()
+                            .is_none_or(|parent| !parent_node.path.matches_path(parent))
                     {
                         return Err(format!("Invalid parent or path at node {index}"));
                     }
@@ -188,8 +204,7 @@ impl Snapshot {
                     return Err(format!("Unlisted root at node {index}"));
                 }
                 None => {
-                    if node
-                        .path
+                    if path
                         .ancestors()
                         .skip(1)
                         .any(|ancestor| root_paths.contains(ancestor))
@@ -289,9 +304,9 @@ mod tests {
     #[test]
     fn drive_root_name_hides_the_verbatim_prefix_without_changing_its_path() {
         let mut node = fixture().nodes.remove(0);
-        node.path = PathBuf::from(r"\\?\X:\");
+        node.path = PathBuf::from(r"\\?\X:\").into();
         assert_eq!(node.name(), r"X:\");
-        assert_eq!(node.path, PathBuf::from(r"\\?\X:\"));
+        assert_eq!(node.path.to_path_buf(), PathBuf::from(r"\\?\X:\"));
     }
 
     #[cfg(not(windows))]
@@ -308,7 +323,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![
                 Node {
-                    path: root.clone(),
+                    path: root.clone().into(),
                     parent: None,
                     children: vec![1],
                     kind: EntryKind::Directory,
@@ -328,7 +343,7 @@ mod tests {
                     scan_duration_ns: 0,
                 },
                 Node {
-                    path: root.join("photo.JPG"),
+                    path: root.join("photo.JPG").into(),
                     parent: Some(0),
                     children: vec![],
                     kind: EntryKind::File,
@@ -358,6 +373,53 @@ mod tests {
     #[test]
     fn validation_accepts_a_consistent_tree() {
         assert!(fixture().validate().is_ok());
+    }
+
+    #[test]
+    fn imported_snapshot_paths_share_prefixes_without_changing_the_format() {
+        let mut snapshot = fixture();
+        let mut sibling = snapshot.nodes[1].clone();
+        sibling.path = snapshot.nodes[0]
+            .path
+            .to_path_buf()
+            .join("second.dat")
+            .into();
+        snapshot.nodes.push(sibling);
+        snapshot.nodes[0].children.push(2);
+        snapshot.nodes[0].logical_size *= 2;
+        snapshot.nodes[0].allocated_size = Some(1024);
+        snapshot.nodes[0].files = 2;
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json["nodes"][1]["path"],
+            serde_json::to_value(snapshot.nodes[1].path.to_path_buf()).unwrap()
+        );
+        let mut imported: Snapshot = serde_json::from_value(json.clone()).unwrap();
+        imported.validate().unwrap();
+        imported.compact_paths();
+        let parent_bytes = |index: usize| {
+            imported.nodes[index]
+                .path
+                .parent()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .as_ptr()
+        };
+        assert_eq!(parent_bytes(1), parent_bytes(2));
+        assert_eq!(serde_json::to_value(&imported).unwrap(), json);
+        imported.validate().unwrap();
+        let cloned = imported.clone();
+        assert_eq!(
+            cloned.nodes[1]
+                .path
+                .parent()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .as_ptr(),
+            parent_bytes(1)
+        );
     }
 
     #[test]
@@ -408,7 +470,7 @@ mod tests {
     fn validation_rejects_wrong_parent_paths_and_aggregates() {
         let original = fixture();
         let mut changed = original.clone();
-        changed.nodes[1].path = std::env::temp_dir().join("outside.JPG");
+        changed.nodes[1].path = std::env::temp_dir().join("outside.JPG").into();
         assert!(changed.validate().is_err());
         changed = original.clone();
         changed.nodes[0].logical_size = 3;
@@ -444,10 +506,10 @@ mod tests {
         template.allocated_size = Some(0);
         template.files = 0;
         snapshot.nodes.clear();
-        let mut path = template.path.clone();
+        let mut path = template.path.to_path_buf();
         for index in 0_usize..1500 {
             let mut node = template.clone();
-            node.path = path.clone();
+            node.path = path.clone().into();
             node.parent = index.checked_sub(1);
             node.children = if index < 1499 {
                 vec![index + 1]

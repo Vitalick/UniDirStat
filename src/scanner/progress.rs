@@ -42,9 +42,14 @@ impl ScanView<'_> {
             DirectoryScanStatus::Cancelled
         } else if self.progress.active.as_ref().is_some_and(|active| {
             active.iter().any(|&active| {
-                self.snapshot.nodes[active]
-                    .path
-                    .starts_with(&self.snapshot.nodes[index].path)
+                let mut ancestor = Some(active);
+                while let Some(candidate) = ancestor {
+                    if candidate == index {
+                        return true;
+                    }
+                    ancestor = self.snapshot.nodes[candidate].parent;
+                }
+                false
             })
         }) {
             DirectoryScanStatus::Scanning

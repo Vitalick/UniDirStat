@@ -13,6 +13,19 @@ fn tile_shape(rect: egui::Rect) -> (egui::Rect, f32) {
     (rect, 0.0)
 }
 
+fn paint_map_tile(painter: &egui::Painter, rect: egui::Rect, fill: Color32) {
+    painter.rect_filled(rect, 0.0, fill);
+    let pixel = painter.ctx().pixels_per_point().recip();
+    if rect.width().min(rect.height()) >= pixel * 3.0 {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(pixel, fill.lerp_to_gamma(Color32::BLACK, 0.42)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 fn paint_map_label(ui: &egui::Ui, rect: egui::Rect, text: &str, color: Color32) {
     if rect.width() >= MAP_LABEL_SIZE * 3.0 && rect.height() >= MAP_LABEL_HEIGHT {
         paint_label(ui, rect, text, color, MAP_LABEL_SIZE);
@@ -168,7 +181,7 @@ impl UniDirStatApp {
                     ui.label(RichText::new(count).size(BODY_SIZE));
                 });
             });
-            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| display_path(&snapshot.nodes[index].path))).truncate());
+            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| display_path(&snapshot.nodes[index].path.to_path_buf()))).truncate());
             if let Some(error) = self.map_worker.error() {
                 ui.colored_label(ui.visuals().error_fg_color, trf("Error: {details}", &[("details", error.into())]));
                 ui.label(tr("Reset the map to try again."));
@@ -231,7 +244,7 @@ impl UniDirStatApp {
                         let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) { continue; }
                         let fill = FILE_PALETTE[tile.color.min(FILE_PALETTE.len() - 1)];
-                        if raster.is_none() { painter.rect_filled(rect, 0.0, fill); }
+                        if raster.is_none() { paint_map_tile(&painter, rect, fill); }
                         if !readable_map_region(rect.intersect(bounds)) { continue; }
                         if tile.owner.is_some_and(|index| selected_region(&self.selection, snapshot, index)) {
                             painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside);
@@ -247,7 +260,7 @@ impl UniDirStatApp {
                             extension_names = trf("{extensions}, and {count} more", &[("extensions", extension_names), ("count", (tile.extensions.len() - 8).to_string())]);
                         }
                         let extensions = trf("File types: {extensions}", &[("extensions", extension_names)]);
-                        let owner = tile.owner.map(|index| trf("Containing folder: {path}", &[("path", display_path(&snapshot.nodes[index].path))]));
+                        let owner = tile.owner.map(|index| trf("Containing folder: {path}", &[("path", display_path(&snapshot.nodes[index].path.to_path_buf()))]));
                         if self.settings.labels { paint_map_label(ui, rect.intersect(bounds).shrink(3.0), &summary, tile_text_color(fill)); }
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("aggregate", tile.owner, tile.color, tile.rect.x.to_bits(), tile.rect.y.to_bits())), Sense::click());
                         if response.clicked() && let Some(index) = tile.owner {
@@ -296,12 +309,12 @@ impl UniDirStatApp {
                         let color = self.file_colors.color(&node.extension());
                         let fill = Color32::from_rgb(color.r(), color.g(), color.b());
                         if !readable {
-                            painter.rect_filled(rect, 0.0, fill);
+                            paint_map_tile(&painter, rect, fill);
                             continue;
                         }
                         let (tile_rect, radius) = tile_shape(rect);
                         let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
-                        if raster.is_none() { painter.rect_filled(tile_rect, radius, fill); }
+                        if raster.is_none() { paint_map_tile(&painter, tile_rect, fill); }
                         if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside); }
                         if self.settings.labels && tile_rect.height() >= MAP_LABEL_HEIGHT + 2.0 && tile_rect.width() >= MAP_LABEL_SIZE * 3.0 + 8.0 {
                             let label = tile_rect.intersect(bounds).shrink2(Vec2::new(4.0, 1.0));
@@ -363,7 +376,7 @@ impl UniDirStatApp {
         }
         let focused = response.has_focus().then_some(response.rect);
         response.on_hover_ui(|ui| {
-            ui.label(display_path(&snapshot.nodes[index].path));
+            ui.label(display_path(&snapshot.nodes[index].path.to_path_buf()));
             ui.label(format_bytes(
                 snapshot.nodes[index].size(self.settings.allocated),
             ));
@@ -565,7 +578,7 @@ mod tests {
         for index in 0..count {
             let folder = index * 2 + 1;
             snapshot.nodes.push(Node {
-                path: PathBuf::from(format!("root/folder-{index}")),
+                path: PathBuf::from(format!("root/folder-{index}")).into(),
                 kind: EntryKind::Directory,
                 parent: Some(0),
                 children: vec![folder + 1],
@@ -574,7 +587,7 @@ mod tests {
                 ..template.clone()
             });
             snapshot.nodes.push(Node {
-                path: PathBuf::from(format!("root/folder-{index}/file.txt")),
+                path: PathBuf::from(format!("root/folder-{index}/file.txt")).into(),
                 parent: Some(folder),
                 logical_size: 1,
                 allocated_size: Some(1),

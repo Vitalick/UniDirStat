@@ -83,11 +83,12 @@ struct CachedPath {
 
 impl CachedPath {
     fn new(node: &Node) -> Self {
-        let value = node.path.to_string_lossy().to_lowercase();
+        let full_path = node.path.to_path_buf();
+        let value = full_path.to_string_lossy().to_lowercase();
         let name = node
             .path
             .file_name()
-            .unwrap_or(node.path.as_os_str())
+            .unwrap_or(full_path.as_os_str())
             .to_string_lossy()
             .to_lowercase();
         let name_start = value.len() - name.len();
@@ -258,28 +259,33 @@ impl SearchIndex {
                     let node = &self.snapshot.nodes[index];
                     let path = &self.paths[index];
                     let text_matches = if let Some(regex) = &regex {
-                        let original = match query.target {
-                            SearchTarget::Path => node.path.to_str(),
-                            SearchTarget::Name => {
-                                node.path.file_name().and_then(|name| name.to_str())
+                        match query.target {
+                            SearchTarget::Path => {
+                                let full_path = node.path.to_path_buf();
+                                full_path.to_str().map_or_else(
+                                    || regex.is_match(&full_path.to_string_lossy().to_lowercase()),
+                                    |original| regex.is_match(original),
+                                )
                             }
-                        };
-                        original.map_or_else(
-                            || match query.target {
-                                SearchTarget::Path => {
-                                    regex.is_match(&node.path.to_string_lossy().to_lowercase())
-                                }
-                                SearchTarget::Name => regex.is_match(path.name()),
-                            },
-                            |original| regex.is_match(original),
-                        )
+                            SearchTarget::Name => node
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map_or_else(
+                                    || regex.is_match(path.name()),
+                                    |original| regex.is_match(original),
+                                ),
+                        }
                     } else if text.is_empty() {
                         true
                     } else {
                         match query.target {
-                            SearchTarget::Path => {
-                                node.path.to_string_lossy().to_lowercase().contains(&text)
-                            }
+                            SearchTarget::Path => node
+                                .path
+                                .to_path_buf()
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .contains(&text),
                             SearchTarget::Name => path.name().contains(&text),
                         }
                     };
@@ -347,6 +353,7 @@ impl SearchIndex {
                     checkpoint(control)?;
                     Ok(self.snapshot.nodes[index]
                         .path
+                        .to_path_buf()
                         .to_string_lossy()
                         .to_lowercase()
                         .into_boxed_str())
@@ -580,7 +587,7 @@ mod tests {
         let lowercase_paths: Vec<_> = snapshot
             .nodes
             .iter()
-            .map(|node| node.path.to_string_lossy().to_lowercase())
+            .map(|node| node.path.to_path_buf().to_string_lossy().to_lowercase())
             .collect();
         for sort in [SearchSort::Size, SearchSort::Name, SearchSort::Modified] {
             for descending in [false, true] {
@@ -655,8 +662,10 @@ mod tests {
             .iter()
             .position(|node| node.kind == EntryKind::File)
             .unwrap();
-        snapshot.nodes[file].path =
-            std::ffi::OsString::from_wide(&[67, 58, 47, 65, 47, 0xD800, 46, 82, 83]).into();
+        snapshot.nodes[file].path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            67, 58, 47, 65, 47, 0xD800, 46, 82, 83,
+        ]))
+        .into();
         let index = SearchIndex::new(Arc::new(snapshot));
         for target in [SearchTarget::Path, SearchTarget::Name] {
             let found = index
@@ -1207,7 +1216,12 @@ mod tests {
         assert_eq!(found.len(), 1);
         let candidate = &snapshot.nodes[found[0]];
         assert_eq!(candidate.name(), "candidate");
-        assert!(fs::read_dir(&candidate.path).unwrap().next().is_some());
+        assert!(
+            fs::read_dir(candidate.path.to_path_buf())
+                .unwrap()
+                .next()
+                .is_some()
+        );
         #[cfg(feature = "gui")]
         assert!(crate::actions::validate_empty_folder(candidate).is_err());
     }

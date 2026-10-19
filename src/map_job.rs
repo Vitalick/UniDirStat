@@ -590,7 +590,7 @@ fn render_raster(
             &mut image,
             bounds(tile.rect),
             FILE_PALETTE[tile.color.min(FILE_PALETTE.len() - 1)],
-            false,
+            true,
         );
     }
     for (index, tile) in data.tiles.iter().enumerate() {
@@ -620,24 +620,48 @@ fn raster_rect(image: &mut egui::ColorImage, rect: [i32; 4], fill: egui::Color32
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    let light = fill.lerp_to_gamma(egui::Color32::WHITE, 0.12);
-    let dark = fill.lerp_to_gamma(egui::Color32::BLACK, 0.18);
-    let emboss = emboss && right - left >= 2 && bottom - top >= 2;
+    let edge = if emboss {
+        match (right - left).min(bottom - top) {
+            8.. => 3,
+            5.. => 2,
+            3.. => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let border = fill.lerp_to_gamma(egui::Color32::BLACK, 0.42);
+    let light = [
+        border,
+        fill.lerp_to_gamma(egui::Color32::WHITE, 0.14),
+        fill.lerp_to_gamma(egui::Color32::WHITE, 0.06),
+    ];
+    let dark = [
+        border,
+        fill.lerp_to_gamma(egui::Color32::BLACK, 0.18),
+        fill.lerp_to_gamma(egui::Color32::BLACK, 0.08),
+    ];
     for y in y0..y1 {
         let row = &mut image.pixels[y * width + x0..y * width + x1];
-        let color = if emboss && y as i32 == top {
-            light
-        } else if emboss && y as i32 == bottom - 1 {
-            dark
+        let from_top = y as i32 - top;
+        let from_bottom = bottom - y as i32 - 1;
+        let color = if from_top < edge {
+            light[from_top as usize]
+        } else if from_bottom < edge {
+            dark[from_bottom as usize]
         } else {
             fill
         };
         row.fill(color);
-        if emboss && left >= 0 {
-            row[0] = light;
-        }
-        if emboss && right <= width as i32 {
-            row[x1 - x0 - 1] = dark;
+        for depth in 0..edge.min(from_top.min(from_bottom) + 1) {
+            for (x, color) in [
+                (left + depth, light[depth as usize]),
+                (right - depth - 1, dark[depth as usize]),
+            ] {
+                if (x0 as i32..x1 as i32).contains(&x) {
+                    row[x as usize - x0] = color;
+                }
+            }
         }
     }
 }
@@ -831,17 +855,18 @@ mod tests {
     #[test]
     fn embossed_neighbors_cover_the_canvas_without_gaps_or_gloss() {
         let fill = FILE_PALETTE[0];
-        let mut image = egui::ColorImage::filled([8, 4], egui::Color32::TRANSPARENT);
-        raster_rect(&mut image, [0, 0, 4, 4], fill, true);
-        raster_rect(&mut image, [4, 0, 8, 4], fill, true);
+        let mut image = egui::ColorImage::filled([24, 12], egui::Color32::TRANSPARENT);
+        raster_rect(&mut image, [0, 0, 12, 12], fill, true);
+        raster_rect(&mut image, [12, 0, 24, 12], fill, true);
         assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
-        assert_eq!(image[(1, 1)], fill);
-        assert_eq!(image[(2, 2)], fill);
-        assert_ne!(image[(3, 1)], image[(4, 1)]);
-        assert_eq!(
-            image[(0, 1)],
-            fill.lerp_to_gamma(egui::Color32::WHITE, 0.12)
-        );
+        assert_eq!(image[(4, 4)], fill);
+        assert_eq!(image[(8, 8)], fill);
+        assert!(image[(11, 6)].r() < image[(10, 6)].r());
+        assert!(image[(12, 6)].r() < fill.r());
+        assert!(image[(1, 6)].r() > image[(2, 6)].r());
+        assert!(image[(2, 6)].r() > fill.r());
+        assert!(image[(10, 6)].r() < image[(9, 6)].r());
+        assert!(image[(9, 6)].r() < fill.r());
     }
 
     #[test]
@@ -852,6 +877,21 @@ mod tests {
         assert!(image.pixels.iter().all(|pixel| *pixel == fill));
         raster_rect(&mut image, [1, 1, 2, 2], FILE_PALETTE[1], true);
         assert_eq!(image[(1, 1)], FILE_PALETTE[1]);
+    }
+
+    #[test]
+    fn tiny_tiles_keep_color_and_opaque_coverage() {
+        for side in 1..=4 {
+            let mut image = egui::ColorImage::filled([side, side], egui::Color32::TRANSPARENT);
+            raster_rect(
+                &mut image,
+                [0, 0, side as i32, side as i32],
+                FILE_PALETTE[0],
+                true,
+            );
+            assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+            assert!(image.pixels.contains(&FILE_PALETTE[0]));
+        }
     }
 
     #[test]
@@ -1009,8 +1049,8 @@ mod tests {
     fn lower_ranked_extensions_keep_color_in_a_scoped_gapless_map() {
         let mut snapshot = snapshot();
         let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
-        nodes[1].path = PathBuf::from("root/a.type17");
-        nodes[2].path = PathBuf::from("root/b.type18");
+        nodes[1].path = PathBuf::from("root/a.type17").into();
+        nodes[2].path = PathBuf::from("root/b.type18").into();
         let colors = FileColors::from_extensions(
             &(0..19)
                 .map(|rank| ExtensionStats {
@@ -1037,16 +1077,8 @@ mod tests {
         .unwrap()
         .image;
         assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
-        assert!(
-            image
-                .pixels
-                .contains(&egui::Color32::from_rgb(101, 101, 255))
-        );
-        assert!(
-            image
-                .pixels
-                .contains(&egui::Color32::from_rgb(255, 101, 101))
-        );
+        assert!(image.pixels.contains(&FILE_PALETTE[0]));
+        assert!(image.pixels.contains(&FILE_PALETTE[1]));
     }
 
     #[test]
@@ -1055,7 +1087,7 @@ mod tests {
         let template = snapshot.nodes[1].clone();
         Arc::make_mut(&mut snapshot).nodes = (0_usize..10)
             .map(|index| Node {
-                path: PathBuf::from(format!("root/{index}.txt")),
+                path: PathBuf::from(format!("root/{index}.txt")).into(),
                 parent: index.checked_sub(1),
                 children: if index < 9 { vec![index + 1] } else { vec![] },
                 kind: if index < 9 {
@@ -1093,7 +1125,9 @@ mod tests {
         )
         .unwrap()
         .image;
-        assert!(image.pixels.iter().all(|pixel| *pixel == FILE_PALETTE[0]));
+        assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+        assert_eq!(image[(60, 40)], FILE_PALETTE[0]);
+        assert!(image[(0, 40)].r() < FILE_PALETTE[0].r());
         let detail = compute(
             &snapshot,
             MapKey {
@@ -1192,7 +1226,7 @@ mod tests {
             roots: vec![0],
             nodes: (0..3)
                 .map(|index| Node {
-                    path: PathBuf::from(format!("node-{index}")),
+                    path: PathBuf::from(format!("node-{index}")).into(),
                     parent: (index > 0).then_some(0),
                     children: if index == 0 { vec![1, 2] } else { vec![] },
                     kind: if index == 0 {
@@ -1262,8 +1296,8 @@ mod tests {
     fn map_colors_follow_global_logical_ranks_across_scope_and_metric_changes() {
         let mut snapshot = snapshot();
         let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
-        nodes[1].path = PathBuf::from("root/inside.a");
-        nodes[2].path = PathBuf::from("root/outside.b");
+        nodes[1].path = PathBuf::from("root/inside.a").into();
+        nodes[2].path = PathBuf::from("root/outside.b").into();
         let context = egui::Context::default();
         let colors = Arc::new(FileColors::from_extensions(&[
             ExtensionStats {
@@ -1320,8 +1354,8 @@ mod tests {
     fn replacing_colors_invalidates_cached_and_finished_map_results_but_clear_preserves_colors() {
         let mut snapshot = snapshot();
         let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
-        nodes[1].path = PathBuf::from("root/inside.a");
-        nodes[2].path = PathBuf::from("root/outside.b");
+        nodes[1].path = PathBuf::from("root/inside.a").into();
+        nodes[2].path = PathBuf::from("root/outside.b").into();
         let context = egui::Context::default();
         let mut worker = MapWorker::default();
         worker.request(
@@ -1377,8 +1411,8 @@ mod tests {
     fn a_finished_job_with_old_colors_cannot_fill_the_same_requested_key() {
         let mut snapshot = snapshot();
         let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
-        nodes[1].path = PathBuf::from("root/inside.a");
-        nodes[2].path = PathBuf::from("root/outside.b");
+        nodes[1].path = PathBuf::from("root/inside.a").into();
+        nodes[2].path = PathBuf::from("root/outside.b").into();
         let context = egui::Context::default();
         let old_colors = FileColors::from_extensions(&[
             ExtensionStats {
@@ -1600,11 +1634,11 @@ mod tests {
         let mut snapshot = snapshot();
         let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
         let mut inside = nodes[1].clone();
-        inside.path = PathBuf::from("root/folder/inside.txt");
+        inside.path = PathBuf::from("root/folder/inside.txt").into();
         inside.parent = Some(1);
         nodes[1].kind = EntryKind::Directory;
         nodes[1].children = vec![3];
-        nodes[2].path = PathBuf::from("root/outside.bin");
+        nodes[2].path = PathBuf::from("root/outside.bin").into();
         nodes.push(inside);
 
         let summary = compute_summary(&snapshot, Some(1), &LayoutControl::default()).unwrap();

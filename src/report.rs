@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::DuplicateReport;
-use crate::model::{EntryKind, Node, Snapshot};
+use crate::model::{EntryKind, Node, NodePath, Snapshot};
 
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -76,9 +76,10 @@ pub fn load_snapshot(path: &Path) -> Result<Snapshot, String> {
     }
     let bytes = read_snapshot_bytes(path)?;
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-    let snapshot: Snapshot =
+    let mut snapshot: Snapshot =
         serde_json::from_slice(bytes).map_err(|error| format!("Invalid snapshot: {error}"))?;
     snapshot.validate()?;
+    snapshot.compact_paths();
     Ok(snapshot)
 }
 
@@ -146,7 +147,7 @@ pub fn load_csv(path: &Path) -> Result<Snapshot, String> {
             .transpose()
             .map_err(|error| format!("Invalid Unix mode: {error}"))?;
         snapshot.nodes.push(Node {
-            path,
+            path: path.into(),
             parent: None,
             children: Vec::new(),
             kind,
@@ -195,6 +196,7 @@ pub fn load_csv(path: &Path) -> Result<Snapshot, String> {
             .extend(snapshot.nodes.iter().filter_map(|node| node.error.clone()));
     }
     snapshot.validate()?;
+    snapshot.compact_paths();
     Ok(snapshot)
 }
 
@@ -244,6 +246,7 @@ pub fn export_csv(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
                 .serialize(CsvNode {
                     path: node
                         .path
+                        .to_path_buf()
                         .to_str()
                         .ok_or("CSV snapshots require UTF-8 paths")?
                         .to_owned(),
@@ -304,6 +307,7 @@ pub fn export_duplicates_csv(
                         report.algorithm.as_str().to_owned(),
                         group.hash.clone(),
                         node.path
+                            .to_path_buf()
                             .to_str()
                             .ok_or("CSV reports require UTF-8 paths")?
                             .to_owned(),
@@ -322,7 +326,7 @@ pub fn export_duplicates_csv(
 
 #[derive(Serialize)]
 struct PermissionRecord<'entry> {
-    path: &'entry Path,
+    path: &'entry NodePath,
     readonly: bool,
     unix_mode: Option<String>,
     unix_owner: Option<u32>,
@@ -411,13 +415,14 @@ mod tests {
             &ScanControl::default(),
         )
         .unwrap();
-        snapshot
+        let node = snapshot
             .nodes
             .iter_mut()
             .find(|node| node.kind == EntryKind::File)
-            .unwrap()
-            .path
-            .set_file_name(name);
+            .unwrap();
+        let mut path = node.path.to_path_buf();
+        path.set_file_name(name);
+        node.path = path.into();
         let output = fixture.path().join("report.csv");
         fs::write(&output, b"original report").unwrap();
         assert!(export_csv(&output, &snapshot).is_err());
@@ -760,16 +765,19 @@ mod tests {
             &ScanControl::default(),
         )
         .unwrap();
-        snapshot.nodes[1]
-            .path
-            .set_file_name("comma,quote\"line\n.txt");
+        let mut path = snapshot.nodes[1].path.to_path_buf();
+        path.set_file_name("comma,quote\"line\n.txt");
+        snapshot.nodes[1].path = path.into();
         let output = directory.path().join("report.csv");
 
         export_csv(&output, &snapshot).unwrap();
         let mut reader = csv::Reader::from_path(&output).unwrap();
         let rows: Vec<_> = reader.records().map(Result::unwrap).collect();
 
-        assert_eq!(rows[1].get(0), snapshot.nodes[1].path.to_str());
+        assert_eq!(
+            rows[1].get(0),
+            snapshot.nodes[1].path.to_path_buf().to_str()
+        );
     }
 
     #[test]

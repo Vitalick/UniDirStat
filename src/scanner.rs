@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 use regex::RegexSet;
 
-use crate::model::{EntryKind, Node, Snapshot};
+use crate::model::{EntryKind, Node, NodePath, Snapshot};
 
 mod progress;
 use progress::{DirectoryProgress, LiveScan, LiveTotals, duration_ns};
@@ -407,10 +407,11 @@ pub fn refresh_subtree(
         return Err("Only directories can be refreshed as subtrees".to_owned());
     }
     snapshot.validate()?;
-    let metadata = fs::symlink_metadata(&selected.path).map_err(|error| error.to_string())?;
+    let selected_path = selected.path.to_path_buf();
+    let metadata = fs::symlink_metadata(&selected_path).map_err(|error| error.to_string())?;
     if !metadata.is_dir()
         || is_link(&metadata)
-        || fs::canonicalize(&selected.path).ok().as_ref() != Some(&selected.path)
+        || fs::canonicalize(&selected_path).ok().as_ref() != Some(&selected_path)
     {
         return Err("The selected directory changed or became a link; run a new scan".to_owned());
     }
@@ -444,7 +445,7 @@ pub fn refresh_subtree(
         }
     }
     let fresh = scan_with_directories(
-        std::slice::from_ref(&selected.path),
+        std::slice::from_ref(&selected_path),
         &subtree_options,
         control,
         directories,
@@ -495,8 +496,8 @@ pub fn refresh_subtree(
     if let Some(parent) = parent {
         nodes[parent].children.push(replacement_root);
     }
-    let path_error = format!("{}:", selected.path.display());
-    let descendant_error = format!("{}{}", selected.path.display(), std::path::MAIN_SEPARATOR);
+    let path_error = format!("{}:", selected.path);
+    let descendant_error = format!("{}{}", selected.path, std::path::MAIN_SEPARATOR);
     let mut merged = Snapshot {
         version: snapshot.version,
         roots: snapshot
@@ -625,7 +626,7 @@ impl Traversal<'_> {
                 progress.start(index);
             }
             (
-                state.snapshot.nodes[index].path.clone(),
+                state.snapshot.nodes[index].path.to_path_buf(),
                 state.snapshot.nodes[index].file_id.clone(),
             )
         };
@@ -652,6 +653,7 @@ impl Traversal<'_> {
                 return;
             }
         };
+        let prefix: Arc<Path> = Arc::from(path.as_path());
         let mut paths = Vec::with_capacity(BATCH);
         for result in entries {
             if !self.control.checkpoint() {
@@ -672,12 +674,13 @@ impl Traversal<'_> {
                     index,
                     device,
                     depth,
+                    Arc::clone(&prefix),
                     std::mem::replace(&mut paths, Vec::with_capacity(BATCH)),
                 );
             }
         }
         if !paths.is_empty() {
-            self.batch(scope, index, device, depth, paths);
+            self.batch(scope, index, device, depth, prefix, paths);
         }
         self.finish_directory(index);
     }
@@ -688,6 +691,7 @@ impl Traversal<'_> {
         parent: usize,
         device: Option<u64>,
         depth: usize,
+        prefix: Arc<Path>,
         paths: Vec<(PathBuf, fs::DirEntry)>,
     ) {
         let nodes: Vec<_> = paths
@@ -715,7 +719,16 @@ impl Traversal<'_> {
                         if self.options.one_file_system && metadata_device(&metadata) != device {
                             None
                         } else {
-                            let mut node = node_from_metadata(path, Some(parent), &metadata);
+                            let stored_path = NodePath::from_parent(
+                                Arc::clone(&prefix),
+                                entry.file_name().into_boxed_os_str(),
+                            );
+                            let mut node = node_from_metadata_with_path(
+                                &path,
+                                stored_path,
+                                Some(parent),
+                                &metadata,
+                            );
                             if node.kind != EntryKind::Directory {
                                 node.scan_duration_ns = duration_ns(metadata_started.elapsed());
                             }
@@ -725,7 +738,10 @@ impl Traversal<'_> {
                     Err(error) => {
                         let error = Some(format!("{}: {error}", path.display()));
                         Some(Node {
-                            path,
+                            path: NodePath::from_parent(
+                                Arc::clone(&prefix),
+                                entry.file_name().into_boxed_os_str(),
+                            ),
                             parent: Some(parent),
                             children: Vec::new(),
                             kind: EntryKind::Other,
@@ -1072,6 +1088,20 @@ fn update_progress(control: &ScanControl, node: &Node) {
 }
 
 fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata) -> Node {
+    let stored_path = if parent.is_none() {
+        NodePath::root(path.clone())
+    } else {
+        path.as_path().into()
+    };
+    node_from_metadata_with_path(&path, stored_path, parent, metadata)
+}
+
+fn node_from_metadata_with_path(
+    path: &Path,
+    stored_path: NodePath,
+    parent: Option<usize>,
+    metadata: &Metadata,
+) -> Node {
     let kind = if is_link(metadata) {
         EntryKind::Symlink
     } else if metadata.is_dir() {
@@ -1082,7 +1112,7 @@ fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata)
         EntryKind::Other
     };
     let (file_id, mut allocated_size) = if matches!(kind, EntryKind::File | EntryKind::Directory) {
-        entry_storage(&path, metadata)
+        entry_storage(path, metadata)
     } else {
         (metadata_identity(metadata), empty_allocation())
     };
@@ -1091,7 +1121,7 @@ fn node_from_metadata(path: PathBuf, parent: Option<usize>, metadata: &Metadata)
     }
     let (permissions, owner) = platform_permissions(metadata);
     Node {
-        path,
+        path: stored_path,
         parent,
         children: Vec::new(),
         kind,
@@ -1423,7 +1453,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let child = original.nodes[0].children[0];
-        let error = format!("{}: listing failed", original.nodes[child].path.display());
+        let error = format!("{}: listing failed", original.nodes[child].path);
         original.nodes[child].error = Some(error.clone());
         original.nodes[child].scan_warning = true;
         original.nodes[0].scan_warning = true;
@@ -1436,6 +1466,36 @@ pub(crate) mod tests {
                 .nodes
                 .iter()
                 .all(|node| !node.scan_failed && !node.scan_warning)
+        );
+    }
+
+    #[test]
+    fn retained_sibling_paths_share_parent_storage() {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            fs::write(temporary.path().join(format!("file-{index}")), b"data").unwrap();
+        }
+        let snapshot = scan(
+            &[temporary.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let children = &snapshot.nodes[snapshot.roots[0]].children;
+        let parent_storage = |index: usize| {
+            snapshot.nodes[index]
+                .path
+                .parent()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .as_ptr()
+        };
+        assert_eq!(children.len(), 300);
+        assert!(
+            children
+                .iter()
+                .all(|&child| parent_storage(child) == parent_storage(children[0]))
         );
     }
 
@@ -1821,8 +1881,8 @@ pub(crate) mod tests {
         for directory in [first.path(), second.path()] {
             let snapshot = scan(&[directory.into()], &ScanOptions::default(), &control).unwrap();
             assert_eq!(
-                control.current_path().as_ref(),
-                Some(&snapshot.nodes[snapshot.roots[0]].path)
+                control.current_path(),
+                Some(snapshot.nodes[snapshot.roots[0]].path.to_path_buf())
             );
         }
         scan(&[file], &ScanOptions::default(), &control).unwrap();
@@ -2087,7 +2147,7 @@ pub(crate) mod tests {
         let nodes: Vec<_> = (0..4097)
             .map(|index| {
                 let mut node = template.clone();
-                node.path = temporary.path().join(format!("file-{index:04}"));
+                node.path = temporary.path().join(format!("file-{index:04}")).into();
                 node.logical_size = ((4096 - index) % 97) as u64;
                 node
             })
@@ -2503,7 +2563,7 @@ pub(crate) mod tests {
         let control = ScanControl::default();
         for name in ["original", "alias"] {
             let mut node = node_from_metadata(temporary.path().to_owned(), None, &metadata);
-            node.path = temporary.path().join(name);
+            node.path = temporary.path().join(name).into();
             insert_node(
                 &mut snapshot,
                 &mut identities,
@@ -2710,7 +2770,7 @@ pub(crate) mod tests {
         let control = ScanControl::default();
         for (name, allocated) in [("z-original", 4096), ("a-alias", 8192)] {
             let mut node = node_from_metadata(path.clone(), None, &metadata);
-            node.path = temporary.path().join(name);
+            node.path = temporary.path().join(name).into();
             node.allocated_size = Some(allocated);
             let index = insert_node(
                 &mut snapshot,

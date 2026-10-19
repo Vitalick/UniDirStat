@@ -182,6 +182,7 @@ fn sorted_children(
                 .map(|&position| {
                     view.snapshot.nodes[keys[position].index]
                         .path
+                        .to_path_buf()
                         .to_string_lossy()
                         .to_lowercase()
                 })
@@ -270,7 +271,7 @@ impl FileRow {
             index,
             depth,
             name: node.name(),
-            path: display_path(&node.path),
+            path: display_path(&node.path.to_path_buf()),
             extension: node.extension(),
             size: node.size(allocated),
             modified: node.modified,
