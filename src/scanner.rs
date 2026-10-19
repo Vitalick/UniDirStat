@@ -854,14 +854,14 @@ fn update_progress(control: &ScanControl, node: &Node) {
     control.visited.fetch_add(1, Ordering::Relaxed);
     let _ = control
         .bytes
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
             Some(total.saturating_add(node.logical_size))
         });
     if let Some(allocated) = node.allocated_size {
         let _ =
             control
                 .allocated_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                     Some(total.saturating_add(allocated))
                 });
     } else {
