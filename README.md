@@ -135,17 +135,17 @@ cargo test --no-default-features --locked
 
 [GitHub Actions](.github/workflows/ci.yml) runs formatting, all-feature tests, Clippy, headless tests and native packaging on pushes to `main` and pull requests targeting `main`. You can also run **Actions → Desktop builds → Run workflow** without publishing a release. Each run saves versioned installers as workflow artifacts; artifacts are temporary downloads, not published releases.
 
-The version comes from `[package].version` in `Cargo.toml` and is included in installer filenames and application package metadata. A release tag must match it exactly: `v0.1.0` for version `0.1.0`. A mismatch fails the workflow before packaging.
+The version comes from `[package].version` in `Cargo.toml` and is included in installer filenames and application package metadata. A release tag must match it exactly: `v0.1.1` for version `0.1.1`. A mismatch fails the workflow before packaging.
 
 To publish a release after the repository is on GitHub:
 
 1. Set the new package version in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, run the checks above, and commit both version files on `main`.
-2. Tag that commit and push the branch and tag; for the current `0.1.0` version:
+2. Tag that commit and push the branch and tag; for the current `0.1.1` version:
 
    ```sh
-   git tag -a v0.1.0 -m "UniDirStat 0.1.0"
+   git tag -a v0.1.1 -m "UniDirStat 0.1.1"
    git push origin main
-   git push origin v0.1.0
+   git push origin v0.1.1
    ```
 
 3. Actions builds all five assets, verifies their complete set, uploads them to a draft release and downloads them again to verify SHA-256 hashes. Only then is the release published. Stable tags become Latest; tags such as `v0.2.0-beta.1` become prereleases and do not replace Latest. A failed run does not publish a new release; it may leave a draft for inspection or retry.

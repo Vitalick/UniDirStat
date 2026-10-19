@@ -43,7 +43,7 @@ const WATCH_PATH_LIMIT: usize = 1024;
 const DEFAULT_COLUMN_WIDTHS: [f32; 4] = [0.0, 132.0, 144.0, 176.0];
 const CONTROL_BORDER: [Color32; 2] = [
     Color32::from_rgb(112, 126, 147),
-    Color32::from_rgb(137, 148, 169),
+    Color32::from_rgb(99, 115, 140),
 ];
 const ERROR_TEXT: [Color32; 2] = [
     Color32::from_rgb(164, 34, 59),
@@ -957,19 +957,80 @@ impl UniDirStatApp {
         } else {
             Color32::from_rgb(239, 242, 248)
         };
-        style.visuals.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.35 } else { 0.25 });
-        style.visuals.widgets.inactive.bg_stroke =
-            Stroke::new(1.0, CONTROL_BORDER[usize::from(dark)]);
-        style.visuals.selection.stroke =
-            Stroke::new(2.0, if dark { ACCENT } else { PRIMARY_BUTTON });
+        let text = if dark {
+            Color32::from_rgb(218, 225, 237)
+        } else {
+            Color32::from_rgb(39, 50, 67)
+        };
+        let accent = if dark { ACCENT } else { PRIMARY_BUTTON };
+        let separator = if dark {
+            Color32::from_rgb(43, 54, 73)
+        } else {
+            Color32::from_rgb(210, 217, 229)
+        };
+        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+        style.visuals.widgets.noninteractive.bg_fill = style.visuals.window_fill;
+        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, separator);
+        style.visuals.window_stroke = Stroke::new(1.0, separator);
+        style.visuals.selection.bg_fill = if dark {
+            Color32::from_rgb(45, 53, 85)
+        } else {
+            Color32::from_rgb(223, 229, 255)
+        };
+        style.visuals.selection.stroke = Stroke::new(
+            2.0,
+            if dark {
+                Color32::from_rgb(177, 187, 255)
+            } else {
+                Color32::from_rgb(61, 73, 168)
+            },
+        );
         style.visuals.hyperlink_color = if dark { ACCENT } else { PRIMARY_BUTTON };
-        for widget in [
-            &mut style.visuals.widgets.inactive,
-            &mut style.visuals.widgets.hovered,
-            &mut style.visuals.widgets.active,
+        for (widget, fill) in [
+            (
+                &mut style.visuals.widgets.inactive,
+                if dark {
+                    Color32::from_rgb(26, 33, 47)
+                } else {
+                    Color32::from_rgb(239, 242, 248)
+                },
+            ),
+            (
+                &mut style.visuals.widgets.hovered,
+                if dark {
+                    Color32::from_rgb(35, 45, 63)
+                } else {
+                    Color32::from_rgb(227, 233, 245)
+                },
+            ),
+            (
+                &mut style.visuals.widgets.active,
+                if dark {
+                    Color32::from_rgb(43, 55, 76)
+                } else {
+                    Color32::from_rgb(216, 224, 242)
+                },
+            ),
+            (
+                &mut style.visuals.widgets.open,
+                if dark {
+                    Color32::from_rgb(31, 41, 58)
+                } else {
+                    Color32::from_rgb(228, 235, 248)
+                },
+            ),
         ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = Stroke::new(1.0, CONTROL_BORDER[usize::from(dark)]);
+            widget.fg_stroke = Stroke::new(1.0, text);
             widget.corner_radius = CornerRadius::same(7);
+            widget.expansion = 0.0;
         }
+        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0, accent);
+        style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, accent);
+        style.visuals.code_bg_color = style.visuals.widgets.inactive.bg_fill;
         context.set_style(style);
     }
 
@@ -1602,9 +1663,12 @@ impl UniDirStatApp {
                     self.page = Page::Settings;
                 }
                 controls_ui.label(
-                    RichText::new(tr("UniDirStat 0.1.0 | Rust"))
-                        .size(HELP_SIZE)
-                        .color(muted(&controls_ui)),
+                    RichText::new(trf(
+                        "UniDirStat {version} | Rust",
+                        &[("version", env!("CARGO_PKG_VERSION").to_owned())],
+                    ))
+                    .size(HELP_SIZE)
+                    .color(muted(&controls_ui)),
                 );
             });
     }
@@ -2708,7 +2772,7 @@ impl UniDirStatApp {
             ui.label(tr("Releases have not been published yet. Update checks will be available after publication."));
         });
         ui.add_space(12.0);
-        card(ui).show(ui,|ui| { ui.set_min_width(ui.available_width()); ui.strong(tr("UniDirStat 0.1.0")); ui.label(tr("A Rust disk usage explorer inspired by WinDirStat. Native Windows, macOS and Linux architecture. Your scan stays on your computer.")); ui.hyperlink_to(tr("WinDirStat reference project"),"https://github.com/windirstat/windirstat"); ui.label(RichText::new(tr("Raw NTFS/MTP scanning, deleted-file recovery, ACL editing and OS-specific cleanup tools are not implemented.")).small().color(muted(ui))); });
+        card(ui).show(ui,|ui| { ui.set_min_width(ui.available_width()); ui.strong(trf("UniDirStat {version}", &[("version", env!("CARGO_PKG_VERSION").to_owned())])); ui.label(tr("A Rust disk usage explorer inspired by WinDirStat. Native Windows, macOS and Linux architecture. Your scan stays on your computer.")); ui.hyperlink_to(tr("WinDirStat reference project"),"https://github.com/windirstat/windirstat"); ui.label(RichText::new(tr("Raw NTFS/MTP scanning, deleted-file recovery, ACL editing and OS-specific cleanup tools are not implemented.")).small().color(muted(ui))); });
     }
 
     fn inspector(&mut self, context: &egui::Context) {
@@ -4191,6 +4255,56 @@ mod tests {
     #[test]
     fn primary_button_has_readable_white_text() {
         assert!(contrast(Color32::WHITE, PRIMARY_BUTTON) >= 4.5);
+    }
+
+    #[test]
+    fn sidebar_version_follows_the_package_version() {
+        let context = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(context.clone());
+        let mut app = UniDirStatApp::new(&creation, Vec::new(), None, ScanOptions::default(), None);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1700.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| app.sidebar(context),
+        );
+        let expected = format!("UniDirStat {} | Rust", env!("CARGO_PKG_VERSION"));
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == expected)
+        }));
+    }
+
+    #[test]
+    fn control_surfaces_follow_the_theme_with_readable_text_and_focus() {
+        let context = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(context.clone());
+        let mut app = UniDirStatApp::new(&creation, Vec::new(), None, ScanOptions::default(), None);
+        for theme in [Theme::Dark, Theme::Light, Theme::Dark] {
+            app.settings.theme = theme;
+            app.apply_theme(&context);
+            let visuals = context.style().visuals.clone();
+            let widgets = &visuals.widgets;
+            if theme == Theme::Dark {
+                assert!(widgets.inactive.weak_bg_fill.r() < 40);
+                assert!(widgets.inactive.weak_bg_fill.b() > widgets.inactive.weak_bg_fill.r());
+            }
+            for widget in [
+                widgets.inactive,
+                widgets.hovered,
+                widgets.active,
+                widgets.open,
+            ] {
+                assert!(contrast(widget.text_color(), widget.weak_bg_fill) >= 4.5);
+            }
+            assert!(contrast(visuals.text_color(), visuals.panel_fill) >= 4.5);
+            assert!(contrast(visuals.selection.stroke.color, visuals.selection.bg_fill) >= 4.5);
+            assert!(contrast(widgets.active.bg_stroke.color, widgets.active.weak_bg_fill) >= 3.0);
+            assert!(contrast(widgets.inactive.bg_stroke.color, visuals.extreme_bg_color) >= 3.0);
+        }
     }
 
     #[test]

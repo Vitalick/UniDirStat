@@ -168,13 +168,13 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str, selected: bool) -> e
         response.request_focus();
     }
     let visuals = ui.style().interact_selectable(&response, selected);
-    ui.painter().rect(
-        rect,
-        3.0,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-        StrokeKind::Inside,
-    );
+    if selected
+        || response.hovered()
+        || response.has_focus()
+        || response.is_pointer_button_down_on()
+    {
+        ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
+    }
     let font = FontId::monospace(BODY_SIZE);
     let (value_galley, reserved_width) = ui.fonts_mut(|fonts| {
         let value_galley =
@@ -1014,6 +1014,22 @@ impl UniDirStatApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_summary_rows_do_not_paint_button_boxes() {
+        let context = egui::Context::default();
+        let mut row = egui::Rect::NOTHING;
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                row = summary_row(ui, "zip", "1.25 GiB", false).rect;
+            });
+        });
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == row)
+            })
+        );
+    }
 
     fn summary_fixture(
         context: &egui::Context,
