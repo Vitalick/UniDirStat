@@ -22,9 +22,9 @@ Open the macOS DMG and drag UniDirStat into Applications; on Windows, run the in
 
 macOS builds use local ad-hoc signing and are not notarized; Windows installers are unsigned. The OS may show an unverified-publisher warning. Do not disable system security protections. The in-app update check is currently a placeholder and makes no network requests.
 
-![UniDirStat — dark theme](docs/screenshots/dark.png)
+![UniDirStat — English interface, dark theme](docs/screenshots/en-dark.jpg)
 
-[Light-theme screenshot](docs/screenshots/light.png). These macOS screenshots use a disposable sparse-file fixture, not a user's disk inventory.
+[English interface, light theme](docs/screenshots/en-light.jpg). These screenshots show the current macOS application with a read-only demonstration snapshot, not a user's disk inventory.
 
 ## Build and run
 
