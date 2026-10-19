@@ -97,7 +97,7 @@ jobs:
           $process = Start-Process $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$destination`"" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw 'UniDirStat installation failed.' }
           $binary = Join-Path $destination 'unidirstat.exe'
-          & $binary --help
+          & $binary --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Installed UniDirStat did not start.' }
           $dependencies = & dumpbin /dependents $binary
           if ($LASTEXITCODE -ne 0 -or ($dependencies -match '(?i)(VCRUNTIME|MSVCP)[0-9].*\.dll')) { throw 'Unexpected Visual C++ runtime dependency.' }
