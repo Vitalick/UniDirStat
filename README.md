@@ -38,6 +38,12 @@ If UniDirStat is useful to you, you can [support development with a voluntary co
 
 ## Stars
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Vitalick/UniDirStat&type=Date)](https://www.star-history.com/#Vitalick/UniDirStat&Date)
+<a href="https://www.star-history.com/?type=date&repos=Vitalick%2FUniDirStat">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Vitalick/UniDirStat&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Vitalick/UniDirStat&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Vitalick/UniDirStat&type=date&legend=top-left" />
+ </picture>
+</a>
 
 **License:** [GPL-3.0-or-later](LICENSE). [Attribution and font license](docs/guide.md#license).
