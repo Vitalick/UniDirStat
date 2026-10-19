@@ -858,12 +858,11 @@ fn update_progress(control: &ScanControl, node: &Node) {
             Some(total.saturating_add(node.logical_size))
         });
     if let Some(allocated) = node.allocated_size {
-        let _ =
-            control
-                .allocated_bytes
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                    Some(total.saturating_add(allocated))
-                });
+        let _ = control
+            .allocated_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.saturating_add(allocated))
+            });
     } else {
         control.unknown_allocations.fetch_add(1, Ordering::Relaxed);
     }
