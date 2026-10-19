@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -24,7 +24,7 @@ pub struct Tile {
     pub rect: Rect,
 }
 
-/// Splits the longest rectangle edge at a balanced weight boundary.
+/// Packs descending weights into rows with a minimum proportion of 0.4.
 ///
 /// Weights are stably sorted from largest to smallest. Zero weights and invalid
 /// bounds are ignored. Coordinates use `f32`, so subpixel tiles can collapse.
@@ -36,54 +36,140 @@ pub fn treemap(weights: &[(usize, u64)], bounds: Rect) -> Vec<Tile> {
         .iter()
         .copied()
         .filter(|entry| entry.1 > 0)
+        .map(|(node, size)| (node, u128::from(size)))
         .collect();
     weights.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let mut tiles = Vec::with_capacity(weights.len());
-    let mut pending = vec![(weights.as_slice(), bounds)];
-    while let Some((entries, bounds)) = pending.pop() {
-        if entries.len() <= 1 {
-            if let Some(&(node, _)) = entries.first() {
-                tiles.push(Tile { node, rect: bounds });
+    let control = LayoutControl::default();
+    if let Some(rows) = partition_rows(&weights, bounds, &control) {
+        for row in rows {
+            if let Some(children) = partition_row(
+                &weights[row.start..row.end],
+                row.rect,
+                bounds.width >= bounds.height,
+                &control,
+            ) {
+                tiles.extend(children);
             }
-            continue;
         }
-        let total: f64 = entries.iter().map(|entry| entry.1 as f64).sum();
-        let mut split = 1;
-        let mut left_total = entries[0].1 as f64;
-        while split + 1 < entries.len() {
-            let next_total = left_total + entries[split].1 as f64;
-            if (next_total - total / 2.0).abs() > (left_total - total / 2.0).abs() {
-                break;
-            }
-            left_total = next_total;
-            split += 1;
-        }
-        let fraction = (left_total / total) as f32;
-        let (first, second) = if bounds.width >= bounds.height {
-            let width = bounds.width * fraction;
-            (
-                Rect { width, ..bounds },
-                Rect {
-                    x: bounds.x + width,
-                    width: bounds.width - width,
-                    ..bounds
-                },
-            )
-        } else {
-            let height = bounds.height * fraction;
-            (
-                Rect { height, ..bounds },
-                Rect {
-                    y: bounds.y + height,
-                    height: bounds.height - height,
-                    ..bounds
-                },
-            )
-        };
-        pending.push((&entries[split..], second));
-        pending.push((&entries[..split], first));
     }
     tiles
+}
+
+struct Row {
+    start: usize,
+    end: usize,
+    rect: Rect,
+}
+
+fn partition_rows(
+    weights: &[(usize, u128)],
+    bounds: Rect,
+    control: &LayoutControl,
+) -> Option<Vec<Row>> {
+    let total: u128 = weights.iter().map(|entry| entry.1).sum();
+    if total == 0 {
+        return Some(Vec::new());
+    }
+    let horizontal = bounds.width >= bounds.height;
+    let (extent, columns, origin) = if horizontal {
+        (bounds.height, bounds.width, bounds.y)
+    } else {
+        (bounds.width, bounds.height, bounds.x)
+    };
+    let normalized_width = f64::from(columns) / f64::from(extent);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut top = f64::from(origin);
+    while start < weights.len() {
+        let mut end = start;
+        let mut row_weight = 0_u128;
+        while end < weights.len() {
+            control.add_work(1);
+            control.advance()?;
+            let next_weight = row_weight + weights[end].1;
+            let fraction = next_weight as f64 / total as f64;
+            let proportion =
+                weights[end].1 as f64 / total as f64 * normalized_width / fraction / fraction;
+            if end > start && proportion < 0.4 {
+                break;
+            }
+            row_weight = next_weight;
+            end += 1;
+        }
+        let next_top = if end == weights.len() {
+            f64::from(origin) + f64::from(extent)
+        } else {
+            top + row_weight as f64 / total as f64 * f64::from(extent)
+        };
+        let row_origin = top as f32;
+        let row_extent = (next_top as f32 - row_origin).max(0.0);
+        rows.push(Row {
+            start,
+            end,
+            rect: if horizontal {
+                Rect {
+                    y: row_origin,
+                    height: row_extent,
+                    ..bounds
+                }
+            } else {
+                Rect {
+                    x: row_origin,
+                    width: row_extent,
+                    ..bounds
+                }
+            },
+        });
+        top = next_top;
+        start = end;
+    }
+    Some(rows)
+}
+
+fn partition_row(
+    weights: &[(usize, u128)],
+    bounds: Rect,
+    horizontal: bool,
+    control: &LayoutControl,
+) -> Option<Vec<Tile>> {
+    let total: u128 = weights.iter().map(|entry| entry.1).sum();
+    let (origin, extent) = if horizontal {
+        (bounds.x, bounds.width)
+    } else {
+        (bounds.y, bounds.height)
+    };
+    let mut consumed = 0_u128;
+    let mut left = origin;
+    let mut tiles = Vec::with_capacity(weights.len());
+    control.add_work(weights.len());
+    for &(node, weight) in weights {
+        control.advance()?;
+        consumed += weight;
+        let right = if consumed == total {
+            origin + extent
+        } else {
+            (f64::from(origin) + consumed as f64 / total as f64 * f64::from(extent)) as f32
+        };
+        tiles.push(Tile {
+            node,
+            rect: if horizontal {
+                Rect {
+                    x: left,
+                    width: (right - left).max(0.0),
+                    ..bounds
+                }
+            } else {
+                Rect {
+                    y: left,
+                    height: (right - left).max(0.0),
+                    ..bounds
+                }
+            },
+        });
+        left = right;
+    }
+    Some(tiles)
 }
 
 fn valid_bounds(bounds: Rect) -> bool {
@@ -225,7 +311,18 @@ impl LayoutControl {
 pub struct TreemapLayout {
     pub tiles: Vec<Tile>,
     pub frames: Vec<Tile>,
-    pub aggregates: Vec<Tile>,
+    pub aggregates: Vec<Aggregate>,
+}
+
+/// Same-color tiny files belonging to one containing directory.
+#[derive(Debug, PartialEq)]
+pub struct Aggregate {
+    pub owner: Option<usize>,
+    pub rect: Rect,
+    pub color: usize,
+    pub bytes: u128,
+    pub count: usize,
+    pub extensions: Vec<String>,
 }
 
 /// Builds file rectangles within contiguous, proportional directory regions.
@@ -240,14 +337,29 @@ pub fn treemap_for_snapshot(
     Some(treemap_hierarchy(snapshot, roots, allocated, bounds, control)?.tiles)
 }
 
-/// Builds a cancellable hierarchy with explicit regions for omitted contents.
-/// Aggregate nodes identify the containing directory where one is available.
+/// Builds a cancellable hierarchy, grouping tiny files by their extension hash.
 pub fn treemap_hierarchy(
     snapshot: &Snapshot,
     roots: &[usize],
     allocated: bool,
     bounds: Rect,
     control: &LayoutControl,
+) -> Option<TreemapLayout> {
+    treemap_hierarchy_with_colors(snapshot, roots, allocated, bounds, control, |extension| {
+        extension.bytes().fold(0_usize, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(usize::from(byte))
+        })
+    })
+}
+
+/// Builds a hierarchy with tiny file groups keyed by the caller's color palette.
+pub fn treemap_hierarchy_with_colors(
+    snapshot: &Snapshot,
+    roots: &[usize],
+    allocated: bool,
+    bounds: Rect,
+    control: &LayoutControl,
+    color_key: impl Fn(&str) -> usize,
 ) -> Option<TreemapLayout> {
     if control.is_cancelled() {
         return None;
@@ -270,61 +382,108 @@ pub fn treemap_hierarchy(
                 && matches!(node.kind, EntryKind::File | EntryKind::Directory)
                 && visited.insert(index)
             {
-                weights.push((index, node.size(allocated)));
+                weights.push((index, u128::from(node.size(allocated))));
             }
         }
         if weights.is_empty() {
-            if let Some(node) = owner {
-                result.aggregates.push(Tile { node, rect: bounds });
-            }
             continue;
         }
-        let aggregate_node = owner.unwrap_or(weights[0].0);
-        let partitions = partition_visible(&weights, bounds, control)?;
-        control.add_work(partitions.len());
-        for (index, rect) in partitions {
-            control.advance()?;
-            let Some(node) = index else {
-                result.aggregates.push(Tile {
-                    node: aggregate_node,
-                    rect,
-                });
+        let weights = sort_weights(weights, control)?;
+        let rows = partition_rows(&weights, bounds, control)?;
+        let horizontal = bounds.width >= bounds.height;
+        let mut tiny_rows: Option<(usize, usize, Rect)> = None;
+        for row in rows {
+            let tiles = partition_row(&weights[row.start..row.end], row.rect, horizontal, control)?;
+            if tiles.iter().all(|tile| {
+                snapshot.nodes[tile.node].kind == EntryKind::File && !readable_tile(tile.rect)
+            }) {
+                if let Some((_, end, rect)) = &mut tiny_rows {
+                    *end = row.end;
+                    *rect = enclosing_rect(*rect, row.rect);
+                } else {
+                    tiny_rows = Some((row.start, row.end, row.rect));
+                }
                 continue;
-            };
-            let tile = Tile { node, rect };
-            if snapshot.nodes[node].kind == EntryKind::Directory {
-                result.frames.push(tile);
-                groups.push((snapshot.nodes[node].children.as_slice(), rect, Some(node)));
-            } else {
-                result.tiles.push(tile);
             }
+            if let Some((start, end, rect)) = tiny_rows.take() {
+                result.aggregates.extend(aggregate_files(
+                    snapshot,
+                    &weights[start..end],
+                    owner,
+                    allocated,
+                    rect,
+                    control,
+                    &color_key,
+                )?);
+            }
+            let mut tiny_start = None;
+            for (offset, &tile) in tiles.iter().enumerate() {
+                control.add_work(1);
+                control.advance()?;
+                if snapshot.nodes[tile.node].kind == EntryKind::File && !readable_tile(tile.rect) {
+                    tiny_start.get_or_insert(offset);
+                    continue;
+                }
+                if let Some(start) = tiny_start.take() {
+                    let rect = enclosing_rect(tiles[start].rect, tiles[offset - 1].rect);
+                    result.aggregates.extend(aggregate_files(
+                        snapshot,
+                        &weights[row.start + start..row.start + offset],
+                        owner,
+                        allocated,
+                        rect,
+                        control,
+                        &color_key,
+                    )?);
+                }
+                if snapshot.nodes[tile.node].kind == EntryKind::Directory {
+                    result.frames.push(tile);
+                    groups.push((
+                        snapshot.nodes[tile.node].children.as_slice(),
+                        tile.rect,
+                        Some(tile.node),
+                    ));
+                } else {
+                    result.tiles.push(tile);
+                }
+            }
+            if let Some(start) = tiny_start {
+                let rect = enclosing_rect(tiles[start].rect, tiles[tiles.len() - 1].rect);
+                result.aggregates.extend(aggregate_files(
+                    snapshot,
+                    &weights[row.start + start..row.end],
+                    owner,
+                    allocated,
+                    rect,
+                    control,
+                    &color_key,
+                )?);
+            }
+        }
+        if let Some((start, end, rect)) = tiny_rows {
+            result.aggregates.extend(aggregate_files(
+                snapshot,
+                &weights[start..end],
+                owner,
+                allocated,
+                rect,
+                control,
+                &color_key,
+            )?);
         }
     }
     Some(result)
 }
 
-fn partition_visible(
-    weights: &[(usize, u64)],
-    bounds: Rect,
+fn sort_weights(
+    weights: Vec<(usize, u128)>,
     control: &LayoutControl,
-) -> Option<Vec<(Option<usize>, Rect)>> {
-    let mut total = 0_u128;
-    control.add_work(weights.len());
-    for &(_, size) in weights {
-        control.advance()?;
-        total += u128::from(size);
-    }
-    if total == 0 {
-        return Some(Vec::new());
-    }
+) -> Option<Vec<(usize, u128)>> {
     let mut heap = BinaryHeap::new();
     control.add_work(weights.len());
-    for (order, &(node, size)) in weights.iter().enumerate() {
+    for (order, (node, size)) in weights.into_iter().enumerate() {
         control.advance()?;
-        if size == 0 {
-            continue;
-        }
-        heap.push((u128::from(size), Reverse(order), Some(node)));
+        heap.push((size, Reverse(order), node));
     }
     let mut sorted = Vec::with_capacity(heap.len());
     control.add_work(heap.len());
@@ -332,72 +491,73 @@ fn partition_visible(
         control.advance()?;
         sorted.push((node, size));
     }
-    let mut prefixes = Vec::with_capacity(sorted.len() + 1);
-    prefixes.push(0_u128);
-    let mut consumed = 0_u128;
-    control.add_work(sorted.len());
-    for &(_, size) in &sorted {
-        control.advance()?;
-        consumed += size;
-        prefixes.push(consumed);
+    Some(sorted)
+}
+
+fn readable_tile(rect: Rect) -> bool {
+    rect.width >= 4.0 && rect.height >= 4.0 && rect.width * rect.height >= 24.0
+}
+
+fn enclosing_rect(first: Rect, second: Rect) -> Rect {
+    let x = first.x.min(second.x);
+    let y = first.y.min(second.y);
+    Rect {
+        x,
+        y,
+        width: (first.x + first.width).max(second.x + second.width) - x,
+        height: (first.y + first.height).max(second.y + second.height) - y,
     }
-    let mut tiles = Vec::new();
-    let mut pending = vec![(0, sorted.len(), bounds)];
-    control.add_work(1);
-    while let Some((start, end, bounds)) = pending.pop() {
+}
+
+fn aggregate_files(
+    snapshot: &Snapshot,
+    weights: &[(usize, u128)],
+    owner: Option<usize>,
+    allocated: bool,
+    bounds: Rect,
+    control: &LayoutControl,
+    color_key: &impl Fn(&str) -> usize,
+) -> Option<Vec<Aggregate>> {
+    let mut colors = BTreeMap::<usize, (u128, usize, BTreeSet<String>)>::new();
+    control.add_work(weights.len());
+    for &(node, _) in weights {
         control.advance()?;
-        let total = prefixes[end] - prefixes[start];
-        let largest_area = f64::from(bounds.width)
-            * f64::from(bounds.height)
-            * (sorted[start].1 as f64 / total as f64);
-        if bounds.width < 4.0 || bounds.height < 4.0 || largest_area < 24.0 {
-            tiles.push((None, bounds));
-            continue;
-        }
-        if end - start == 1 {
-            tiles.push((sorted[start].0, bounds));
-            continue;
-        }
-        let half = total as f64 / 2.0;
-        let mut split = start
-            + 1
-            + prefixes[start + 1..end]
-                .partition_point(|&prefix| ((prefix - prefixes[start]) as f64) < half);
-        split = split.min(end - 1);
-        if split > start + 1 {
-            let previous = (prefixes[split - 1] - prefixes[start]) as f64;
-            let current = (prefixes[split] - prefixes[start]) as f64;
-            if (previous - half).abs() < (current - half).abs() {
-                split -= 1;
-            }
-        }
-        let fraction = (prefixes[split] - prefixes[start]) as f64 / total as f64;
-        let (first, second) = if bounds.width >= bounds.height {
-            let width = bounds.width * fraction as f32;
-            (
-                Rect { width, ..bounds },
-                Rect {
-                    x: bounds.x + width,
-                    width: bounds.width - width,
-                    ..bounds
-                },
-            )
-        } else {
-            let height = bounds.height * fraction as f32;
-            (
-                Rect { height, ..bounds },
-                Rect {
-                    y: bounds.y + height,
-                    height: bounds.height - height,
-                    ..bounds
-                },
-            )
-        };
-        control.add_work(2);
-        pending.push((split, end, second));
-        pending.push((start, split, first));
+        let extension = snapshot.nodes[node].extension();
+        let group = colors.entry(color_key(&extension)).or_default();
+        group.0 += u128::from(snapshot.nodes[node].size(allocated));
+        group.1 += 1;
+        group.2.insert(extension);
     }
-    Some(tiles)
+    let mut aggregates: Vec<_> = colors
+        .into_iter()
+        .map(|(color, (bytes, count, extensions))| Aggregate {
+            owner,
+            rect: bounds,
+            color,
+            bytes,
+            count,
+            extensions: extensions.into_iter().collect(),
+        })
+        .collect();
+    let weights = sort_weights(
+        aggregates
+            .iter()
+            .enumerate()
+            .map(|(index, group)| (index, group.bytes))
+            .collect(),
+        control,
+    )?;
+    for row in partition_rows(&weights, bounds, control)? {
+        for tile in partition_row(
+            &weights[row.start..row.end],
+            row.rect,
+            bounds.width >= bounds.height,
+            control,
+        )? {
+            aggregates[tile.node].rect = tile.rect;
+        }
+    }
+    Some(aggregates)
 }
 
 fn hierarchy_visible(
@@ -642,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn treemap_balances_equal_weights_into_squares() {
+    fn treemap_packs_equal_weights_into_classic_rows() {
         let tiles = treemap(
             &[(0, 1), (1, 1), (2, 1), (3, 1)],
             Rect {
@@ -654,11 +814,62 @@ mod tests {
         );
 
         assert_eq!(tiles.len(), 4);
-        assert!(
-            tiles
-                .iter()
-                .all(|tile| tile.rect.width == 50.0 && tile.rect.height == 50.0)
+        assert_eq!(tiles[0].rect.height, 75.0);
+        assert!((tiles[0].rect.width - 100.0 / 3.0).abs() < 0.001);
+        assert_eq!(
+            tiles[3].rect,
+            Rect {
+                x: 0.0,
+                y: 75.0,
+                width: 100.0,
+                height: 25.0
+            }
         );
+    }
+
+    #[test]
+    fn treemap_rows_follow_the_parent_orientation_and_proportion_rule() {
+        let weights = [(0, 6), (1, 3), (2, 1)];
+        for (width, height, expected) in [
+            (
+                100.0,
+                100.0,
+                [
+                    (0.0, 0.0, 100.0, 60.0),
+                    (0.0, 60.0, 75.0, 40.0),
+                    (75.0, 60.0, 25.0, 40.0),
+                ],
+            ),
+            (
+                100.0,
+                200.0,
+                [
+                    (0.0, 0.0, 90.0, 200.0 / 3.0 * 2.0),
+                    (0.0, 200.0 / 3.0 * 2.0, 90.0, 200.0 / 3.0),
+                    (90.0, 0.0, 10.0, 200.0),
+                ],
+            ),
+        ] {
+            let tiles = treemap(
+                &weights,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height,
+                },
+            );
+            for (tile, (x, y, width, height)) in tiles.iter().zip(expected) {
+                for (actual, expected) in [
+                    (tile.rect.x, x),
+                    (tile.rect.y, y),
+                    (tile.rect.width, width),
+                    (tile.rect.height, height),
+                ] {
+                    assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -883,33 +1094,232 @@ mod tests {
     }
 
     #[test]
-    fn dense_treemap_aggregates_unreadable_tiles_without_losing_area() {
-        let weights: Vec<_> = (0..4_096).map(|index| (index, 1)).collect();
-        let control = LayoutControl::default();
-        let partitions = partition_visible(
-            &weights,
+    fn tiny_files_keep_separate_colors_without_one_block_per_row() {
+        let mut snapshot = fixture();
+        let template = snapshot.nodes[2].clone();
+        snapshot.nodes = std::iter::once(Node {
+            path: PathBuf::from("root"),
+            parent: None,
+            children: (1..=20_000).collect(),
+            kind: EntryKind::Directory,
+            logical_size: 20_000,
+            ..template.clone()
+        })
+        .chain((1..=20_000).map(|index| Node {
+            path: PathBuf::from(format!(
+                "root/{index}.{}",
+                if index % 2 == 0 { "txt" } else { "bin" }
+            )),
+            parent: Some(0),
+            logical_size: 1,
+            ..template.clone()
+        }))
+        .collect();
+        let geometry = treemap_hierarchy(
+            &snapshot,
+            &[0],
+            false,
             Rect {
                 x: 0.0,
                 y: 0.0,
                 width: 200.0,
                 height: 100.0,
             },
-            &control,
+            &LayoutControl::default(),
         )
         .unwrap();
 
-        assert_eq!(partitions.len(), 1);
-        assert!(partitions.iter().all(|(node, rect)| {
-            node.is_none()
-                || rect.width >= 4.0 && rect.height >= 4.0 && rect.width * rect.height >= 24.0
+        assert!(geometry.tiles.is_empty());
+        assert_eq!(geometry.aggregates.len(), 2);
+        for aggregate in &geometry.aggregates {
+            assert_eq!(aggregate.owner, Some(0));
+            assert_eq!(aggregate.count, 10_000);
+            assert_eq!(aggregate.bytes, 10_000);
+            assert_eq!(aggregate.extensions.len(), 1);
+            assert!((aggregate.rect.width * aggregate.rect.height - 10_000.0).abs() < 0.01);
+        }
+        let shared_color = treemap_hierarchy_with_colors(
+            &snapshot,
+            &[0],
+            false,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            &LayoutControl::default(),
+            |_| 7,
+        )
+        .unwrap();
+        assert_eq!(shared_color.aggregates.len(), 1);
+        let aggregate = &shared_color.aggregates[0];
+        assert_eq!(
+            (aggregate.color, aggregate.count, aggregate.bytes),
+            (7, 20_000, 20_000)
+        );
+        assert_eq!(aggregate.extensions, ["bin", "txt"]);
+        assert_eq!(
+            aggregate.rect,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0
+            }
+        );
+    }
+
+    #[test]
+    fn tiny_groups_keep_their_containing_folders_and_reveal_files_when_zoomed() {
+        let mut snapshot = fixture();
+        let template = snapshot.nodes[2].clone();
+        snapshot.nodes = vec![
+            Node {
+                kind: EntryKind::Directory,
+                children: vec![1, 2],
+                logical_size: 512,
+                ..template.clone()
+            },
+            Node {
+                kind: EntryKind::Directory,
+                parent: Some(0),
+                children: (3..259).collect(),
+                logical_size: 256,
+                ..template.clone()
+            },
+            Node {
+                kind: EntryKind::Directory,
+                parent: Some(0),
+                children: (259..515).collect(),
+                logical_size: 256,
+                ..template.clone()
+            },
+        ];
+        snapshot.nodes.extend((3..515).map(|index| Node {
+            path: PathBuf::from(format!("root/{index}.txt")),
+            parent: Some(if index < 259 { 1 } else { 2 }),
+            logical_size: 1,
+            ..template.clone()
         }));
-        let area: f32 = partitions
-            .iter()
-            .map(|(_, rect)| rect.width * rect.height)
-            .sum();
-        assert!((area - 20_000.0).abs() < 0.01);
-        let (processed, total) = control.progress();
-        assert_eq!(processed, total);
+        let coarse = treemap_hierarchy_with_colors(
+            &snapshot,
+            &[0],
+            false,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 128.0,
+                height: 64.0,
+            },
+            &LayoutControl::default(),
+            |_| 0,
+        )
+        .unwrap();
+        assert!(coarse.tiles.is_empty());
+        assert_eq!(coarse.aggregates.len(), 2);
+        for owner in [1, 2] {
+            let aggregate = coarse
+                .aggregates
+                .iter()
+                .find(|group| group.owner == Some(owner))
+                .unwrap();
+            let frame = coarse
+                .frames
+                .iter()
+                .find(|tile| tile.node == owner)
+                .unwrap();
+            assert_eq!(aggregate.rect, frame.rect);
+            assert_eq!((aggregate.count, aggregate.bytes), (256, 256));
+        }
+        let fine = treemap_hierarchy_with_colors(
+            &snapshot,
+            &[0],
+            false,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 512.0,
+                height: 256.0,
+            },
+            &LayoutControl::default(),
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(fine.tiles.len(), 512);
+        assert!(fine.aggregates.is_empty());
+    }
+
+    #[test]
+    fn tiny_root_files_have_no_invented_owner_and_grouping_can_be_cancelled() {
+        let mut snapshot = fixture();
+        snapshot.nodes[2].logical_size = 1;
+        snapshot.nodes[3].logical_size = 1;
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 4.0,
+        };
+        let geometry = treemap_hierarchy_with_colors(
+            &snapshot,
+            &[2, 3],
+            false,
+            bounds,
+            &LayoutControl::default(),
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(geometry.aggregates.len(), 1);
+        assert_eq!(geometry.aggregates[0].owner, None);
+        assert_eq!(
+            (geometry.aggregates[0].count, geometry.aggregates[0].bytes),
+            (2, 2)
+        );
+        let control = LayoutControl::default();
+        assert!(
+            treemap_hierarchy_with_colors(&snapshot, &[2, 3], false, bounds, &control, |_| {
+                control.cancel();
+                0
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn treemap_descends_through_tiny_directories_without_gray_remainders_or_recursion() {
+        let mut snapshot = fixture();
+        let template = snapshot.nodes[2].clone();
+        snapshot.nodes = (0_usize..10_000)
+            .map(|index| Node {
+                parent: index.checked_sub(1),
+                kind: if index < 9_999 {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                },
+                children: if index < 9_999 {
+                    vec![index + 1]
+                } else {
+                    vec![]
+                },
+                logical_size: 1,
+                ..template.clone()
+            })
+            .collect();
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 1.0,
+        };
+        let geometry =
+            treemap_hierarchy(&snapshot, &[0], false, bounds, &LayoutControl::default()).unwrap();
+        assert_eq!(geometry.frames.len(), 9_999);
+        assert_eq!(geometry.aggregates.len(), 1);
+        assert_eq!(geometry.aggregates[0].owner, Some(9_998));
+        assert_eq!(geometry.aggregates[0].rect, bounds);
+        assert_eq!(geometry.aggregates[0].bytes, 1);
     }
 
     #[test]
@@ -973,15 +1383,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(geometry.aggregates.len(), 1);
-        assert_eq!(geometry.aggregates[0].node, 1);
+        assert_eq!(geometry.aggregates[0].owner, Some(1));
+        assert_eq!(geometry.aggregates[0].count, 1);
+        assert_eq!(geometry.aggregates[0].bytes, 1);
         let aggregate = geometry.aggregates[0].rect;
         assert!((aggregate.width * aggregate.height - 100.0 / 1_001.0).abs() < 0.001);
         let area: f32 = geometry
             .tiles
             .iter()
-            .chain(&geometry.aggregates)
             .map(|tile| tile.rect.width * tile.rect.height)
-            .sum();
+            .sum::<f32>()
+            + geometry
+                .aggregates
+                .iter()
+                .map(|tile| tile.rect.width * tile.rect.height)
+                .sum::<f32>();
         assert!((area - 100.0).abs() < 0.001);
     }
 

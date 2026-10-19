@@ -1,8 +1,13 @@
 use super::workspace::{info_button, paint_label};
 use super::*;
+use crate::file_colors::FILE_PALETTE;
 
 const MAP_LABEL_SIZE: f32 = 14.0;
 const MAP_LABEL_HEIGHT: f32 = MAP_LABEL_SIZE * 1.5;
+
+fn readable_map_region(rect: egui::Rect) -> bool {
+    rect.width() >= 4.0 && rect.height() >= 4.0 && rect.area() >= 24.0
+}
 
 fn tile_shape(rect: egui::Rect, gap: f32) -> (egui::Rect, f32) {
     let detail = ((rect.width().min(rect.height()) - 12.0) / 20.0).clamp(0.0, 1.0);
@@ -157,6 +162,12 @@ impl UniDirStatApp {
                     self.map_focus = self.selection.primary().and_then(|index| if snapshot.nodes[index].kind == EntryKind::Directory { Some(index) } else { snapshot.nodes[index].parent });
                 }
                 ui.label(format!("{:.0}%", self.map_viewport.scale * 100.0));
+                let count = trf("{count} visible entries", &[("count", self.rows.len().to_string())]);
+                let count_width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(count.clone(), FontId::proportional(BODY_SIZE), ui.visuals().text_color()).size().x);
+                let remaining = ui.available_size_before_wrap().x;
+                ui.allocate_ui_with_layout(Vec2::new(remaining.max(count_width), CONTROL_HEIGHT), Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(count).size(BODY_SIZE));
+                });
             });
             ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).truncate());
             if let Some(error) = self.map_worker.error() {
@@ -199,7 +210,7 @@ impl UniDirStatApp {
                     let mut focused = None;
                     for tile in &data.frames {
                         let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
-                        if !bounds.intersects(rect) { continue; }
+                        if !bounds.intersects(rect) || !readable_map_region(rect.intersect(bounds)) { continue; }
                         painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
                         painter.rect_stroke(rect, 2.0, Stroke::new(0.6, muted(ui).gamma_multiply(0.5)), StrokeKind::Inside);
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("directory-region", tile.node)), Sense::click());
@@ -209,23 +220,70 @@ impl UniDirStatApp {
                         let base = base_rect(tile.rect, data, bounds.size());
                         let rect = self.map_viewport.rect(base, bounds.min);
                         if !bounds.intersects(rect) { continue; }
-                        painter.rect_filled(rect, 0.0, ui.visuals().widgets.inactive.bg_fill);
-                        if self.settings.labels { paint_map_label(ui, rect.intersect(bounds).shrink(3.0), tr("Small files"), ui.visuals().text_color()); }
-                        let response = ui.interact(rect.intersect(bounds), ui.id().with(("aggregate", tile.node, tile.rect.x.to_bits(), tile.rect.y.to_bits())), Sense::click());
-                        focused = self.map_item(ui, response.clone(), tile.node, snapshot, base, bounds.size()).or(focused);
-                        let description = || trf("Smaller contents of {path}", &[("path", snapshot.nodes[tile.node].path.display().to_string())]);
-                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, response.enabled(), self.selection.contains(tile.node), description()));
-                        response.on_hover_ui(|ui| { ui.label(description()); });
+                        let fill = FILE_PALETTE[tile.color.min(FILE_PALETTE.len() - 1)];
+                        painter.rect_filled(rect, 0.0, fill);
+                        if !readable_map_region(rect.intersect(bounds)) { continue; }
+                        if tile.owner.is_some_and(|index| selected_region(&self.selection, snapshot, index)) {
+                            painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside);
+                        }
+                        let size = u64::try_from(tile.bytes).map_or_else(|_| format!("{} {}", tile.bytes, tr("B")), format_bytes);
+                        let summary = trf("{count} small files · {size}", &[("count", tile.count.to_string()), ("size", size)]);
+                        let mut extension_names = tile.extensions.iter().take(8).map(String::as_str).collect::<Vec<_>>().join(", ");
+                        if tile.extensions.len() > 8 {
+                            extension_names = trf("{extensions}, and {count} more", &[("extensions", extension_names), ("count", (tile.extensions.len() - 8).to_string())]);
+                        }
+                        let extensions = trf("File types: {extensions}", &[("extensions", extension_names)]);
+                        let owner = tile.owner.map(|index| trf("Containing folder: {path}", &[("path", snapshot.nodes[index].path.display().to_string())]));
+                        if self.settings.labels { paint_map_label(ui, rect.intersect(bounds).shrink(3.0), &summary, tile_text_color(fill)); }
+                        let response = ui.interact(rect.intersect(bounds), ui.id().with(("aggregate", tile.owner, tile.color, tile.rect.x.to_bits(), tile.rect.y.to_bits())), Sense::click());
+                        if response.clicked() && let Some(index) = tile.owner {
+                            let modifiers = click_modifiers(&response.ctx);
+                            self.select_aggregate_owner(index, snapshot, modifiers.command || modifiers.ctrl);
+                        }
+                        if response.clicked() && tile.owner.is_none() {
+                            self.map_viewport.zoom_at(rect.center() - bounds.min, 2.0, bounds.size());
+                            ui.ctx().request_repaint();
+                        }
+                        if response.double_clicked() && let Some(index) = tile.owner {
+                            self.map_viewport.zoom_to(base, bounds.size());
+                            self.map_focus = Some(index);
+                            ui.ctx().request_repaint();
+                        }
+                        let action = if tile.owner.is_some() { tr("Select containing folder") } else { tr("Zoom to selection") };
+                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, response.enabled(), tile.owner.is_some_and(|index| self.selection.contains(index)), format!("{summary}. {extensions}. {}. {action}", owner.as_deref().unwrap_or_default())));
+                        if response.has_focus() { focused = Some(response.rect); }
+                        response.context_menu(|ui| {
+                            if let Some(index) = tile.owner {
+                                if ui.button(tr("Select containing folder")).clicked() {
+                                    self.select_aggregate_owner(index, snapshot, false);
+                                    ui.close();
+                                }
+                                if ui.button(tr("Zoom into folder")).clicked() {
+                                    self.map_focus = Some(index);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        response.on_hover_ui(|ui| {
+                            ui.label(&summary);
+                            ui.label(&extensions);
+                            if let Some(owner) = &owner { ui.label(owner); }
+                            ui.label(action);
+                        });
                     }
                     for tile in &data.tiles {
                         let base = base_rect(tile.rect, data, bounds.size());
                         let rect = self.map_viewport.rect(base, bounds.min);
-                        if !bounds.intersects(rect) || rect.width() < 0.5 || rect.height() < 0.5 { continue; }
+                        if !bounds.intersects(rect) { continue; }
                         let node = &snapshot.nodes[tile.node];
+                        let color = self.file_colors.color(&node.extension());
+                        let fill = Color32::from_rgb(color.r(), color.g(), color.b());
+                        if !readable_map_region(rect.intersect(bounds)) {
+                            painter.rect_filled(rect, 0.0, fill);
+                            continue;
+                        }
                         let (tile_rect, radius) = tile_shape(rect, self.settings.tile_gap);
                         let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
-                        let color = extension_color(&node.extension());
-                        let fill = Color32::from_rgb(color.r(), color.g(), color.b());
                         painter.rect_filled(tile_rect, radius, fill);
                         if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside); }
                         if self.settings.labels && tile_rect.height() >= MAP_LABEL_HEIGHT + 2.0 && tile_rect.width() >= MAP_LABEL_SIZE * 3.0 + 8.0 {
@@ -238,6 +296,7 @@ impl UniDirStatApp {
                     for index in self.selection.indices() {
                         if let Some(tile) = data.frame(index) {
                             let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
+                            if !readable_map_region(rect.intersect(bounds)) { continue; }
                             painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
                         }
                     }
@@ -254,6 +313,17 @@ impl UniDirStatApp {
                 self.scope = Some(index); self.map_viewport = MapViewport::default(); ui.ctx().request_repaint();
             }
         });
+    }
+
+    fn select_aggregate_owner(&mut self, index: usize, snapshot: &Snapshot, toggle: bool) {
+        self.selection.click(index, &[(index, 0)], toggle, false);
+        self.selected = self.selection.primary();
+        let mut parent = snapshot.nodes[index].parent;
+        while let Some(ancestor) = parent {
+            self.rebuild |= self.expanded.insert(ancestor);
+            parent = snapshot.nodes[ancestor].parent;
+        }
+        self.reveal_row = Some(index);
     }
 
     fn map_item(
@@ -315,7 +385,9 @@ impl UniDirStatApp {
             }
             let steps =
                 ((span * outer * self.map_viewport.scale / 6.0).ceil() as usize).clamp(2, 160);
-            let fill = extension_color(&snapshot.nodes[sector.node].extension());
+            let fill = self
+                .file_colors
+                .color(&snapshot.nodes[sector.node].extension());
             let mut mesh = egui::Mesh::default();
             for step in 0..=steps {
                 let angle =
@@ -433,6 +505,268 @@ impl UniDirStatApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_region_actions_require_both_a_usable_span_and_area() {
+        for (size, readable) in [
+            (Vec2::new(4.0, 6.0), true),
+            (Vec2::new(4.0, 5.0), false),
+            (Vec2::new(3.0, 16.0), false),
+            (Vec2::new(8.0, 4.0), true),
+        ] {
+            assert_eq!(
+                readable_map_region(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                readable
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_directory_colors_paint_without_creating_widgets_until_zoomed() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("file.txt"), b"x").unwrap();
+        let mut snapshot = scanner::scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let template = snapshot.nodes[1].clone();
+        let count = 100_000_usize;
+        snapshot.nodes = vec![Node {
+            kind: EntryKind::Directory,
+            parent: None,
+            children: (0..count).map(|index| index * 2 + 1).collect(),
+            logical_size: count as u64,
+            allocated_size: Some(count as u64),
+            ..template.clone()
+        }];
+        for index in 0..count {
+            let folder = index * 2 + 1;
+            snapshot.nodes.push(Node {
+                path: PathBuf::from(format!("root/folder-{index}")),
+                kind: EntryKind::Directory,
+                parent: Some(0),
+                children: vec![folder + 1],
+                logical_size: 1,
+                allocated_size: Some(1),
+                ..template.clone()
+            });
+            snapshot.nodes.push(Node {
+                path: PathBuf::from(format!("root/folder-{index}/file.txt")),
+                parent: Some(folder),
+                logical_size: 1,
+                allocated_size: Some(1),
+                ..template.clone()
+            });
+        }
+        let snapshot = Arc::new(snapshot);
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut app = UniDirStatApp::new(
+            &eframe::CreationContext::_new_kittest(context.clone()),
+            Vec::new(),
+            None,
+            ScanOptions::default(),
+            None,
+        );
+        app.file_colors = Arc::new(FileColors::from_extensions(&[ExtensionStats {
+            extension: "txt".into(),
+            bytes: count as u64,
+            files: count as u64,
+        }]));
+        app.map_worker.set_colors(Arc::clone(&app.file_colors));
+        app.settings.reduced_motion = true;
+        app.map_worker.request(
+            MapKey {
+                scope: None,
+                allocated: false,
+                width: 1000,
+                height: 500,
+                kind: MapKind::Treemap,
+            },
+            Arc::clone(&snapshot),
+            &context,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.map_worker.pending() {
+            assert!(Instant::now() < deadline);
+            app.map_worker.poll();
+            std::thread::yield_now();
+        }
+        let mut colored = Vec::new();
+        let mut node_count = 0;
+        for _ in 0..3 {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(800.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default()
+                        .show(context, |ui| app.map_canvas(ui, &snapshot, 320.0));
+                },
+            );
+            node_count = output.platform_output.accesskit_update.unwrap().nodes.len();
+            colored = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == FILE_PALETTE[0] => Some(rect.rect),
+                    _ => None,
+                })
+                .collect();
+        }
+        assert!(
+            node_count < 200,
+            "tiny regions registered {node_count} accessibility nodes"
+        );
+        assert_eq!(colored.len(), count);
+        let painted = colored
+            .iter()
+            .fold(egui::Rect::NOTHING, |bounds, rect| bounds.union(*rect));
+        let area: f64 = colored
+            .iter()
+            .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
+            .sum();
+        assert!(
+            (area - f64::from(painted.area())).abs() < 1.0,
+            "{area} != {}",
+            painted.area()
+        );
+        app.map_viewport
+            .zoom_at(painted.size() / 2.0, 64.0, painted.size());
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(800.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default()
+                    .show(context, |ui| app.map_canvas(ui, &snapshot, 320.0));
+            },
+        );
+        let labels: Vec<_> = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains(tr("Select containing folder"))),
+            "scale={}, labels={labels:?}",
+            app.map_viewport.scale
+        );
+    }
+
+    #[test]
+    fn wide_map_toolbar_keeps_its_entry_count_on_the_zoom_row_at_the_right_edge() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("file"), b"data").unwrap();
+        let snapshot = Arc::new(
+            scanner::scan(
+                &[fixture.path().into()],
+                &ScanOptions::default(),
+                &ScanControl::default(),
+            )
+            .unwrap(),
+        );
+        let context = egui::Context::default();
+        let mut app = UniDirStatApp::new(
+            &eframe::CreationContext::_new_kittest(context.clone()),
+            Vec::new(),
+            None,
+            ScanOptions::default(),
+            None,
+        );
+        app.rows = vec![(0, 0), (1, 1)];
+        let count = trf("{count} visible entries", &[("count", "2".into())]);
+        let mut count_rect = None;
+        let mut zoom_rect = None;
+        let mut right_edge = 0.0;
+        for _ in 0..3 {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        right_edge = ui.max_rect().right() - 12.0;
+                        app.map_canvas(ui, &snapshot, 400.0);
+                    });
+                },
+            );
+            for shape in output.shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    if text.galley.job.text == count {
+                        count_rect = Some(text.visual_bounding_rect());
+                    }
+                    if text.galley.job.text == "100%" {
+                        zoom_rect = Some(text.visual_bounding_rect());
+                    }
+                }
+            }
+        }
+        let count_rect = count_rect.expect("entry count");
+        let zoom_rect = zoom_rect.expect("zoom amount");
+        assert!(
+            (count_rect.center().y - zoom_rect.center().y).abs() < 8.0,
+            "{count_rect:?}, {zoom_rect:?}"
+        );
+        assert!(
+            (count_rect.right() - right_edge).abs() < 4.0,
+            "{count_rect:?}, {right_edge}"
+        );
+    }
+
+    #[test]
+    fn aggregate_owner_selection_reveals_the_folder_and_updates_details() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("folder")).unwrap();
+        let snapshot = scanner::scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let folder = snapshot
+            .nodes
+            .iter()
+            .position(|node| node.name() == "folder")
+            .unwrap();
+        let context = egui::Context::default();
+        let mut app = UniDirStatApp::new(
+            &eframe::CreationContext::_new_kittest(context),
+            Vec::new(),
+            None,
+            ScanOptions::default(),
+            None,
+        );
+        app.expanded.clear();
+        app.select_aggregate_owner(folder, &snapshot, false);
+        assert_eq!(app.selected, Some(folder));
+        assert_eq!(app.reveal_row, Some(folder));
+        assert!(
+            app.expanded
+                .contains(&snapshot.nodes[folder].parent.unwrap())
+        );
+        app.select_aggregate_owner(folder, &snapshot, true);
+        assert_eq!(app.selected, None);
+    }
 
     #[test]
     fn sunburst_keyboard_roves_visible_sectors_and_activates_the_focused_name() {

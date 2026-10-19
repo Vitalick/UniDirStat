@@ -291,5 +291,17 @@
   "Search": "Search",
   "Search error": "Search error",
   "Search and filters": "Search and filters",
-  "Use arrow keys to choose a segment, then Enter or Space to select it.": "Use arrow keys to choose a segment, then Enter or Space to select it."
+  "Use arrow keys to choose a segment, then Enter or Space to select it.": "Use arrow keys to choose a segment, then Enter or Space to select it.",
+  "Recalculate folder": "Recalculate folder",
+  "Folder recalculation cancelled. Previous results are preserved.": "Folder recalculation cancelled. Previous results are preserved.",
+  "Item moved to trash. Scan results are outdated.": "Item moved to trash. Scan results are outdated.",
+  "The item was moved to trash, but folder recalculation did not finish: {error}": "The item was moved to trash, but folder recalculation did not finish: {error}",
+  "Item moved to trash. Recalculating its parent folder.": "Item moved to trash. Recalculating its parent folder.",
+  "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.": "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.",
+  "{count} small files · {size}": "{count} small files · {size}",
+  "File types: {extensions}": "File types: {extensions}",
+  "Containing folder: {path}": "Containing folder: {path}",
+  "Select containing folder": "Select containing folder",
+  "Zoom into folder": "Zoom into folder",
+  "{extensions}, and {count} more": "{extensions}, and {count} more"
 }

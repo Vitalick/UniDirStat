@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use crate::file_colors::FileColors;
 use eframe::egui;
 use unidirstat::{
     analysis::ExtensionStats,
@@ -37,7 +38,7 @@ pub struct MapData {
     pub tiles: Vec<layout::Tile>,
     pub sectors: Vec<layout::Sector>,
     pub frames: Vec<layout::Tile>,
-    pub aggregates: Vec<layout::Tile>,
+    pub aggregates: Vec<layout::Aggregate>,
     frame_lookup: HashMap<usize, layout::Rect>,
 }
 
@@ -73,6 +74,7 @@ struct SummaryTask {
 struct MapRequest {
     key: MapKey,
     snapshot: Arc<Snapshot>,
+    colors: Arc<FileColors>,
     context: egui::Context,
 }
 
@@ -84,6 +86,7 @@ struct MapTask {
 
 #[derive(Default)]
 pub struct MapWorker {
+    colors: Arc<FileColors>,
     snapshot: Option<Weak<Snapshot>>,
     requested: Option<MapKey>,
     ready: Option<Arc<MapData>>,
@@ -101,6 +104,14 @@ pub struct MapWorker {
 }
 
 impl MapWorker {
+    pub(crate) fn set_colors(&mut self, colors: Arc<FileColors>) {
+        if Arc::ptr_eq(&self.colors, &colors) {
+            return;
+        }
+        self.colors = colors;
+        self.clear_geometry();
+    }
+
     pub fn request(&mut self, key: MapKey, snapshot: Arc<Snapshot>, context: &egui::Context) {
         self.request_summary(key.scope, Arc::clone(&snapshot), context);
         if self.requested == Some(key) {
@@ -129,6 +140,7 @@ impl MapWorker {
         let request = MapRequest {
             key,
             snapshot,
+            colors: Arc::clone(&self.colors),
             context: context.clone(),
         };
         if self.running.is_some() {
@@ -244,7 +256,12 @@ impl MapWorker {
         let spawned = std::thread::Builder::new()
             .name("map-layout".into())
             .spawn(move || {
-                let data = compute(&request.snapshot, request.key, &worker_control);
+                let data = compute(
+                    &request.snapshot,
+                    request.key,
+                    &worker_control,
+                    &request.colors,
+                );
                 let _ = sender.send(data);
                 request.context.request_repaint();
             });
@@ -325,17 +342,21 @@ impl MapWorker {
         self.error.as_deref()
     }
 
-    pub fn clear(&mut self) {
+    fn clear_geometry(&mut self) {
         if let Some(task) = &self.running {
             task.control.cancel();
         }
         self.requested = None;
-        self.snapshot = None;
         self.ready = None;
         self.ready_key = None;
         self.queued = None;
         self.cache.clear();
         self.error = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.clear_geometry();
+        self.snapshot = None;
         if let Some(task) = &self.summary_running {
             task.control.cancel();
         }
@@ -358,7 +379,12 @@ impl Drop for MapWorker {
     }
 }
 
-fn compute(snapshot: &Snapshot, key: MapKey, control: &LayoutControl) -> Option<MapData> {
+fn compute(
+    snapshot: &Snapshot,
+    key: MapKey,
+    control: &LayoutControl,
+    colors: &FileColors,
+) -> Option<MapData> {
     let selected;
     let roots = match key.scope {
         Some(index) => {
@@ -380,8 +406,14 @@ fn compute(snapshot: &Snapshot, key: MapKey, control: &LayoutControl) -> Option<
     };
     match key.kind {
         MapKind::Treemap => {
-            let geometry =
-                layout::treemap_hierarchy(snapshot, roots, key.allocated, bounds, control)?;
+            let geometry = layout::treemap_hierarchy_with_colors(
+                snapshot,
+                roots,
+                key.allocated,
+                bounds,
+                control,
+                |extension| colors.index(extension),
+            )?;
             data.tiles = geometry.tiles;
             data.aggregates = geometry.aggregates;
             let mut seen = HashSet::new();
@@ -583,6 +615,187 @@ mod tests {
             worker.summary_error().is_none(),
             "{:?}",
             worker.summary_error()
+        );
+    }
+
+    #[test]
+    fn map_colors_follow_global_logical_ranks_across_scope_and_metric_changes() {
+        let mut snapshot = snapshot();
+        let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
+        nodes[1].path = PathBuf::from("root/inside.a");
+        nodes[2].path = PathBuf::from("root/outside.b");
+        let context = egui::Context::default();
+        let colors = Arc::new(FileColors::from_extensions(&[
+            ExtensionStats {
+                extension: "a".into(),
+                bytes: 60,
+                files: 1,
+            },
+            ExtensionStats {
+                extension: "b".into(),
+                bytes: 40,
+                files: 1,
+            },
+        ]));
+        let mut worker = MapWorker::default();
+        worker.set_colors(Arc::clone(&colors));
+        for (scope, allocated, expected) in [
+            (None, false, vec![("a", 0), ("b", 1)]),
+            (Some(2), false, vec![("b", 1)]),
+            (None, true, vec![("a", 0), ("b", 1)]),
+        ] {
+            worker.request(
+                MapKey {
+                    scope,
+                    allocated,
+                    width: 8,
+                    height: 3,
+                    ..key()
+                },
+                Arc::clone(&snapshot),
+                &context,
+            );
+            finish(&mut worker);
+            let groups = &worker.data().unwrap().aggregates;
+            for (extension, color) in expected {
+                assert!(
+                    groups
+                        .iter()
+                        .any(|group| group.extensions == [extension] && group.color == color),
+                    "{extension} should retain color {color}: {groups:?}"
+                );
+            }
+            let ready = Arc::clone(worker.data().unwrap());
+            worker.set_colors(Arc::clone(&colors));
+            assert!(Arc::ptr_eq(&ready, worker.data().unwrap()));
+        }
+    }
+
+    #[test]
+    fn replacing_colors_invalidates_cached_and_finished_map_results_but_clear_preserves_colors() {
+        let mut snapshot = snapshot();
+        let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
+        nodes[1].path = PathBuf::from("root/inside.a");
+        nodes[2].path = PathBuf::from("root/outside.b");
+        let context = egui::Context::default();
+        let mut worker = MapWorker::default();
+        worker.request(
+            MapKey {
+                width: 8,
+                height: 3,
+                ..key()
+            },
+            Arc::clone(&snapshot),
+            &context,
+        );
+        finish(&mut worker);
+        finish_summary(&mut worker);
+        let previous = Arc::clone(worker.data().unwrap());
+        let summary = Arc::clone(worker.summary().unwrap());
+        let colors = Arc::new(FileColors::from_extensions(&[
+            ExtensionStats {
+                extension: "b".into(),
+                bytes: 60,
+                files: 1,
+            },
+            ExtensionStats {
+                extension: "a".into(),
+                bytes: 40,
+                files: 1,
+            },
+        ]));
+        worker.set_colors(Arc::clone(&colors));
+        assert!(worker.data().is_none());
+        assert!(worker.cache.is_empty());
+        assert!(Arc::ptr_eq(&summary, worker.summary().unwrap()));
+        worker.clear();
+        worker.request(
+            MapKey {
+                width: 8,
+                height: 3,
+                ..key()
+            },
+            snapshot,
+            &context,
+        );
+        finish(&mut worker);
+        assert!(!Arc::ptr_eq(&previous, worker.data().unwrap()));
+        let groups = &worker.data().unwrap().aggregates;
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.extensions == ["b"] && group.color == 0)
+        );
+    }
+
+    #[test]
+    fn a_finished_job_with_old_colors_cannot_fill_the_same_requested_key() {
+        let mut snapshot = snapshot();
+        let nodes = &mut Arc::make_mut(&mut snapshot).nodes;
+        nodes[1].path = PathBuf::from("root/inside.a");
+        nodes[2].path = PathBuf::from("root/outside.b");
+        let context = egui::Context::default();
+        let old_colors = FileColors::from_extensions(&[
+            ExtensionStats {
+                extension: "a".into(),
+                bytes: 60,
+                files: 1,
+            },
+            ExtensionStats {
+                extension: "b".into(),
+                bytes: 40,
+                files: 1,
+            },
+        ]);
+        let colors = Arc::new(FileColors::from_extensions(&[
+            ExtensionStats {
+                extension: "b".into(),
+                bytes: 60,
+                files: 1,
+            },
+            ExtensionStats {
+                extension: "a".into(),
+                bytes: 40,
+                files: 1,
+            },
+        ]));
+        let key = MapKey {
+            width: 8,
+            height: 3,
+            ..key()
+        };
+        let control = Arc::new(LayoutControl::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(compute(
+                &snapshot,
+                key,
+                &LayoutControl::default(),
+                &old_colors,
+            ))
+            .unwrap();
+        let mut worker = MapWorker::default();
+        worker.snapshot = Some(Arc::downgrade(&snapshot));
+        worker.requested = Some(key);
+        worker.running = Some(MapTask {
+            key,
+            control: Arc::clone(&control),
+            receiver,
+        });
+        worker.set_colors(colors);
+        assert!(control.is_cancelled());
+        worker.request(key, snapshot, &context);
+        finish(&mut worker);
+        let groups = &worker.data().unwrap().aggregates;
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.extensions == ["b"] && group.color == 0)
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.extensions == ["a"] && group.color == 1)
         );
     }
 
@@ -896,7 +1109,13 @@ mod tests {
             })
             .collect();
 
-        let data = compute(&snapshot, key(), &LayoutControl::default()).unwrap();
+        let data = compute(
+            &snapshot,
+            key(),
+            &LayoutControl::default(),
+            &FileColors::default(),
+        )
+        .unwrap();
 
         assert_eq!(data.frames.len(), 1);
         for node in [0, 1, 2] {

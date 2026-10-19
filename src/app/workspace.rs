@@ -159,6 +159,65 @@ fn focus_outline(ui: &egui::Ui, response: &egui::Response) {
     }
 }
 
+fn summary_row(ui: &mut egui::Ui, label: &str, value: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), BODY_SIZE + 12.0),
+        Sense::click(),
+    );
+    if response.clicked() {
+        response.request_focus();
+    }
+    let visuals = ui.style().interact_selectable(&response, selected);
+    ui.painter().rect(
+        rect,
+        3.0,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        StrokeKind::Inside,
+    );
+    let font = FontId::monospace(BODY_SIZE);
+    let (value_galley, reserved_width) = ui.fonts_mut(|fonts| {
+        let value_galley =
+            fonts.layout_no_wrap(value.to_owned(), font.clone(), visuals.text_color());
+        let reserved_width = fonts
+            .layout_no_wrap(format_bytes(1024 * 1024 - 1), font, visuals.text_color())
+            .size()
+            .x
+            .max(value_galley.size().x)
+            + 2.0;
+        (value_galley, reserved_width)
+    });
+    let content = rect.shrink2(Vec2::new(6.0, 3.0));
+    let value_left = (content.right() - reserved_width).max(content.left());
+    let label_rect = egui::Rect::from_min_max(
+        content.min,
+        egui::pos2((value_left - 8.0).max(content.left()), content.bottom()),
+    );
+    paint_label(ui, label_rect, label, visuals.text_color(), BODY_SIZE);
+    ui.painter()
+        .with_clip_rect(
+            egui::Rect::from_min_max(egui::pos2(value_left, rect.top()), rect.max)
+                .intersect(ui.clip_rect()),
+        )
+        .galley(
+            egui::pos2(
+                content.right() - value_galley.size().x,
+                content.center().y - value_galley.size().y / 2.0,
+            ),
+            value_galley,
+            visuals.text_color(),
+        );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            response.enabled(),
+            selected,
+            format!("{label} | {value}"),
+        )
+    });
+    response
+}
+
 impl UniDirStatApp {
     pub(super) fn workspace(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
         self.map_worker
@@ -168,9 +227,9 @@ impl UniDirStatApp {
         if !narrow {
             egui::SidePanel::right("workspace-summary")
                 .resizable(true)
-                .default_width(280.0)
+                .default_width(260.0)
                 .width_range(220.0..=420.0)
-                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 0)))
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 0)))
                 .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("workspace-summary-scroll")
@@ -255,28 +314,50 @@ impl UniDirStatApp {
     }
 
     fn workspace_summary(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
-        self.scope_summary(ui, snapshot);
-        if let Some(index) = self.selected {
-            ui.add_space(12.0);
-            ui.separator();
-            self.inspector_contents(ui, snapshot, index);
-        }
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = BODY_SIZE + 12.0;
+            ui.spacing_mut().button_padding = Vec2::new(6.0, 3.0);
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+            self.scope_summary(ui, snapshot);
+            if let Some(index) = self.selected {
+                ui.add_space(8.0);
+                ui.separator();
+                self.inspector_contents(ui, snapshot, index);
+            }
+        });
     }
 
     fn scope_summary(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
-        ui.heading(tr("Overview"));
         let size = self.scope.map_or_else(
             || snapshot.total_size(self.settings.allocated),
             |index| snapshot.nodes[index].size(self.settings.allocated),
         );
-        ui.label(
-            RichText::new(format_bytes(size))
-                .monospace()
-                .size(25.0)
-                .strong(),
+        ui.horizontal(|ui| {
+            ui.strong(tr("Overview"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format_bytes(size)).monospace().strong());
+            });
+        });
+        let path = self.scope.map_or_else(
+            || tr("All scanned locations").to_owned(),
+            |index| snapshot.nodes[index].path.display().to_string(),
         );
-        ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).wrap());
+        ui.horizontal(|ui| {
+            let response = ui.add_sized(
+                [
+                    (ui.available_width() - BODY_SIZE - 12.0 - ui.spacing().item_spacing.x)
+                        .max(1.0),
+                    BODY_SIZE + 12.0,
+                ],
+                egui::Label::new(&path)
+                    .truncate()
+                    .sense(Sense::focusable_noninteractive()),
+            );
+            focus_outline(ui, &response);
+            if response.has_focus() {
+                response.show_tooltip_text(&path);
+            }
+            response.on_hover_text(&path);
             info_button(ui, tr("Logical size can exceed disk capacity (sparse files, hard links). Allocated blocks may be shared; snapshots and filesystem metadata are not included."));
         });
         if !self.analysis_complete {
@@ -310,27 +391,48 @@ impl UniDirStatApp {
             &summary.extensions_logical
         };
         for stats in extensions.iter().take(8) {
-            ui.horizontal(|ui| {
-                color_dot(ui, extension_color(&stats.extension));
-                if ui.button(extension_label(&stats.extension)).clicked() {
-                    self.search_query.extension = Some(stats.extension.clone());
-                    self.search_query.scope = self.scope;
-                    self.page = Page::Files;
-                    self.compact_map = false;
-                    self.summary_open = false;
-                    self.rebuild = true;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.monospace(format_bytes(stats.bytes));
-                });
-            });
-            ui.add(
-                egui::ProgressBar::new(stats.bytes as f32 / size.max(1) as f32)
-                    .desired_height(4.0)
-                    .fill(extension_color(&stats.extension)),
+            let label = extension_label(&stats.extension);
+            let response = ui
+                .push_id(("summary-extension", &stats.extension), |ui| {
+                    summary_row(
+                        ui,
+                        label,
+                        &format_bytes(stats.bytes),
+                        self.search_query.extension.as_ref() == Some(&stats.extension),
+                    )
+                })
+                .inner;
+            let bar = egui::Rect::from_min_max(
+                response.rect.left_bottom() + Vec2::new(6.0, -4.0),
+                response.rect.right_bottom() - Vec2::new(6.0, 1.0),
             );
+            ui.painter()
+                .rect_filled(bar, 1.0, ui.visuals().extreme_bg_color);
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    bar.min,
+                    Vec2::new(
+                        bar.width() * (stats.bytes as f32 / size.max(1) as f32).clamp(0.0, 1.0),
+                        bar.height(),
+                    ),
+                ),
+                1.0,
+                self.file_colors.color(&stats.extension),
+            );
+            focus_outline(ui, &response);
+            if response.has_focus() {
+                response.show_tooltip_text(label);
+            }
+            if response.on_hover_text(label).clicked() {
+                self.search_query.extension = Some(stats.extension.clone());
+                self.search_query.scope = self.scope;
+                self.page = Page::Files;
+                self.compact_map = false;
+                self.summary_open = false;
+                self.rebuild = true;
+            }
         }
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         ui.strong(tr("Largest files"));
         let largest = if self.settings.allocated {
             &summary.largest_allocated
@@ -339,26 +441,22 @@ impl UniDirStatApp {
         };
         for &index in largest {
             let node = &snapshot.nodes[index];
-            let response = egui::Frame::new()
-                .inner_margin(6)
-                .fill(if self.selection.contains(index) {
-                    ui.visuals().selection.bg_fill
-                } else {
-                    Color32::TRANSPARENT
+            let response = ui
+                .push_id(("summary-file", index), |ui| {
+                    summary_row(
+                        ui,
+                        &node.name(),
+                        &format_bytes(node.size(self.settings.allocated)),
+                        self.selection.contains(index),
+                    )
                 })
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(node.name())
-                            .truncate()
-                            .sense(Sense::hover()),
-                    );
-                    ui.monospace(format_bytes(node.size(self.settings.allocated)));
-                })
-                .response;
-            let response = clickable_row(response);
+                .inner;
             focus_outline(ui, &response);
-            self.item_response(response, index, snapshot, SelectionView::Overview);
+            self.item_response(response.clone(), index, snapshot, SelectionView::Overview);
+            if response.has_focus() {
+                response.show_tooltip_text(node.path.display().to_string());
+            }
+            response.on_hover_text(node.path.display().to_string());
         }
     }
 
@@ -443,7 +541,7 @@ impl UniDirStatApp {
                 show_work_progress(ui, &self.search_control);
             }
         }
-        if !compact {
+        if !compact && self.page != Page::Overview {
             ui.label(trf(
                 "{count} visible entries",
                 &[("count", self.rows.len().to_string())],
@@ -745,7 +843,7 @@ impl UniDirStatApp {
                             &painter,
                             icon,
                             node.kind == EntryKind::Directory,
-                            extension_color(&node.extension()),
+                            self.file_colors.color(&node.extension()),
                         );
                         let label_rect = egui::Rect::from_min_max(
                             egui::pos2(icon.right() + 7.0, rect.top()),
@@ -916,6 +1014,167 @@ impl UniDirStatApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary_fixture(
+        context: &egui::Context,
+    ) -> (tempfile::TempDir, UniDirStatApp, Arc<Snapshot>) {
+        let fixture = tempfile::tempdir().expect("fixture");
+        for index in 0..8 {
+            let name = format!(
+                "archive-name-that-cannot-fit-in-a-summary-{index}.extraordinarily-long-extension-{index}"
+            );
+            std::fs::write(
+                fixture.path().join(name),
+                vec![0; if index == 0 { 8192 } else { 1024 }],
+            )
+            .expect("file");
+        }
+        let snapshot = Arc::new(
+            scanner::scan(
+                &[fixture.path().into()],
+                &ScanOptions::default(),
+                &ScanControl::default(),
+            )
+            .expect("scan"),
+        );
+        let mut app = UniDirStatApp::new(
+            &eframe::CreationContext::_new_kittest(context.clone()),
+            Vec::new(),
+            None,
+            ScanOptions::default(),
+            None,
+        );
+        app.analysis_complete = true;
+        app.map_worker
+            .request_summary(None, Arc::clone(&snapshot), context);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.map_worker.summary_pending() && Instant::now() < deadline {
+            app.map_worker.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.map_worker.summary().is_some());
+        context.set_zoom_factor(1.0);
+        (fixture, app, snapshot)
+    }
+
+    #[test]
+    fn summary_long_names_do_not_collide_with_sizes() {
+        let context = egui::Context::default();
+        let (_fixture, mut app, snapshot) = summary_fixture(&context);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(220.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    app.workspace_summary(ui, &snapshot);
+                });
+            },
+        );
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((shape.clip_rect, text)),
+                _ => None,
+            })
+            .collect();
+        for label in [
+            "extraordinarily-long-extension-0",
+            "archive-name-that-cannot-fit-in-a-summary-0.extraordinarily-long-extension-0",
+        ] {
+            let (clip, name) = text
+                .iter()
+                .find(|(_, text)| text.galley.job.text == label)
+                .expect("summary name");
+            let name_rect = name.visual_bounding_rect().intersect(*clip);
+            let (clip, bytes) = text
+                .iter()
+                .find(|(_, text)| {
+                    text.galley.job.text == format_bytes(8192)
+                        && (text.visual_bounding_rect().center().y - name_rect.center().y).abs()
+                            < 3.0
+                })
+                .expect("size stays on the same row as its name");
+            let bytes_rect = bytes.visual_bounding_rect();
+            assert!(
+                clip.contains_rect(bytes_rect),
+                "size stays fully visible: {bytes_rect:?} within {clip:?}"
+            );
+            assert!(name_rect.right() + 4.0 <= bytes_rect.left());
+        }
+    }
+
+    #[test]
+    fn summary_statistics_fit_in_a_short_panel() {
+        let context = egui::Context::default();
+        let (_fixture, mut app, snapshot) = summary_fixture(&context);
+        let mut height = 0.0;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.set_width(244.0);
+                height = ui
+                    .scope(|ui| app.workspace_summary(ui, &snapshot))
+                    .response
+                    .rect
+                    .height();
+            });
+        });
+        assert!(height <= 540.0, "summary height: {height}");
+    }
+
+    #[test]
+    fn file_controls_leave_visible_entry_count_to_the_map_toolbar() {
+        let context = egui::Context::default();
+        let (_fixture, mut app, _) = summary_fixture(&context);
+        app.rows = vec![(0, 0)];
+        app.rebuild = false;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.file_controls(ui));
+            },
+        );
+        let count = trf("{count} visible entries", &[("count", "1".into())]);
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == count)
+        }));
+    }
+
+    #[test]
+    fn files_page_keeps_the_entry_count_without_a_map() {
+        let context = egui::Context::default();
+        let (_fixture, mut app, _) = summary_fixture(&context);
+        app.page = Page::Files;
+        app.rows = vec![(0, 0)];
+        app.rebuild = false;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| app.file_controls(ui));
+            },
+        );
+        let count = trf("{count} visible entries", &[("count", "1".into())]);
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == count)
+        }));
+    }
 
     #[test]
     fn tree_panel_leaves_map_space_in_a_short_workspace() {

@@ -1,0 +1,22 @@
+UniDirStat treemap row layout
+
+The row-packing algorithm in src/layout.rs is a Rust adaptation of
+ArrangeRows in WinDirStat's windirstat/Controls/TreeMapLayout.cpp.
+The extension color assignment and palette in src/file_colors.rs follow
+WinDirStatModel.cpp and Controls/TreeMap.h / Controls/TreeMap.cpp.
+
+Original work: Copyright © WinDirStat Team.
+Source version: WinDirStat 2.9.3, commit
+40d77b693e1e1059aba21412268b3cbaa09cec62.
+https://github.com/windirstat/windirstat/blob/40d77b693e1e1059aba21412268b3cbaa09cec62/windirstat/Controls/TreeMapLayout.cpp
+
+The original and this Rust adaptation are distributed under
+GPL-3.0-or-later, without warranty; see LICENSE.
+Adaptation: 2026-10-16, with continuous proportional coordinates,
+cancellable traversal and color-grouped tiny-file regions.
+Equal-byte extension ties use deterministic name ordering. File colors
+retain the global logical-byte ranking when changing folder or metric;
+the modern flat rendering does not reproduce cushion shading.
+
+The bundled Ubuntu font has separate notices and license terms in
+assets/fonts/Ubuntu-LICENSE.txt.

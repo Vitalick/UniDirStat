@@ -14,6 +14,9 @@ use unidirstat::{
 mod app;
 
 #[cfg(feature = "gui")]
+mod file_colors;
+
+#[cfg(feature = "gui")]
 mod i18n;
 
 #[cfg(feature = "gui")]

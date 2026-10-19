@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::file_colors::FileColors;
 use crate::i18n::{Language, set_language, tr, trf};
 use crate::map_job::{MapData, MapKey, MapKind, MapWorker};
 use crate::map_view::MapViewport;
@@ -38,6 +39,7 @@ const BODY_SIZE: f32 = 16.0;
 const HELP_SIZE: f32 = 14.0;
 const CONTROL_HEIGHT: f32 = 40.0;
 const ROW_HEIGHT: f32 = 38.0;
+const WATCH_PATH_LIMIT: usize = 1024;
 const DEFAULT_COLUMN_WIDTHS: [f32; 4] = [0.0, 132.0, 144.0, 176.0];
 const CONTROL_BORDER: [Color32; 2] = [
     Color32::from_rgb(112, 126, 147),
@@ -126,7 +128,7 @@ impl Default for Settings {
             theme: Theme::System,
             reduced_motion: false,
             mac_access_reviewed: false,
-            font_scale: 1.0,
+            font_scale: 0.8,
             show_modified: true,
             show_share: true,
             threads: 0,
@@ -203,6 +205,78 @@ struct PreparedSnapshot {
     age: ([u64; 4], [u64; 4]),
     analysis_complete: bool,
     error: Option<String>,
+    refresh_view: Option<Box<RefreshView>>,
+}
+
+struct RefreshView {
+    selected: Option<usize>,
+    selection: Vec<usize>,
+    primary: Option<usize>,
+    scope: Option<usize>,
+    search_scope: Option<usize>,
+    map_focus: Option<usize>,
+    expanded: HashSet<usize>,
+    refreshed: Option<usize>,
+}
+
+impl RefreshView {
+    fn remap(
+        &mut self,
+        previous: &Snapshot,
+        current: &Snapshot,
+        control: &ScanControl,
+    ) -> Result<(), String> {
+        let requested = self
+            .selected
+            .iter()
+            .chain(&self.selection)
+            .chain(self.primary.iter())
+            .chain(self.scope.iter())
+            .chain(self.search_scope.iter())
+            .chain(self.map_focus.iter())
+            .chain(&self.expanded)
+            .chain(self.refreshed.iter());
+        let paths: HashMap<_, _> = requested
+            .filter_map(|&index| {
+                previous
+                    .nodes
+                    .get(index)
+                    .map(|node| (node.path.as_path(), index))
+            })
+            .collect();
+        let mut mapping = HashMap::with_capacity(paths.len());
+        for (index, node) in current.nodes.iter().enumerate() {
+            if index % 256 == 0 && !control.checkpoint() {
+                return Err(
+                    tr("Folder recalculation cancelled. Previous results are preserved.").into(),
+                );
+            }
+            if let Some(&previous) = paths.get(node.path.as_path()) {
+                mapping.insert(previous, index);
+            }
+        }
+        let remap = |index: usize| mapping.get(&index).copied();
+        let directory = |index: usize| {
+            remap(index).filter(|&index| current.nodes[index].kind == EntryKind::Directory)
+        };
+        self.selected = self.selected.and_then(remap);
+        self.selection = self
+            .selection
+            .iter()
+            .filter_map(|&index| remap(index))
+            .collect();
+        self.primary = self.primary.and_then(remap);
+        self.scope = self.scope.and_then(directory);
+        self.search_scope = self.search_scope.and_then(directory);
+        self.map_focus = self.map_focus.and_then(directory);
+        self.refreshed = self.refreshed.and_then(directory);
+        self.expanded = self
+            .expanded
+            .iter()
+            .filter_map(|&index| directory(index))
+            .collect();
+        Ok(())
+    }
 }
 
 struct RowsReady {
@@ -304,6 +378,7 @@ enum JobResult {
     Load(Result<PreparedSnapshot, String>),
     Duplicates(DuplicateReport),
     Permissions(PathBuf, Result<String, String>),
+    Cleanup(Result<usize, String>),
     Io(Result<String, String>),
 }
 
@@ -360,13 +435,32 @@ fn job_state(control: &ScanControl) -> JobState {
     }
 }
 
+fn queue_watch_paths(
+    event: notify::Event,
+    sender: &mpsc::SyncSender<PathBuf>,
+    changed: &AtomicBool,
+) {
+    if event.need_rescan()
+        || event.paths.is_empty()
+        || matches!(
+            event.kind,
+            notify::EventKind::Any | notify::EventKind::Other
+        )
+    {
+        changed.store(true, Ordering::Relaxed);
+        return;
+    }
+    for path in event.paths {
+        if sender.try_send(path).is_err() {
+            changed.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
 fn page_needs_rows(page: Page, largest: bool) -> bool {
     matches!(page, Page::Overview | Page::Files | Page::Largest)
         && (page == Page::Largest) != largest
-}
-
-fn clickable_row(response: egui::Response) -> egui::Response {
-    response.interact(Sense::click())
 }
 
 fn click_modifiers(context: &egui::Context) -> egui::Modifiers {
@@ -545,6 +639,7 @@ fn prepare_snapshot(
         age: ([0; 4], [0; 4]),
         analysis_complete: false,
         error: None,
+        refresh_view: None,
     };
     let analysis = (|| {
         prepared.index = Some(Arc::new(SearchIndex::with_control(
@@ -619,6 +714,7 @@ pub struct UniDirStatApp {
     duplicate_rows: Vec<DuplicateRow>,
     duplicate_reclaimable: u64,
     extensions: [Vec<ExtensionStats>; 2],
+    file_colors: Arc<FileColors>,
     selected: Option<usize>,
     selection: Selection,
     rows_largest: bool,
@@ -642,9 +738,14 @@ pub struct UniDirStatApp {
     status: String,
     error: Option<String>,
     cleanup: Option<Cleanup>,
+    refresh_after_cleanup: bool,
     watching: bool,
     watcher: Option<notify::RecommendedWatcher>,
     changed: Arc<AtomicBool>,
+    watch_paths: Option<(mpsc::SyncSender<PathBuf>, Receiver<PathBuf>)>,
+    pending_watch_paths: HashSet<PathBuf>,
+    watch_full_scan: bool,
+    last_refreshed: Option<(PathBuf, usize)>,
     last_change: Option<Instant>,
     last_dark: Option<bool>,
     map_worker: MapWorker,
@@ -702,7 +803,7 @@ impl UniDirStatApp {
             settings.threads = options.threads;
         }
         settings.threads = settings.threads.min(64);
-        settings.font_scale = settings.font_scale.clamp(0.85, 2.0);
+        settings.font_scale = settings.font_scale.clamp(0.75, 2.0);
         context.egui_ctx.set_fonts(interface_fonts());
         context.egui_ctx.set_zoom_factor(settings.font_scale);
         settings.tile_gap = settings.tile_gap.clamp(1.0, 6.0);
@@ -727,6 +828,7 @@ impl UniDirStatApp {
             duplicate_rows: Vec::new(),
             duplicate_reclaimable: 0,
             extensions: [Vec::new(), Vec::new()],
+            file_colors: Arc::default(),
             selected: None,
             selection: Selection::default(),
             rows_largest: false,
@@ -755,9 +857,14 @@ impl UniDirStatApp {
                 )
             }),
             cleanup: None,
+            refresh_after_cleanup: false,
             watching: false,
             watcher: None,
             changed: Arc::new(AtomicBool::new(false)),
+            watch_paths: None,
+            pending_watch_paths: HashSet::new(),
+            watch_full_scan: false,
+            last_refreshed: None,
             last_change: None,
             last_dark: None,
             map_worker: MapWorker::default(),
@@ -895,6 +1002,8 @@ impl UniDirStatApp {
             return;
         }
         self.cleanup = None;
+        self.refresh_after_cleanup = false;
+        self.last_refreshed = None;
         self.search_control.cancel();
         self.search_receiver = None;
         self.control = Arc::default();
@@ -923,6 +1032,32 @@ impl UniDirStatApp {
         }
     }
 
+    fn recalculation_target(&self) -> Option<usize> {
+        if !self.live || self.receiver.is_some() {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let directory = |index: usize| {
+            snapshot
+                .nodes
+                .get(index)
+                .filter(|node| node.kind == EntryKind::Directory)
+                .map(|_| index)
+        };
+        self.selection
+            .primary()
+            .or(self.selected)
+            .and_then(|index| {
+                let node = snapshot.nodes.get(index)?;
+                match node.kind {
+                    EntryKind::Directory => Some(index),
+                    EntryKind::File => node.parent.and_then(directory),
+                    _ => None,
+                }
+            })
+            .or_else(|| self.scope.and_then(directory))
+    }
+
     fn refresh_folder(&mut self, index: usize, context: &egui::Context) {
         if !self.live || self.receiver.is_some() {
             return;
@@ -930,22 +1065,53 @@ impl UniDirStatApp {
         let Some(snapshot) = self.snapshot.as_ref().map(Arc::clone) else {
             return;
         };
+        if !snapshot
+            .nodes
+            .get(index)
+            .is_some_and(|node| node.kind == EntryKind::Directory)
+        {
+            return;
+        }
+        let mut view = RefreshView {
+            selected: self.selected,
+            selection: self.selection.indices().collect(),
+            primary: self.selection.primary(),
+            scope: self.scope,
+            search_scope: self.search_query.scope,
+            map_focus: self.map_focus,
+            expanded: self.expanded.clone(),
+            refreshed: Some(index),
+        };
         self.control = Arc::default();
         self.search_control.cancel();
         self.search_receiver = None;
         self.cleanup = None;
+        self.refresh_after_cleanup = false;
+        self.rebuild = true;
         let control = Arc::clone(&self.control);
         let options = self.scan_options();
         self.job(JobKind::Refresh, context, move || {
             JobResult::Scan(
-                scanner::refresh_subtree(&snapshot, index, &options, &control)
-                    .map(|snapshot| prepare_snapshot(snapshot, options.threads, &control)),
+                scanner::refresh_subtree(&snapshot, index, &options, &control).and_then(|fresh| {
+                    let mut prepared = prepare_snapshot(fresh, options.threads, &control);
+                    if control.is_cancelled() {
+                        return Err(tr(
+                            "Folder recalculation cancelled. Previous results are preserved.",
+                        )
+                        .into());
+                    }
+                    view.remap(&snapshot, &prepared.snapshot, &control)?;
+                    prepared.refresh_view = Some(Box::new(view));
+                    Ok(prepared)
+                }),
             )
         });
     }
 
     fn load(&mut self, path: PathBuf, context: &egui::Context) {
         self.cleanup = None;
+        self.refresh_after_cleanup = false;
+        self.last_refreshed = None;
         self.search_control.cancel();
         self.search_receiver = None;
         self.control = Arc::default();
@@ -978,71 +1144,126 @@ impl UniDirStatApp {
             self.receiver = None;
             let job_kind = self.job_kind.take();
             match result {
-                JobResult::Scan(result) | JobResult::Load(result) => match result {
-                    Ok(prepared) => {
-                        let snapshot = prepared.snapshot;
-                        self.cleanup = None;
-                        self.live = matches!(job_kind, Some(JobKind::Scan | JobKind::Refresh));
-                        if !self.live {
-                            self.watching = false;
-                            self.watcher = None;
-                        }
-                        self.roots = snapshot
-                            .roots
-                            .iter()
-                            .map(|&index| snapshot.nodes[index].path.clone())
-                            .collect();
-                        self.status = if snapshot.cancelled {
-                            tr("Scan cancelled | partial results").into()
-                        } else {
-                            trf(
-                                "{files} files scanned in {seconds} s",
-                                &[
-                                    ("files", snapshot.file_count().to_string()),
-                                    (
-                                        "seconds",
-                                        format!("{:.2}", snapshot.elapsed_ms as f64 / 1000.0),
-                                    ),
-                                ],
+                JobResult::Scan(result) | JobResult::Load(result) => {
+                    let result =
+                        if job_kind == Some(JobKind::Refresh) && self.control.is_cancelled() {
+                            Err(tr(
+                                "Folder recalculation cancelled. Previous results are preserved.",
                             )
+                            .into())
+                        } else {
+                            result
                         };
-                        if !self.live {
-                            self.status.push_str(" | ");
-                            self.status.push_str(tr("Read-only snapshot"));
+                    match result {
+                        Ok(prepared) => {
+                            let snapshot = prepared.snapshot;
+                            self.cleanup = None;
+                            self.live = matches!(job_kind, Some(JobKind::Scan | JobKind::Refresh));
+                            if !self.live {
+                                self.watching = false;
+                                self.watcher = None;
+                                self.watch_paths = None;
+                                self.pending_watch_paths.clear();
+                                self.watch_full_scan = false;
+                                self.last_change = None;
+                            }
+                            self.roots = snapshot
+                                .roots
+                                .iter()
+                                .map(|&index| snapshot.nodes[index].path.clone())
+                                .collect();
+                            self.status = if snapshot.cancelled {
+                                tr("Scan cancelled | partial results").into()
+                            } else {
+                                trf(
+                                    "{files} files scanned in {seconds} s",
+                                    &[
+                                        ("files", snapshot.file_count().to_string()),
+                                        (
+                                            "seconds",
+                                            format!("{:.2}", snapshot.elapsed_ms as f64 / 1000.0),
+                                        ),
+                                    ],
+                                )
+                            };
+                            if !self.live {
+                                self.status.push_str(" | ");
+                                self.status.push_str(tr("Read-only snapshot"));
+                            }
+                            self.expanded = snapshot.roots.iter().copied().collect();
+                            self.extensions = prepared.extensions;
+                            self.largest = prepared.largest;
+                            self.analysis_complete = prepared.analysis_complete;
+                            if let Some(error) = prepared.error {
+                                self.error = Some(error);
+                            }
+                            let timestamp = now();
+                            (self.age_sizes, self.age_files) = prepared.age;
+                            self.age_day = timestamp / 86_400;
+                            self.selected = None;
+                            self.selection.clear();
+                            self.scope = None;
+                            self.map_viewport = MapViewport::default();
+                            self.map_focus = None;
+                            self.map_worker.clear();
+                            self.file_colors =
+                                Arc::new(FileColors::from_extensions(&self.extensions[0]));
+                            self.map_worker.set_colors(Arc::clone(&self.file_colors));
+                            self.duplicates = None;
+                            self.duplicate_rows.clear();
+                            self.duplicate_reclaimable = 0;
+                            self.snapshot = Some(snapshot);
+                            self.search_index = prepared.index;
+                            self.search_control.cancel();
+                            self.search_receiver = None;
+                            self.rows.clear();
+                            self.search_query.scope = None;
+                            self.permission_details = None;
+                            self.reveal_row = None;
+                            if job_kind != Some(JobKind::Refresh) {
+                                self.last_refreshed = None;
+                            }
+                            if let Some(view) = prepared.refresh_view {
+                                self.selected = view.selected;
+                                for index in view.selection {
+                                    self.selection.click(index, &[], true, false);
+                                }
+                                if let Some(primary) = view.primary {
+                                    self.selection.right_click(primary);
+                                }
+                                self.scope = view.scope;
+                                self.search_query.scope = view.search_scope;
+                                self.map_focus = view.map_focus;
+                                self.expanded = view.expanded;
+                                self.last_refreshed = view.refreshed.and_then(|index| {
+                                    self.snapshot
+                                        .as_ref()?
+                                        .nodes
+                                        .get(index)
+                                        .map(|node| (node.path.clone(), index))
+                                });
+                            }
+                            self.rebuild = true;
+                            if self.watching && job_kind != Some(JobKind::Refresh) {
+                                self.install_watcher(context);
+                            }
                         }
-                        self.expanded = snapshot.roots.iter().copied().collect();
-                        self.extensions = prepared.extensions;
-                        self.largest = prepared.largest;
-                        self.analysis_complete = prepared.analysis_complete;
-                        if let Some(error) = prepared.error {
-                            self.error = Some(error);
-                        }
-                        let timestamp = now();
-                        (self.age_sizes, self.age_files) = prepared.age;
-                        self.age_day = timestamp / 86_400;
-                        self.selected = None;
-                        self.selection.clear();
-                        self.scope = None;
-                        self.map_viewport = MapViewport::default();
-                        self.map_focus = None;
-                        self.map_worker.clear();
-                        self.duplicates = None;
-                        self.duplicate_rows.clear();
-                        self.duplicate_reclaimable = 0;
-                        self.snapshot = Some(snapshot);
-                        self.search_index = prepared.index;
-                        self.search_control.cancel();
-                        self.search_receiver = None;
-                        self.rows.clear();
-                        self.search_query.scope = None;
-                        self.permission_details = None;
-                        self.rebuild = true;
-                        if self.watching {
-                            self.install_watcher(context);
+                        Err(error) => {
+                            self.rebuild |= job_kind == Some(JobKind::Refresh);
+                            if self.refresh_after_cleanup {
+                                self.status =
+                                    tr("Item moved to trash. Scan results are outdated.").into();
+                                self.error = Some(trf(
+                                    "The item was moved to trash, but folder recalculation did not finish: {error}",
+                                    &[("error", error)],
+                                ));
+                            } else {
+                                self.error = Some(error);
+                            }
                         }
                     }
-                    Err(error) => self.error = Some(error),
-                },
+                    self.refresh_after_cleanup = false;
+                }
                 JobResult::Duplicates(report) => {
                     self.status = trf(
                         "{groups} duplicate groups | {errors} read errors",
@@ -1064,6 +1285,19 @@ impl UniDirStatApp {
                     }
                     Err(error) => self.error = Some(error),
                 },
+                JobResult::Cleanup(result) => match result {
+                    Ok(parent) => {
+                        self.status =
+                            tr("Item moved to trash. Recalculating its parent folder.").into();
+                        self.refresh_folder(parent, context);
+                        self.refresh_after_cleanup = self.job_kind == Some(JobKind::Refresh);
+                        if !self.refresh_after_cleanup {
+                            self.status =
+                                tr("Item moved to trash. Scan results are outdated.").into();
+                        }
+                    }
+                    Err(error) => self.error = Some(error),
+                },
                 JobResult::Permissions(path, result) => match result {
                     Ok(details) => {
                         self.permission_details = Some((path, details));
@@ -1073,8 +1307,14 @@ impl UniDirStatApp {
             }
         } else if let Some(Err(mpsc::TryRecvError::Disconnected)) = result {
             self.receiver = None;
-            self.job_kind = None;
-            self.error = Some(tr("The background job stopped unexpectedly. Your files were not automatically changed.").into());
+            self.rebuild |= self.job_kind.take() == Some(JobKind::Refresh);
+            if self.refresh_after_cleanup {
+                self.status = tr("Item moved to trash. Scan results are outdated.").into();
+                self.error = Some(tr("Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.").into());
+                self.refresh_after_cleanup = false;
+            } else {
+                self.error = Some(tr("The background job stopped unexpectedly. Your files were not automatically changed.").into());
+            }
         }
         if let Some(result) = self.search_receiver.as_ref().map(Receiver::try_recv) {
             match result {
@@ -1102,7 +1342,21 @@ impl UniDirStatApp {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if self.changed.swap(false, Ordering::Relaxed) {
+        let mut watch_activity = self.changed.swap(false, Ordering::Relaxed);
+        self.watch_full_scan |= watch_activity;
+        if let Some((_, receiver)) = &self.watch_paths {
+            for path in receiver.try_iter().take(WATCH_PATH_LIMIT) {
+                watch_activity = true;
+                if !self.watch_full_scan {
+                    self.pending_watch_paths.insert(path);
+                    if self.pending_watch_paths.len() > WATCH_PATH_LIMIT {
+                        self.pending_watch_paths.clear();
+                        self.watch_full_scan = true;
+                    }
+                }
+            }
+        }
+        if watch_activity {
             self.last_change = Some(Instant::now());
         }
         if let Some(Ok(error)) = self.watch_errors.as_ref().map(Receiver::try_recv) {
@@ -1115,13 +1369,42 @@ impl UniDirStatApp {
             self.watch_errors = None;
         }
         if self.watching
+            && self.live
             && self.receiver.is_none()
             && self
                 .last_change
                 .is_some_and(|instant| instant.elapsed() > Duration::from_secs(2))
         {
             self.last_change = None;
-            self.start_scan(context);
+            let target = self
+                .last_refreshed
+                .as_ref()
+                .filter(|(folder, index)| {
+                    !self.watch_full_scan
+                        && !self.pending_watch_paths.is_empty()
+                        && self
+                            .snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.nodes.get(*index))
+                            .is_some_and(|node| {
+                                node.kind == EntryKind::Directory && node.path == *folder
+                            })
+                        && self.pending_watch_paths.iter().all(|path| {
+                            path.is_absolute()
+                                && path.starts_with(folder)
+                                && !path
+                                    .components()
+                                    .any(|component| component == std::path::Component::ParentDir)
+                        })
+                })
+                .map(|(_, index)| *index);
+            self.pending_watch_paths.clear();
+            self.watch_full_scan = false;
+            if let Some(index) = target {
+                self.refresh_folder(index, context);
+            } else {
+                self.start_scan(context);
+            }
         }
         if self.receiver.is_some()
             || self.search_receiver.is_some()
@@ -1136,8 +1419,16 @@ impl UniDirStatApp {
         self.watcher = None;
         self.watch_errors = None;
         if !self.watching || !self.live {
+            self.watch_paths = None;
+            self.pending_watch_paths.clear();
+            self.watch_full_scan = false;
+            self.last_change = None;
             return;
         }
+        let (path_sender, _) = self
+            .watch_paths
+            .get_or_insert_with(|| mpsc::sync_channel(WATCH_PATH_LIMIT));
+        let path_sender = path_sender.clone();
         let changed = Arc::clone(&self.changed);
         let context = context.clone();
         let (error_sender, error_receiver) = mpsc::channel();
@@ -1145,7 +1436,7 @@ impl UniDirStatApp {
         let result =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
                 Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
-                    changed.store(true, Ordering::Relaxed);
+                    queue_watch_paths(event, &path_sender, &changed);
                     context.request_repaint();
                 }
                 Err(error) => {
@@ -1656,13 +1947,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn extension_color(extension: &str) -> Color32 {
-    let hash = extension.bytes().fold(0usize, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(usize::from(byte))
-    });
-    PALETTE[hash % PALETTE.len()]
-}
-
 fn tile_text_color(background: Color32) -> Color32 {
     let linear = |channel: u8| {
         let channel = f32::from(channel) / 255.0;
@@ -1819,18 +2103,23 @@ impl UniDirStatApp {
 
     fn filters(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        let search_label = ui.label(tr("Search files and folders"));
         ui.horizontal_wrapped(|ui| {
-            changed |= ui
+            let search = ui
                 .add_sized(
                     [ui.available_width().min(360.0), CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.search_query.text)
                         .margin(INPUT_MARGIN)
                         .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
                         .hint_text(tr("Search files and folders...")),
-                )
-                .labelled_by(search_label.id)
-                .changed();
+                );
+            search.widget_info(|| {
+                let mut info = egui::WidgetInfo::labeled(
+                    egui::WidgetType::TextEdit, ui.is_enabled(), tr("Search files and folders"),
+                );
+                info.current_text_value = Some(self.search_query.text.clone());
+                info
+            });
+            changed |= search.changed();
             changed |= ui
                 .checkbox(&mut self.search_query.regex, tr("Regex"))
                 .changed();
@@ -1847,8 +2136,12 @@ impl UniDirStatApp {
                 self.search_query = SearchQuery::default();
                 changed = true;
             }
-        });
-        ui.collapsing(tr("Advanced filters"), |ui| {
+            ui.menu_button(tr("Advanced filters"), |ui| {
+                let viewport = ui.ctx().content_rect().size();
+                ui.set_width((viewport.x - 48.0).clamp(160.0, 640.0));
+                egui::ScrollArea::vertical()
+                    .max_height((viewport.y - 80.0).max(40.0))
+                    .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (label, field, unit) in [
                     (
@@ -1996,6 +2289,14 @@ impl UniDirStatApp {
                     self.settings.filters.remove(index);
                 }
             });
+                    });
+            });
+            let target = self.recalculation_target();
+            if ui.add_enabled(target.is_some(), egui::Button::new(tr("Recalculate folder"))).clicked()
+                && let Some(index) = target
+            {
+                self.refresh_folder(index, ui.ctx());
+            }
         });
         if changed {
             self.filter_error = None;
@@ -2122,7 +2423,7 @@ impl UniDirStatApp {
                     for index in range {
                         let stats = &extensions[index];
                         ui.horizontal(|ui| {
-                            color_dot(ui, extension_color(&stats.extension));
+                            color_dot(ui, self.file_colors.color(&stats.extension));
                             if ui
                                 .add_sized(
                                     [140.0, 30.0],
@@ -2151,7 +2452,7 @@ impl UniDirStatApp {
                             );
                             ui.add(
                                 egui::ProgressBar::new((stats.bytes as f64 / total) as f32)
-                                    .fill(extension_color(&stats.extension))
+                                    .fill(self.file_colors.color(&stats.extension))
                                     .desired_width((ui.available_width() - 65.0).max(50.0))
                                     .desired_height(7.0),
                             );
@@ -2337,7 +2638,7 @@ impl UniDirStatApp {
             });
             if ui
                 .add(
-                    egui::Slider::new(&mut self.settings.font_scale, 0.85..=2.0)
+                    egui::Slider::new(&mut self.settings.font_scale, 0.75..=2.0)
                         .text(tr("Interface scale"))
                         .fixed_decimals(2),
                 )
@@ -2739,6 +3040,17 @@ impl UniDirStatApp {
                 self.run_open(node, true);
                 ui.close();
             }
+            if node.kind == EntryKind::Directory
+                && ui
+                    .add_enabled(
+                        single && self.live && self.receiver.is_none(),
+                        egui::Button::new(tr("Refresh this folder")),
+                    )
+                    .clicked()
+            {
+                self.refresh_folder(index, &response.ctx);
+                ui.close();
+            }
             if ui
                 .add_enabled(
                     single && self.live && self.receiver.is_none() && node.parent.is_some(),
@@ -2835,19 +3147,23 @@ impl UniDirStatApp {
             }
             let node = node.clone();
             if let Some(cleanup) = self.cleanup.take() {
+                let refresh_parent = match &cleanup {
+                    Cleanup::Trash(_) | Cleanup::TrashEmpty(_) => node.parent,
+                    Cleanup::Move(_, _) => None,
+                };
                 self.job(JobKind::FileOperation, context, move || {
-                    JobResult::Io(
-                        (match cleanup {
-                            Cleanup::Trash(_) => actions::trash_node(&node),
-                            Cleanup::TrashEmpty(_) => actions::trash_empty_folder(&node),
-                            Cleanup::Move(_, destination) => {
-                                actions::move_node(&node, &destination)
-                            }
-                        })
-                        .map(|()| {
+                    let result = match cleanup {
+                        Cleanup::Trash(_) => actions::trash_node(&node),
+                        Cleanup::TrashEmpty(_) => actions::trash_empty_folder(&node),
+                        Cleanup::Move(_, destination) => actions::move_node(&node, &destination),
+                    };
+                    if let Some(parent) = refresh_parent {
+                        JobResult::Cleanup(result.map(|()| parent))
+                    } else {
+                        JobResult::Io(result.map(|()| {
                             tr("File operation complete. Refresh to update the scan.").into()
-                        }),
-                    )
+                        }))
+                    }
                 });
             }
         }
@@ -2999,6 +3315,521 @@ fn age(modified: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh_test_app(root: &Path) -> (UniDirStatApp, egui::Context) {
+        let context = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(context.clone());
+        let mut app = UniDirStatApp::new(&creation, Vec::new(), None, ScanOptions::default(), None);
+        app.settings.threads = 1;
+        let snapshot = scanner::scan(
+            &[root.into()],
+            &ScanOptions {
+                threads: 1,
+                ..ScanOptions::default()
+            },
+            &ScanControl::default(),
+        )
+        .unwrap();
+        queue_refresh_result(
+            &mut app,
+            JobKind::Scan,
+            JobResult::Scan(Ok(prepare_snapshot(snapshot, 1, &ScanControl::default()))),
+        );
+        app.poll(&context);
+        (app, context)
+    }
+
+    fn queue_refresh_result(app: &mut UniDirStatApp, kind: JobKind, result: JobResult) {
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.job_kind = Some(kind);
+        assert!(sender.send(result).is_ok());
+    }
+
+    fn finish_refresh_jobs(app: &mut UniDirStatApp, context: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.receiver.is_some() {
+            assert!(Instant::now() < deadline, "background refresh timed out");
+            app.poll(context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn refresh_node(app: &UniDirStatApp, name: &str) -> usize {
+        app.snapshot
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .position(|node| node.name() == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn folder_recalculation_rebuilds_global_file_color_ranks() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("large.raw"), [0; 100]).unwrap();
+        std::fs::write(fixture.path().join("small.txt"), [0; 10]).unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        assert_eq!(app.file_colors.index("raw"), 0);
+        assert_eq!(app.file_colors.index("txt"), 1);
+        std::fs::write(fixture.path().join("small.txt"), [0; 200]).unwrap();
+        let root = app.snapshot.as_ref().unwrap().roots[0];
+        app.refresh_folder(root, &context);
+        finish_refresh_jobs(&mut app, &context);
+        assert_eq!(app.file_colors.index("txt"), 0);
+        assert_eq!(app.file_colors.index("raw"), 1);
+    }
+
+    #[test]
+    fn folder_refresh_preserves_surviving_view_paths_after_arena_reordering() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("changed")).unwrap();
+        std::fs::create_dir(fixture.path().join("retained")).unwrap();
+        std::fs::write(fixture.path().join("changed/old"), b"before").unwrap();
+        std::fs::write(fixture.path().join("retained/keep"), b"keep").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let changed = refresh_node(&app, "changed");
+        let retained = refresh_node(&app, "retained");
+        let keep = refresh_node(&app, "keep");
+        app.selected = Some(keep);
+        app.selection.click(changed, &[], false, false);
+        app.selection.click(keep, &[], true, false);
+        app.scope = Some(changed);
+        app.search_query.scope = Some(changed);
+        app.map_focus = Some(changed);
+        app.expanded.extend([changed, retained]);
+        app.reveal_row = Some(keep);
+        app.duplicates = Some(Arc::new(DuplicateReport::default()));
+        app.duplicate_rows.push(DuplicateRow::File(keep));
+        app.duplicate_reclaimable = 4;
+        std::fs::write(fixture.path().join("changed/new"), b"new").unwrap();
+        app.refresh_folder(changed, &context);
+        finish_refresh_jobs(&mut app, &context);
+        let snapshot = app.snapshot.as_ref().unwrap();
+        assert_eq!(
+            app.selected.map(|index| snapshot.nodes[index].name()),
+            Some("keep".into())
+        );
+        assert_eq!(
+            app.selection
+                .primary()
+                .map(|index| snapshot.nodes[index].name()),
+            Some("keep".into())
+        );
+        assert_eq!(
+            app.scope.map(|index| snapshot.nodes[index].name()),
+            Some("changed".into())
+        );
+        assert_eq!(app.search_query.scope, app.scope);
+        assert_eq!(app.map_focus, app.scope);
+        assert!(app.expanded.contains(&refresh_node(&app, "retained")));
+        assert!(app.selection.contains(refresh_node(&app, "changed")));
+        assert_eq!(app.reveal_row, None);
+        assert!(app.duplicates.is_none());
+        assert!(app.duplicate_rows.is_empty());
+        assert_eq!(app.duplicate_reclaimable, 0);
+        assert!(app.live);
+    }
+
+    #[test]
+    fn folder_refresh_cancellation_after_preparation_preserves_the_previous_snapshot() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("old"), b"old").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let previous = Arc::clone(app.snapshot.as_ref().unwrap());
+        std::fs::write(fixture.path().join("new"), b"new").unwrap();
+        let fresh = scanner::scan(
+            &[fixture.path().into()],
+            &ScanOptions::default(),
+            &ScanControl::default(),
+        )
+        .unwrap();
+        let prepared = prepare_snapshot(fresh, 1, &ScanControl::default());
+        app.rebuild = false;
+        queue_refresh_result(&mut app, JobKind::Refresh, JobResult::Scan(Ok(prepared)));
+        app.control.cancel();
+        app.poll(&context);
+        assert!(Arc::ptr_eq(app.snapshot.as_ref().unwrap(), &previous));
+        assert!(app.rebuild);
+    }
+
+    #[test]
+    fn completed_trash_refreshes_the_parent_without_rescanning_siblings() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("changed")).unwrap();
+        std::fs::create_dir(fixture.path().join("retained")).unwrap();
+        let victim = fixture.path().join("changed/victim");
+        std::fs::write(&victim, b"disposable").unwrap();
+        std::fs::write(fixture.path().join("retained/keep"), b"keep").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        std::fs::write(
+            fixture.path().join("retained/not-scanned"),
+            b"outside refresh",
+        )
+        .unwrap();
+        let index = refresh_node(&app, "victim");
+        let parent = app.snapshot.as_ref().unwrap().nodes[index].parent.unwrap();
+        app.selected = Some(index);
+        app.selection.click(index, &[], false, false);
+        std::fs::remove_file(&victim).unwrap();
+        queue_refresh_result(
+            &mut app,
+            JobKind::FileOperation,
+            JobResult::Cleanup(Ok(parent)),
+        );
+        finish_refresh_jobs(&mut app, &context);
+        assert!(!victim.exists());
+        let snapshot = app.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.file_count(), 1);
+        assert_eq!(snapshot.total_size(false), 4);
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.name() != "victim" && node.name() != "not-scanned")
+        );
+        assert!(app.live);
+        assert_eq!(app.selected, None);
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn folder_refresh_clears_directory_scopes_replaced_by_regular_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("selected")).unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let selected = refresh_node(&app, "selected");
+        app.scope = Some(selected);
+        app.search_query.scope = Some(selected);
+        app.map_focus = Some(selected);
+        app.expanded.insert(selected);
+        std::fs::remove_dir(fixture.path().join("selected")).unwrap();
+        std::fs::write(fixture.path().join("selected"), b"replacement").unwrap();
+        let root = app.snapshot.as_ref().unwrap().roots[0];
+        app.refresh_folder(root, &context);
+        finish_refresh_jobs(&mut app, &context);
+        assert_eq!(app.scope, None);
+        assert_eq!(app.search_query.scope, None);
+        assert_eq!(app.map_focus, None);
+        assert!(!app.expanded.contains(&refresh_node(&app, "selected")));
+    }
+
+    #[test]
+    fn failed_folder_refresh_preserves_data_and_rebuilds_cancelled_search() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("selected")).unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let selected = refresh_node(&app, "selected");
+        let previous = Arc::clone(app.snapshot.as_ref().unwrap());
+        app.rebuild = false;
+        std::fs::remove_dir(fixture.path().join("selected")).unwrap();
+        app.refresh_folder(selected, &context);
+        finish_refresh_jobs(&mut app, &context);
+        assert!(Arc::ptr_eq(app.snapshot.as_ref().unwrap(), &previous));
+        assert!(app.rebuild);
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn completed_trash_refresh_failure_reports_that_cleanup_already_happened() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("selected")).unwrap();
+        let victim = fixture.path().join("selected/victim");
+        std::fs::write(&victim, b"disposable").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let parent = refresh_node(&app, "selected");
+        let previous = Arc::clone(app.snapshot.as_ref().unwrap());
+        std::fs::remove_file(&victim).unwrap();
+        std::fs::remove_dir(fixture.path().join("selected")).unwrap();
+        queue_refresh_result(
+            &mut app,
+            JobKind::FileOperation,
+            JobResult::Cleanup(Ok(parent)),
+        );
+        finish_refresh_jobs(&mut app, &context);
+        assert!(Arc::ptr_eq(app.snapshot.as_ref().unwrap(), &previous));
+        assert_eq!(
+            app.status,
+            tr("Item moved to trash. Scan results are outdated.")
+        );
+        assert!(
+            app.error.as_deref().unwrap().contains(
+                tr("The item was moved to trash, but folder recalculation did not finish: {error}")
+                    .split("{error}")
+                    .next()
+                    .unwrap()
+            )
+        );
+        assert!(app.rebuild);
+        assert!(app.live);
+    }
+
+    #[test]
+    fn failed_cleanup_does_not_refresh_or_change_the_snapshot() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("keep"), b"keep").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let previous = Arc::clone(app.snapshot.as_ref().unwrap());
+        queue_refresh_result(
+            &mut app,
+            JobKind::FileOperation,
+            JobResult::Cleanup(Err("validation refused".into())),
+        );
+        app.poll(&context);
+        assert!(Arc::ptr_eq(app.snapshot.as_ref().unwrap(), &previous));
+        assert!(app.receiver.is_none());
+        assert_eq!(app.error.as_deref(), Some("validation refused"));
+    }
+
+    #[test]
+    fn folder_recalculation_targets_only_live_idle_selected_or_scoped_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("folder")).unwrap();
+        std::fs::write(fixture.path().join("folder/file"), b"file").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let folder = refresh_node(&app, "folder");
+        let file = refresh_node(&app, "file");
+        assert_eq!(app.recalculation_target(), None);
+        app.scope = Some(folder);
+        assert_eq!(app.recalculation_target(), Some(folder));
+        app.selection.click(file, &[], false, false);
+        assert_eq!(app.recalculation_target(), Some(folder));
+        app.scope = None;
+        app.selection.click(folder, &[], false, false);
+        assert_eq!(app.recalculation_target(), Some(folder));
+        app.live = false;
+        assert_eq!(app.recalculation_target(), None);
+        app.refresh_folder(folder, &context);
+        assert!(app.receiver.is_none());
+        app.live = true;
+        app.refresh_folder(file, &context);
+        assert!(app.receiver.is_none());
+        app.refresh_folder(usize::MAX, &context);
+        assert!(app.receiver.is_none());
+        app.refresh_folder(folder, &context);
+        assert_eq!(app.recalculation_target(), None);
+        finish_refresh_jobs(&mut app, &context);
+    }
+
+    #[test]
+    fn watched_trash_events_refresh_only_the_recalculated_parent_and_keep_its_view() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("changed")).unwrap();
+        std::fs::create_dir(fixture.path().join("retained")).unwrap();
+        std::fs::write(fixture.path().join("changed/victim"), b"disposable").unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        let changed = refresh_node(&app, "changed");
+        let victim = app.snapshot.as_ref().unwrap().nodes[refresh_node(&app, "victim")]
+            .path
+            .clone();
+        std::fs::write(fixture.path().join("retained/outside"), b"outside refresh").unwrap();
+        app.settings.mac_access_reviewed = true;
+        app.watching = true;
+        app.selected = Some(changed);
+        app.selection.click(changed, &[], false, false);
+        app.scope = Some(changed);
+        let (sender, receiver) = mpsc::sync_channel(WATCH_PATH_LIMIT);
+        app.watch_paths = Some((sender.clone(), receiver));
+        std::fs::remove_file(&victim).unwrap();
+        sender.send(victim).unwrap();
+        app.last_change = Some(Instant::now() - Duration::from_secs(3));
+        queue_refresh_result(
+            &mut app,
+            JobKind::FileOperation,
+            JobResult::Cleanup(Ok(changed)),
+        );
+        finish_refresh_jobs(&mut app, &context);
+        app.last_change = Some(Instant::now() - Duration::from_secs(3));
+        app.poll(&context);
+        assert_eq!(app.job_kind, Some(JobKind::Refresh));
+        finish_refresh_jobs(&mut app, &context);
+        let snapshot = app.snapshot.as_ref().unwrap();
+        assert!(snapshot.nodes.iter().all(|node| node.name() != "outside"));
+        assert_eq!(
+            app.selected.map(|index| snapshot.nodes[index].name()),
+            Some("changed".into())
+        );
+        assert_eq!(
+            app.scope.map(|index| snapshot.nodes[index].name()),
+            Some("changed".into())
+        );
+    }
+
+    #[test]
+    fn watcher_events_outside_the_refreshed_folder_keep_the_full_scan_fallback() {
+        for parent_event in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::create_dir(fixture.path().join("changed")).unwrap();
+            std::fs::create_dir(fixture.path().join("retained")).unwrap();
+            let (mut app, context) = refresh_test_app(fixture.path());
+            app.settings.mac_access_reviewed = true;
+            let changed = refresh_node(&app, "changed");
+            app.refresh_folder(changed, &context);
+            finish_refresh_jobs(&mut app, &context);
+            std::fs::write(fixture.path().join("retained/outside"), b"outside refresh").unwrap();
+            let snapshot = app.snapshot.as_ref().unwrap();
+            let event = if parent_event {
+                snapshot.nodes[snapshot.roots[0]].path.clone()
+            } else {
+                snapshot.nodes[refresh_node(&app, "retained")]
+                    .path
+                    .join("outside")
+            };
+            app.watching = true;
+            let (sender, receiver) = mpsc::sync_channel(WATCH_PATH_LIMIT);
+            app.watch_paths = Some((sender.clone(), receiver));
+            sender.send(event).unwrap();
+            app.poll(&context);
+            app.last_change = Some(Instant::now() - Duration::from_secs(3));
+            app.poll(&context);
+            assert_eq!(app.job_kind, Some(JobKind::Scan));
+            finish_refresh_jobs(&mut app, &context);
+            assert!(
+                app.snapshot
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|node| node.name() == "outside")
+            );
+            assert!(app.last_refreshed.is_none());
+        }
+    }
+
+    #[test]
+    fn watcher_unknown_notifications_keep_the_full_scan_fallback() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("changed")).unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        app.settings.mac_access_reviewed = true;
+        let changed = refresh_node(&app, "changed");
+        app.refresh_folder(changed, &context);
+        finish_refresh_jobs(&mut app, &context);
+        app.watching = true;
+        app.changed.store(true, Ordering::Relaxed);
+        app.poll(&context);
+        app.last_change = Some(Instant::now() - Duration::from_secs(3));
+        app.poll(&context);
+        assert_eq!(app.job_kind, Some(JobKind::Scan));
+        finish_refresh_jobs(&mut app, &context);
+    }
+
+    #[test]
+    fn watcher_queue_and_pending_path_overflow_keep_the_full_scan_fallback() {
+        for pending_overflow in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::create_dir(fixture.path().join("changed")).unwrap();
+            let (mut app, context) = refresh_test_app(fixture.path());
+            app.settings.mac_access_reviewed = true;
+            let changed = refresh_node(&app, "changed");
+            app.refresh_folder(changed, &context);
+            finish_refresh_jobs(&mut app, &context);
+            let folder = app.last_refreshed.as_ref().unwrap().0.clone();
+            app.watching = true;
+            let (sender, receiver) = mpsc::sync_channel(WATCH_PATH_LIMIT);
+            app.watch_paths = Some((sender.clone(), receiver));
+            for index in 0..WATCH_PATH_LIMIT {
+                queue_watch_paths(
+                    notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                        .add_path(folder.join(index.to_string())),
+                    &sender,
+                    &app.changed,
+                );
+            }
+            if pending_overflow {
+                app.poll(&context);
+                assert_eq!(app.pending_watch_paths.len(), WATCH_PATH_LIMIT);
+            }
+            queue_watch_paths(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(folder.join("overflow")),
+                &sender,
+                &app.changed,
+            );
+            app.poll(&context);
+            assert!(app.watch_full_scan);
+            assert!(app.pending_watch_paths.len() <= WATCH_PATH_LIMIT);
+            app.last_change = Some(Instant::now() - Duration::from_secs(3));
+            app.poll(&context);
+            assert_eq!(app.job_kind, Some(JobKind::Scan));
+            finish_refresh_jobs(&mut app, &context);
+        }
+    }
+
+    #[test]
+    fn watcher_path_queue_marks_empty_unknown_and_rescan_events_for_a_full_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(WATCH_PATH_LIMIT);
+        let changed = AtomicBool::new(false);
+        for event in [
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File)),
+            notify::Event::new(notify::EventKind::Any).add_path(fixture.path().join("unknown")),
+            notify::Event::new(notify::EventKind::Other).add_path(fixture.path().join("other")),
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(fixture.path().join("rescan"))
+                .set_flag(notify::event::Flag::Rescan),
+        ] {
+            queue_watch_paths(event, &sender, &changed);
+            assert!(changed.swap(false, Ordering::Relaxed));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn watcher_path_queue_survives_watcher_reinstallation_after_a_full_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        app.settings.mac_access_reviewed = true;
+        app.watching = true;
+        let (sender, receiver) = mpsc::sync_channel(WATCH_PATH_LIMIT);
+        app.watch_paths = Some((sender.clone(), receiver));
+        app.start_scan(&context);
+        finish_refresh_jobs(&mut app, &context);
+        app.watcher = None;
+        let root = app.snapshot.as_ref().unwrap().nodes[app.snapshot.as_ref().unwrap().roots[0]]
+            .path
+            .clone();
+        let path = root.join("late");
+        std::fs::write(&path, b"new data").unwrap();
+        sender.send(path).unwrap();
+        app.poll(&context);
+        assert!(app.last_change.is_some());
+        app.last_change = Some(Instant::now() - Duration::from_secs(3));
+        app.poll(&context);
+        assert_eq!(app.job_kind, Some(JobKind::Scan));
+        finish_refresh_jobs(&mut app, &context);
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|node| node.name() == "late")
+        );
+    }
+
+    #[test]
+    fn watcher_dispatch_requires_a_live_snapshot_and_an_idle_job() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (mut app, context) = refresh_test_app(fixture.path());
+        app.settings.mac_access_reviewed = true;
+        app.watching = true;
+        app.live = false;
+        app.last_change = Some(Instant::now() - Duration::from_secs(3));
+        app.poll(&context);
+        assert!(app.receiver.is_none());
+        app.live = true;
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.job_kind = Some(JobKind::FileOperation);
+        app.poll(&context);
+        assert_eq!(app.job_kind, Some(JobKind::FileOperation));
+        assert!(sender.send(JobResult::Io(Ok("complete".into()))).is_ok());
+        app.poll(&context);
+        assert_eq!(app.job_kind, Some(JobKind::Scan));
+        finish_refresh_jobs(&mut app, &context);
+    }
 
     #[test]
     fn click_keeps_its_command_modifier_if_released_in_the_same_frame() {
@@ -3232,12 +4063,75 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_keeps_advanced_filters_on_the_search_row() {
+        let context = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(context.clone());
+        let mut app = UniDirStatApp::new(&creation, Vec::new(), None, ScanOptions::default(), None);
+        let mut positions = Vec::new();
+        for _ in 0..2 {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1700.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| app.filters(ui));
+                },
+            );
+            positions = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text() == tr("Search files and folders...")
+                            || text.galley.text() == tr("Advanced filters") =>
+                    {
+                        Some(text.pos.y)
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+        assert_eq!(positions.len(), 2);
+        assert!(
+            (positions[0] - positions[1]).abs() < 8.0,
+            "search and filters must share one row: {positions:?}"
+        );
+    }
+
+    #[test]
+    fn saved_eighty_percent_scale_is_applied_without_clamping_up() {
+        let fixture = tempfile::tempdir().unwrap();
+        let settings = fixture.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"font_scale":0.8,"mac_access_reviewed":true}"#,
+        )
+        .unwrap();
+        let context = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(context.clone());
+        let app = UniDirStatApp::new(
+            &creation,
+            Vec::new(),
+            None,
+            ScanOptions::default(),
+            Some(settings),
+        );
+        let _ = context.run(egui::RawInput::default(), |_| {});
+        assert_eq!(app.settings.font_scale, 0.8);
+        assert!((context.zoom_factor() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
     fn old_settings_keep_system_language_and_visible_columns() {
         let settings: Settings =
             serde_json::from_str(r#"{"theme":"Light"}"#).expect("old settings");
         assert_eq!(settings.language, Language::System);
         assert!(settings.show_modified && settings.show_share);
-        assert_eq!((settings.font_scale, settings.threads), (1.0, 0));
+        assert_eq!((settings.font_scale, settings.threads), (0.8, 0));
     }
 
     #[test]
@@ -3334,7 +4228,7 @@ mod tests {
 
     #[test]
     fn map_tile_labels_have_readable_contrast_in_both_themes() {
-        for color in PALETTE {
+        for color in crate::file_colors::FILE_PALETTE {
             for factor in [0.81, 0.93, 1.0] {
                 let background = color.gamma_multiply(factor);
                 assert!(contrast(tile_text_color(background), background) >= 4.5);
@@ -3438,18 +4332,19 @@ mod tests {
         control.bytes.store(1024 * 1024, Ordering::Relaxed);
         control.allocated_bytes.store(4096, Ordering::Relaxed);
         let progress = job_progress(&control, 1.0, true);
-        assert!(progress.contains("logical 1.00 MiB"), "{progress}");
-        assert!(progress.contains("allocated 4.00 KiB"), "{progress}");
+        assert!(progress.contains("1.00 "), "{progress}");
+        assert!(progress.contains("4.00 "), "{progress}");
         control.unknown_allocations.store(1, Ordering::Relaxed);
         let progress = job_progress(&control, 1.0, true);
-        assert!(progress.contains("allocated Unavailable"), "{progress}");
-        assert!(!job_progress(&control, 1.0, false).contains("allocated"));
+        assert!(progress.contains(tr("Unavailable")), "{progress}");
+        assert!(!progress.contains("4.00 "), "{progress}");
+        assert!(!job_progress(&control, 1.0, false).contains(tr("Unavailable")));
     }
 
     #[test]
     fn bytes_are_formatted_without_overflow() {
-        assert_eq!(format_bytes(1024), "1.00 KiB");
-        assert_eq!(format_bytes(u64::MAX), "16.00 EiB");
+        assert_eq!(format_bytes(1024), format!("1.00 {}", tr("KiB")));
+        assert_eq!(format_bytes(u64::MAX), format!("16.00 {}", tr("EiB")));
     }
 
     #[test]
@@ -3501,7 +4396,7 @@ fn file_row_background_accepts_secondary_clicks() {
                 egui::CentralPanel::default().show(context, |ui| {
                     let row = egui::Frame::new().show(ui, |ui| ui.label("file"));
                     position = row.response.rect.center();
-                    let response = clickable_row(row.response);
+                    let response = row.response.interact(Sense::click());
                     assert!(response.sense.senses_click());
                     response.context_menu(|ui| {
                         opened = true;

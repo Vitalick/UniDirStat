@@ -23,6 +23,7 @@ install -m 644 packaging/linux/unidirstat.desktop "$package/usr/share/applicatio
 install -m 644 assets/unidirstat.png "$package/usr/share/icons/hicolor/256x256/apps/unidirstat.png"
 install -m 644 assets/unidirstat.svg "$package/usr/share/icons/hicolor/scalable/apps/unidirstat.svg"
 install -m 644 LICENSE "$package/usr/share/doc/unidirstat/copyright"
+install -m 644 NOTICE "$package/usr/share/doc/unidirstat/NOTICE"
 install -m 644 assets/fonts/Ubuntu-LICENSE.txt "$package/usr/share/doc/unidirstat/Ubuntu-LICENSE.txt"
 desktop-file-validate "$package/usr/share/applications/unidirstat.desktop"
 cat > "$package/DEBIAN/control" <<EOF

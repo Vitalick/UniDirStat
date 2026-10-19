@@ -291,5 +291,17 @@
   "Search": "Поиск",
   "Search error": "Ошибка поиска",
   "Search and filters": "Поиск и фильтры",
-  "Use arrow keys to choose a segment, then Enter or Space to select it.": "Выберите сегмент стрелками, затем нажмите Enter или пробел."
+  "Use arrow keys to choose a segment, then Enter or Space to select it.": "Выберите сегмент стрелками, затем нажмите Enter или пробел.",
+  "Recalculate folder": "Пересчитать папку",
+  "Folder recalculation cancelled. Previous results are preserved.": "Пересчёт папки отменён. Предыдущие результаты сохранены.",
+  "Item moved to trash. Scan results are outdated.": "Объект перемещён в корзину. Результаты сканирования устарели.",
+  "The item was moved to trash, but folder recalculation did not finish: {error}": "Объект перемещён в корзину, но пересчёт папки не завершён: {error}",
+  "Item moved to trash. Recalculating its parent folder.": "Объект перемещён в корзину. Пересчитывается родительская папка.",
+  "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.": "Пересчёт папки неожиданно остановился. Объект уже перемещён в корзину; результаты сканирования устарели.",
+  "{count} small files · {size}": "Мелкие файлы: {count} · {size}",
+  "File types: {extensions}": "Типы файлов: {extensions}",
+  "Containing folder: {path}": "Родительская папка: {path}",
+  "Select containing folder": "Выделить родительскую папку",
+  "Zoom into folder": "Приблизить папку",
+  "{extensions}, and {count} more": "{extensions}; ещё типов: {count}"
 }
