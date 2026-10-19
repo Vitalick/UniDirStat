@@ -299,6 +299,7 @@
   "Item moved to trash. Recalculating its parent folder.": "Объект перемещён в корзину. Пересчитывается родительская папка.",
   "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.": "Пересчёт папки неожиданно остановился. Объект уже перемещён в корзину; результаты сканирования устарели.",
   "{count} small files · {size}": "Мелкие файлы: {count} · {size}",
+  "{folder}/ · {count} files · {size}": "{folder}/ · файлов: {count} · {size}",
   "File types: {extensions}": "Типы файлов: {extensions}",
   "Containing folder: {path}": "Родительская папка: {path}",
   "Select containing folder": "Выделить родительскую папку",

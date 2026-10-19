@@ -24,13 +24,13 @@ fn paint_map_focus(ui: &egui::Ui, rect: egui::Rect) {
     ui.painter().rect_stroke(
         rect.shrink(1.0),
         0.0,
-        Stroke::new(4.0, Color32::WHITE),
+        Stroke::new(4.0_f32, Color32::WHITE),
         StrokeKind::Inside,
     );
     ui.painter().rect_stroke(
         rect.shrink(2.0),
         0.0,
-        Stroke::new(2.0, Color32::BLACK),
+        Stroke::new(2.0_f32, Color32::BLACK),
         StrokeKind::Inside,
     );
 }
@@ -169,7 +169,7 @@ impl UniDirStatApp {
                     ui.label(RichText::new(count).size(BODY_SIZE));
                 });
             });
-            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| snapshot.nodes[index].path.display().to_string())).truncate());
+            ui.add(egui::Label::new(self.scope.map_or_else(|| tr("All scanned locations").to_owned(), |index| display_path(&snapshot.nodes[index].path))).truncate());
             if let Some(error) = self.map_worker.error() {
                 ui.colored_label(ui.visuals().error_fg_color, trf("Error: {details}", &[("details", error.into())]));
                 ui.label(tr("Reset the map to try again."));
@@ -212,7 +212,7 @@ impl UniDirStatApp {
                         let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
                         if !bounds.intersects(rect) || !readable_map_region(rect.intersect(bounds)) { continue; }
                         painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
-                        painter.rect_stroke(rect, 2.0, Stroke::new(0.6, muted(ui).gamma_multiply(0.5)), StrokeKind::Inside);
+                        painter.rect_stroke(rect, 2.0, Stroke::new(0.6_f32, muted(ui).gamma_multiply(0.5)), StrokeKind::Inside);
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("directory-region", tile.node)), Sense::click());
                         focused = self.map_item(ui, response, tile.node, snapshot, base_rect(tile.rect, data, bounds.size()), bounds.size()).or(focused);
                     }
@@ -224,16 +224,20 @@ impl UniDirStatApp {
                         painter.rect_filled(rect, 0.0, fill);
                         if !readable_map_region(rect.intersect(bounds)) { continue; }
                         if tile.owner.is_some_and(|index| selected_region(&self.selection, snapshot, index)) {
-                            painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside);
+                            painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside);
                         }
                         let size = u64::try_from(tile.bytes).map_or_else(|_| format!("{} {}", tile.bytes, tr("B")), format_bytes);
-                        let summary = trf("{count} small files · {size}", &[("count", tile.count.to_string()), ("size", size)]);
+                        let summary = if let Some(index) = tile.owner {
+                            trf("{folder}/ · {count} files · {size}", &[("folder", snapshot.nodes[index].name().trim_end_matches(std::path::is_separator).to_owned()), ("count", tile.count.to_string()), ("size", size)])
+                        } else {
+                            trf("{count} small files · {size}", &[("count", tile.count.to_string()), ("size", size)])
+                        };
                         let mut extension_names = tile.extensions.iter().take(8).map(String::as_str).collect::<Vec<_>>().join(", ");
                         if tile.extensions.len() > 8 {
                             extension_names = trf("{extensions}, and {count} more", &[("extensions", extension_names), ("count", (tile.extensions.len() - 8).to_string())]);
                         }
                         let extensions = trf("File types: {extensions}", &[("extensions", extension_names)]);
-                        let owner = tile.owner.map(|index| trf("Containing folder: {path}", &[("path", snapshot.nodes[index].path.display().to_string())]));
+                        let owner = tile.owner.map(|index| trf("Containing folder: {path}", &[("path", display_path(&snapshot.nodes[index].path))]));
                         if self.settings.labels { paint_map_label(ui, rect.intersect(bounds).shrink(3.0), &summary, tile_text_color(fill)); }
                         let response = ui.interact(rect.intersect(bounds), ui.id().with(("aggregate", tile.owner, tile.color, tile.rect.x.to_bits(), tile.rect.y.to_bits())), Sense::click());
                         if response.clicked() && let Some(index) = tile.owner {
@@ -285,7 +289,7 @@ impl UniDirStatApp {
                         let (tile_rect, radius) = tile_shape(rect, self.settings.tile_gap);
                         let response = ui.interact(tile_rect.intersect(bounds), ui.id().with(("tile", tile.node)), Sense::click());
                         painter.rect_filled(tile_rect, radius, fill);
-                        if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0, ui.visuals().text_color()), StrokeKind::Inside); }
+                        if selected_region(&self.selection, snapshot, tile.node) { painter.rect_stroke(tile_rect.shrink(1.0), radius, Stroke::new(2.0_f32, ui.visuals().text_color()), StrokeKind::Inside); }
                         if self.settings.labels && tile_rect.height() >= MAP_LABEL_HEIGHT + 2.0 && tile_rect.width() >= MAP_LABEL_SIZE * 3.0 + 8.0 {
                             let label = tile_rect.intersect(bounds).shrink2(Vec2::new(4.0, 1.0));
                             paint_map_label(ui, egui::Rect::from_min_size(label.min, Vec2::new(label.width(), MAP_LABEL_HEIGHT)), &node.name(), tile_text_color(fill));
@@ -297,7 +301,7 @@ impl UniDirStatApp {
                         if let Some(tile) = data.frame(index) {
                             let rect = self.map_viewport.rect(base_rect(tile.rect, data, bounds.size()), bounds.min);
                             if !readable_map_region(rect.intersect(bounds)) { continue; }
-                            painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
+                            painter.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(3.0_f32, ACCENT), StrokeKind::Inside);
                         }
                     }
                     if let Some(rect) = focused { paint_map_focus(ui, rect); }
@@ -345,7 +349,7 @@ impl UniDirStatApp {
         }
         let focused = response.has_focus().then_some(response.rect);
         response.on_hover_ui(|ui| {
-            ui.label(snapshot.nodes[index].path.display().to_string());
+            ui.label(display_path(&snapshot.nodes[index].path));
             ui.label(format_bytes(
                 snapshot.nodes[index].size(self.settings.allocated),
             ));
@@ -429,7 +433,7 @@ impl UniDirStatApp {
                 painter.circle_stroke(
                     label_center,
                     3.0,
-                    Stroke::new(2.0, ui.visuals().text_color()),
+                    Stroke::new(2.0_f32, ui.visuals().text_color()),
                 );
             }
             if let Some(pointer) = pointer.filter(|pointer| bounds.contains(*pointer)) {
@@ -483,8 +487,8 @@ impl UniDirStatApp {
         {
             let point =
                 bounds.min + self.map_viewport.offset + point.to_vec2() * self.map_viewport.scale;
-            painter.circle_stroke(point, 6.0, Stroke::new(4.0, Color32::WHITE));
-            painter.circle_stroke(point, 6.0, Stroke::new(2.0, Color32::BLACK));
+            painter.circle_stroke(point, 6.0, Stroke::new(4.0_f32, Color32::WHITE));
+            painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, Color32::BLACK));
         }
         let target = if response.context_menu_opened() {
             self.selection.primary().map(|index| (index, center))
@@ -667,6 +671,9 @@ mod tests {
             "scale={}, labels={labels:?}",
             app.map_viewport.scale
         );
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("folder-") && text.galley.job.text.contains("/ ·"))
+        }), "aggregate labels must identify their containing folder");
     }
 
     #[test]

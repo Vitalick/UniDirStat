@@ -1,6 +1,6 @@
 [English](guide.md) | [Русский](guide.ru.md)
 
-[← Installation and project overview](../README.md#english)
+[← Installation and project overview](../README.md)
 
 # UniDirStat — Documentation
 

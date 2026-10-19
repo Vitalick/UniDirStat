@@ -1,7 +1,21 @@
 use std::collections::HashSet;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// Formats paths for people while retaining the original path for filesystem operations.
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    if let Some(Component::Prefix(prefix)) = path.components().next() {
+        match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(_) => return text[4..].to_owned(),
+            std::path::Prefix::VerbatimUNC(..) => return format!(r"\\{}", &text[8..]),
+            _ => {}
+        }
+    }
+    text
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum EntryKind {
@@ -31,11 +45,10 @@ pub struct Node {
 
 impl Node {
     pub fn name(&self) -> String {
-        self.path
-            .file_name()
-            .unwrap_or(self.path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+        self.path.file_name().map_or_else(
+            || display_path(&self.path),
+            |name| name.to_string_lossy().into_owned(),
+        )
     }
 
     pub fn extension(&self) -> String {
@@ -243,6 +256,38 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_display_paths_hide_only_drive_and_unc_verbatim_prefixes() {
+        for (path, expected) in [
+            (r"\\?\X:\ai\images", r"X:\ai\images"),
+            (r"\\?\X:\", r"X:\"),
+            (r"\\?\UNC\server\share\images", r"\\server\share\images"),
+            (r"X:\ai\images", r"X:\ai\images"),
+            (r"\\server\share\images", r"\\server\share\images"),
+            (r"\\?\Volume{1234}\images", r"\\?\Volume{1234}\images"),
+            (r"\\.\PhysicalDrive0", r"\\.\PhysicalDrive0"),
+        ] {
+            assert_eq!(display_path(std::path::Path::new(path)), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_name_hides_the_verbatim_prefix_without_changing_its_path() {
+        let mut node = fixture().nodes.remove(0);
+        node.path = PathBuf::from(r"\\?\X:\");
+        assert_eq!(node.name(), r"X:\");
+        assert_eq!(node.path, PathBuf::from(r"\\?\X:\"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn display_paths_preserve_unix_names_including_backslashes() {
+        let path = std::path::Path::new(r"/data/\\?\X:\images");
+        assert_eq!(display_path(path), path.display().to_string());
+    }
 
     fn fixture() -> Snapshot {
         let root = std::env::temp_dir().join("unidirstat-validation");

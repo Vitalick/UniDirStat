@@ -46,7 +46,7 @@ pub(super) fn info_button(ui: &mut egui::Ui, text: &str) {
         })
         .response;
     ui.painter()
-        .circle_stroke(response.rect.center(), 8.0, Stroke::new(1.2, muted(ui)));
+        .circle_stroke(response.rect.center(), 8.0, Stroke::new(1.2_f32, muted(ui)));
     ui.painter().text(
         response.rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -82,7 +82,7 @@ fn file_icon(painter: &egui::Painter, rect: egui::Rect, directory: bool, color: 
         painter.rect_stroke(
             rect.shrink2(Vec2::new(2.0, 0.0)),
             2.0,
-            Stroke::new(1.5, color),
+            Stroke::new(1.5_f32, color),
             StrokeKind::Inside,
         );
         painter.line_segment(
@@ -90,7 +90,7 @@ fn file_icon(painter: &egui::Painter, rect: egui::Rect, directory: bool, color: 
                 rect.left_center() + Vec2::new(5.0, 0.0),
                 rect.right_center() - Vec2::new(4.0, 0.0),
             ],
-            Stroke::new(1.0, color),
+            Stroke::new(1.0_f32, color),
         );
     }
 }
@@ -153,7 +153,7 @@ fn focus_outline(ui: &egui::Ui, response: &egui::Response) {
         ui.painter().rect_stroke(
             response.rect.shrink(1.0),
             3.0,
-            Stroke::new(2.0, ui.visuals().text_color()),
+            Stroke::new(2.0_f32, ui.visuals().text_color()),
             StrokeKind::Inside,
         );
     }
@@ -340,7 +340,7 @@ impl UniDirStatApp {
         });
         let path = self.scope.map_or_else(
             || tr("All scanned locations").to_owned(),
-            |index| snapshot.nodes[index].path.display().to_string(),
+            |index| display_path(&snapshot.nodes[index].path),
         );
         ui.horizontal(|ui| {
             let response = ui.add_sized(
@@ -454,9 +454,9 @@ impl UniDirStatApp {
             focus_outline(ui, &response);
             self.item_response(response.clone(), index, snapshot, SelectionView::Overview);
             if response.has_focus() {
-                response.show_tooltip_text(node.path.display().to_string());
+                response.show_tooltip_text(display_path(&node.path));
             }
-            response.on_hover_text(node.path.display().to_string());
+            response.on_hover_text(display_path(&node.path));
         }
     }
 
@@ -793,7 +793,7 @@ impl UniDirStatApp {
                                     x,
                                     rect.y_range(),
                                     Stroke::new(
-                                        1.0,
+                                        1.0_f32,
                                         ui.visuals().widgets.noninteractive.bg_stroke.color,
                                     ),
                                 );
@@ -851,7 +851,7 @@ impl UniDirStatApp {
                         );
                         let label = if self.page == Page::Largest || has_filters(&self.search_query)
                         {
-                            node.path.display().to_string()
+                            display_path(&node.path)
                         } else {
                             node.name()
                         };
@@ -918,7 +918,7 @@ impl UniDirStatApp {
                         self.tree_key(&response, index, snapshot, ui.id());
                         self.item_response(response.clone(), index, snapshot, SelectionView::Files);
                         response.on_hover_ui(|ui| {
-                            ui.label(node.path.display().to_string());
+                            ui.label(display_path(&node.path));
                             ui.label(trf(
                                 "{parent}% of parent | {total}% of scan",
                                 &[

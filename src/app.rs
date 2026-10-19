@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use unidirstat::{
     actions,
     analysis::{self, DuplicateReport, ExtensionStats, HashAlgorithm},
-    model::{EntryKind, Node, Snapshot},
+    model::{EntryKind, Node, Snapshot, display_path},
     report,
     scanner::{self, ScanControl, ScanOptions, ScanPhase},
     search::{SearchIndex, SearchQuery, SearchSort, SearchTarget},
@@ -780,7 +780,7 @@ impl UniDirStatApp {
                 Err(error) => (
                     Settings::default(),
                     None,
-                    Some(format!("{}: {error}", path.display())),
+                    Some(format!("{}: {error}", display_path(&path))),
                 ),
             }
         } else {
@@ -968,17 +968,17 @@ impl UniDirStatApp {
         } else {
             Color32::from_rgb(210, 217, 229)
         };
-        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text);
         style.visuals.widgets.noninteractive.bg_fill = style.visuals.window_fill;
-        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, separator);
-        style.visuals.window_stroke = Stroke::new(1.0, separator);
+        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, separator);
+        style.visuals.window_stroke = Stroke::new(1.0_f32, separator);
         style.visuals.selection.bg_fill = if dark {
             Color32::from_rgb(45, 53, 85)
         } else {
             Color32::from_rgb(223, 229, 255)
         };
         style.visuals.selection.stroke = Stroke::new(
-            2.0,
+            2.0_f32,
             if dark {
                 Color32::from_rgb(177, 187, 255)
             } else {
@@ -1022,14 +1022,14 @@ impl UniDirStatApp {
         ] {
             widget.bg_fill = fill;
             widget.weak_bg_fill = fill;
-            widget.bg_stroke = Stroke::new(1.0, CONTROL_BORDER[usize::from(dark)]);
-            widget.fg_stroke = Stroke::new(1.0, text);
+            widget.bg_stroke = Stroke::new(1.0_f32, CONTROL_BORDER[usize::from(dark)]);
+            widget.fg_stroke = Stroke::new(1.0_f32, text);
             widget.corner_radius = CornerRadius::same(7);
             widget.expansion = 0.0;
         }
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
-        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0, accent);
-        style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, accent);
+        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, accent);
+        style.visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, accent);
         style.visuals.code_bg_color = style.visuals.widgets.inactive.bg_fill;
         context.set_style(style);
     }
@@ -1512,10 +1512,7 @@ impl UniDirStatApp {
                     if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
                         self.error = Some(trf(
                             "Could not watch {path}: {error}",
-                            &[
-                                ("path", root.display().to_string()),
-                                ("error", error.to_string()),
-                            ],
+                            &[("path", display_path(root)), ("error", error.to_string())],
                         ));
                         self.watching = false;
                         return;
@@ -1769,9 +1766,7 @@ impl UniDirStatApp {
                                 } else {
                                     report::export_csv(&path, &snapshot)
                                 })
-                                .map(|()| {
-                                    trf("Saved {path}", &[("path", path.display().to_string())])
-                                }),
+                                .map(|()| trf("Saved {path}", &[("path", display_path(&path))])),
                             )
                         });
                     }
@@ -1793,9 +1788,8 @@ impl UniDirStatApp {
                 {
                     self.job(JobKind::SaveReport, ui.ctx(), move || {
                         JobResult::Io(
-                            report::export_permissions(&path, &snapshot).map(|()| {
-                                trf("Saved {path}", &[("path", path.display().to_string())])
-                            }),
+                            report::export_permissions(&path, &snapshot)
+                                .map(|()| trf("Saved {path}", &[("path", display_path(&path))])),
                         )
                     });
                 }
@@ -1930,7 +1924,7 @@ impl UniDirStatApp {
                 }
                 if matches!(kind, Some(JobKind::Scan | JobKind::Refresh)) && self.control.phase() == ScanPhase::Discovering {
                     if let Some(path) = self.control.current_path() {
-                        ui.add(egui::Label::new(trf("Last directory: {path}", &[("path", path.display().to_string())])).truncate()).on_hover_text(path.display().to_string());
+                        ui.add(egui::Label::new(trf("Last directory: {path}", &[("path", display_path(&path))])).truncate()).on_hover_text(display_path(&path));
                     }
                     if state == JobState::Running && self.progress_changed.elapsed() >= Duration::from_secs(3) {
                         ui.label(trf("No new results for {seconds} s. A filesystem operation or permission dialog may be waiting.", &[("seconds", self.progress_changed.elapsed().as_secs().to_string())]));
@@ -1946,7 +1940,7 @@ fn card(ui: &egui::Ui) -> egui::Frame {
         .corner_radius(12)
         .inner_margin(18)
         .stroke(Stroke::new(
-            1.0,
+            1.0_f32,
             if ui.visuals().dark_mode {
                 Color32::from_rgb(39, 46, 63)
             } else {
@@ -2114,15 +2108,11 @@ impl UniDirStatApp {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.strong(if name.is_empty() {
-                            path.display().to_string()
+                            display_path(&path)
                         } else {
                             name
                         });
-                        ui.label(
-                            RichText::new(path.display().to_string())
-                                .small()
-                                .color(muted(ui)),
-                        );
+                        ui.label(RichText::new(display_path(&path)).small().color(muted(ui)));
                         if system_data_group {
                             ui.label(
                                 RichText::new(tr("macOS System + Data volume group"))
@@ -2546,7 +2536,7 @@ impl UniDirStatApp {
                     && let Some(path)=rfd::FileDialog::new().set_file_name("duplicates.json").add_filter(tr("Report"), &["json", "csv"]).save_file()
                     && let Some(report)=self.duplicates.as_ref().map(Arc::clone) {
                     let snapshot = Arc::clone(snapshot);
-                    self.job(JobKind::SaveDuplicates,ui.ctx(),move || JobResult::Io((if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("csv")) { report::export_duplicates_csv(&path,&report,&snapshot) } else { report::save_duplicates(&path,&report) }).map(|()|trf("Saved {path}",&[("path",path.display().to_string())]))));
+                    self.job(JobKind::SaveDuplicates,ui.ctx(),move || JobResult::Io((if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("csv")) { report::export_duplicates_csv(&path,&report,&snapshot) } else { report::save_duplicates(&path,&report) }).map(|()|trf("Saved {path}",&[("path",display_path(&path))]))));
                 }
             });
         });
@@ -2601,7 +2591,7 @@ impl UniDirStatApp {
                                 .on_hover_text(hash);
                             }
                             DuplicateRow::File(index) => {
-                                let path = snapshot.nodes[index].path.display().to_string();
+                                let path = display_path(&snapshot.nodes[index].path);
                                 let response = ui
                                     .add_sized(
                                         [width, 32.0],
@@ -2823,7 +2813,7 @@ impl UniDirStatApp {
                     self.selection
                         .indices()
                         .filter_map(|index| snapshot.nodes.get(index))
-                        .map(|node| node.path.display().to_string())
+                        .map(|node| display_path(&node.path))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
@@ -2832,7 +2822,7 @@ impl UniDirStatApp {
         ui.label(RichText::new(node.name()).size(18.0).strong());
         ui.add(
             egui::Label::new(
-                RichText::new(node.path.display().to_string())
+                RichText::new(display_path(&node.path))
                     .small()
                     .color(muted(ui)),
             )
@@ -2892,7 +2882,7 @@ impl UniDirStatApp {
         }
         ui.separator();
         if ui.button(tr("Copy path")).clicked() {
-            context.copy_text(node.path.display().to_string());
+            context.copy_text(display_path(&node.path));
         }
         if ui.button(tr("Reveal in file manager")).clicked() {
             self.run_open(node, true);
@@ -3021,7 +3011,7 @@ impl UniDirStatApp {
                 trf(
                     "{path} | {bytes} | {share}% of parent",
                     &[
-                        ("path", snapshot.nodes[index].path.display().to_string()),
+                        ("path", display_path(&snapshot.nodes[index].path)),
                         (
                             "bytes",
                             format_bytes(snapshot.nodes[index].size(self.settings.allocated)),
@@ -3078,12 +3068,12 @@ impl UniDirStatApp {
                 .clicked()
             {
                 let paths = if self.selection.is_empty() {
-                    node.path.display().to_string()
+                    display_path(&node.path)
                 } else {
                     self.selection
                         .indices()
                         .filter_map(|index| snapshot.nodes.get(index))
-                        .map(|node| node.path.display().to_string())
+                        .map(|node| display_path(&node.path))
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
@@ -3196,8 +3186,8 @@ impl UniDirStatApp {
         egui::Modal::new(egui::Id::new("cleanup-confirmation")).show(context,|ui| {
             ui.set_width(440.0);
             ui.heading(match cleanup { Cleanup::Trash(_) | Cleanup::TrashEmpty(_)=>tr("Move to system trash?"),Cleanup::Move(_,_)=>tr("Move this item?") });
-            ui.label(node.path.display().to_string());
-            if let Cleanup::Move(_,destination)=cleanup { ui.label(trf("Destination: {path}",&[("path",destination.display().to_string())])); ui.label(tr("Existing files will never be overwritten. Atomic moves require the same filesystem; cross-volume moves fail safely.")); }
+            ui.label(display_path(&node.path));
+            if let Cleanup::Move(_,destination)=cleanup { ui.label(trf("Destination: {path}",&[("path",display_path(destination))])); ui.label(tr("Existing files will never be overwritten. Atomic moves require the same filesystem; cross-volume moves fail safely.")); }
             else if matches!(cleanup, Cleanup::TrashEmpty(_)) { ui.label(tr("The folder must still be empty when the operation runs.")); }
             else { ui.label(tr("The item and, for a folder, its contents will be sent to your system trash. Recovery depends on your operating system and filesystem.")); }
             ui.add_space(12.0); ui.horizontal(|ui| { cancel=ui.button(tr("Cancel")).clicked(); confirm=ui.button(tr("Confirm")).clicked(); });
@@ -3325,9 +3315,9 @@ impl eframe::App for UniDirStatApp {
                 .open(&mut open)
                 .default_width(650.0)
                 .show(context, |ui| {
-                    ui.label(path.display().to_string());
+                    ui.label(display_path(path));
                     if ui.button(tr("Copy path")).clicked() {
-                        context.copy_text(path.display().to_string());
+                        context.copy_text(display_path(path));
                     }
                     egui::ScrollArea::both().max_height(400.0).show(ui, |ui| {
                         ui.monospace(details);

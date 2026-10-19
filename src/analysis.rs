@@ -766,12 +766,15 @@ mod tests {
     #[test]
     fn files_changed_after_sampling_are_not_reported_as_duplicates() {
         let directory = tempfile::tempdir().unwrap();
+        let modified = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let paths = [
             directory.path().join("first"),
             directory.path().join("second"),
         ];
         for path in &paths {
-            fs::write(path, vec![7; 2 * 1024 * 1024]).unwrap();
+            let mut file = fs::File::create(path).unwrap();
+            file.write_all(&vec![7; 2 * 1024 * 1024]).unwrap();
+            file.set_modified(modified).unwrap();
         }
         let snapshot = scan(
             &[directory.path().into()],
@@ -797,13 +800,20 @@ mod tests {
                 let mut file = OpenOptions::new().write(true).open(path).unwrap();
                 file.seek(SeekFrom::Start(512 * 1024)).unwrap();
                 file.write_all(&[8]).unwrap();
+                file.set_modified(modified + std::time::Duration::from_millis(500))
+                    .unwrap();
             }
             gate.release.wait();
             worker.join().unwrap()
         });
 
         assert!(report.groups.is_empty());
-        assert!(!report.errors.is_empty());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.ends_with("file changed since sampling"))
+        );
     }
 
     #[test]

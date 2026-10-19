@@ -299,6 +299,7 @@
   "Item moved to trash. Recalculating its parent folder.": "Item moved to trash. Recalculating its parent folder.",
   "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.": "Folder recalculation stopped unexpectedly. The item was already moved to trash; scan results are outdated.",
   "{count} small files · {size}": "{count} small files · {size}",
+  "{folder}/ · {count} files · {size}": "{folder}/ · files: {count} · {size}",
   "File types: {extensions}": "File types: {extensions}",
   "Containing folder: {path}": "Containing folder: {path}",
   "Select containing folder": "Select containing folder",
